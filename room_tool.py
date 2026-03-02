@@ -116,7 +116,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, door_walls=(), no_walls=(), door_anchor
     t  = s.wall_thickness
     h  = s.wall_height
     zt = z + h
-    fd = t          # tunnel reveal depth = wall thickness
+    fd = t * 0.5    # tunnel reveal depth = half wall thickness (two frames meet flush)
     dw = min(door_width  if door_width  is not None else s.door_width,
              (x2 - x1) * 0.85) if s.add_door else 0
     dh = min(door_height if door_height is not None else s.door_height,
@@ -259,16 +259,17 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, door_walls=(), no_walls=(), door_anchor
             _face4(bm, (x1,y1,zt), (x1,y2,zt), (x2,y2,zt), (x2,y1,zt))
 
     if s.add_floor:
+        # Winding reversed vs ceiling so normal points +Z (up = toward room interior)
         if _ey:   # E/W door: strip in Y
             ys = [y1] + _ey + [y2]
             for i in range(len(ys) - 1):
-                _face4(bm, (x1,ys[i],z), (x1,ys[i+1],z), (x2,ys[i+1],z), (x2,ys[i],z))
+                _face4(bm, (x1,ys[i],z), (x2,ys[i],z), (x2,ys[i+1],z), (x1,ys[i+1],z))
         elif _ex:  # N/S door: strip in X
             xs = [x1] + _ex + [x2]
             for i in range(len(xs) - 1):
-                _face4(bm, (xs[i],y1,z), (xs[i],y2,z), (xs[i+1],y2,z), (xs[i+1],y1,z))
+                _face4(bm, (xs[i],y1,z), (xs[i+1],y1,z), (xs[i+1],y2,z), (xs[i],y2,z))
         else:
-            _face4(bm, (x1,y1,z), (x1,y2,z), (x2,y2,z), (x2,y1,z))
+            _face4(bm, (x1,y1,z), (x2,y1,z), (x2,y2,z), (x1,y2,z))
 
     # ── Merge all coincident vertices ──────────────────────────────────────────
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
@@ -348,15 +349,15 @@ def _wall_snap_ext(pt, rooms, t_fallback):
             if wc == 'N' and py < y2:  continue
             if wc == 'S' and py > y1:  continue
             if dist < best_d and lo <= along <= hi:
-                # Snap new room so both door-frame exteriors meet flush (each frame depth = t)
+                # Snap new room so both door-frame exteriors meet flush (each frame depth = t/2)
                 if wc == 'E':
-                    sp = Vector((x2 + 2*t, max(y1, min(y2, py))))
+                    sp = Vector((x2 + t, max(y1, min(y2, py))))
                 elif wc == 'W':
-                    sp = Vector((x1 - 2*t, max(y1, min(y2, py))))
+                    sp = Vector((x1 - t, max(y1, min(y2, py))))
                 elif wc == 'N':
-                    sp = Vector((max(x1, min(x2, px)), y2 + 2*t))
+                    sp = Vector((max(x1, min(x2, px)), y2 + t))
                 else:
-                    sp = Vector((max(x1, min(x2, px)), y1 - 2*t))
+                    sp = Vector((max(x1, min(x2, px)), y1 - t))
                 best_d = dist
                 best   = (sp, normal, i, wc)
     return best
@@ -446,6 +447,98 @@ def _door_frame_verts(r, wall_char, z, dw, dh):
         lo = max(x1, anchor - dw * 0.5)
         hi = min(x2, anchor + dw * 0.5)
         return [(hi, y1, z0), (lo, y1, z0), (lo, y1, z1), (hi, y1, z1)]
+
+
+def _solid_x_overlap(nx1, nx2, r, wall_char, s):
+    """Return True if [nx1,nx2] touches any SOLID section of r's N or S wall.
+    Returns False only if the overlap is entirely inside the door-frame opening.
+    A single-point query (nx1==nx2) is also handled correctly."""
+    rx1, rx2 = r["x1"], r["x2"]
+    ox1, ox2 = max(nx1, rx1), min(nx2, rx2)
+    if ox1 > ox2:        # truly no X overlap at all
+        return False
+    if wall_char in r.get("door_walls", []) and s.add_door:
+        dw     = r.get("door_dims", {}).get(wall_char, {}).get("w", s.door_width)
+        anchor = r.get("door_anchors", {}).get(wall_char, (rx1 + rx2) * 0.5)
+        dl = max(rx1, anchor - dw * 0.5)
+        dr = min(rx2, anchor + dw * 0.5)
+        if ox1 >= dl and ox2 <= dr:
+            return False   # entirely within door opening — exempt
+    return True
+
+
+def _solid_y_overlap(ny1, ny2, r, wall_char, s):
+    """Return True if [ny1,ny2] touches any SOLID section of r's E or W wall.
+    Returns False only if the overlap is entirely inside the door-frame opening.
+    A single-point query (ny1==ny2) is also handled correctly."""
+    ry1, ry2 = r["y1"], r["y2"]
+    oy1, oy2 = max(ny1, ry1), min(ny2, ry2)
+    if oy1 > oy2:        # truly no Y overlap at all
+        return False
+    if wall_char in r.get("door_walls", []) and s.add_door:
+        dw     = r.get("door_dims", {}).get(wall_char, {}).get("w", s.door_width)
+        anchor = r.get("door_anchors", {}).get(wall_char, (ry1 + ry2) * 0.5)
+        db = max(ry1, anchor - dw * 0.5)
+        df = min(ry2, anchor + dw * 0.5)
+        if oy1 >= db and oy2 <= df:
+            return False   # entirely within door opening — exempt
+    return True
+
+
+def _clamp_y_for_rooms(new_y, fixed_y, nx1, nx2, rooms, skip_idx, s):
+    """Clamp new_y so the new room keeps >= wall_thickness from existing rooms.
+    Solid walls require W clearance; door-frame openings allow touching (zero gap)."""
+    t = s.wall_thickness
+    if new_y == fixed_y:
+        return new_y
+    going_south = new_y < fixed_y
+    for i, r in enumerate(rooms):
+        if i == skip_idx:
+            continue
+        rx1, ry1, rx2, ry2 = r["x1"], r["y1"], r["x2"], r["y2"]
+        if nx2 <= rx1 or nx1 >= rx2:
+            continue
+        if going_south:
+            if ry2 <= fixed_y:
+                if _solid_x_overlap(nx1, nx2, r, 'N', s):
+                    new_y = max(new_y, ry2 + t)   # solid wall — keep W gap
+                else:
+                    new_y = max(new_y, ry2)        # door frame — allow touching
+        else:
+            if ry1 >= fixed_y:
+                if _solid_x_overlap(nx1, nx2, r, 'S', s):
+                    new_y = min(new_y, ry1 - t)
+                else:
+                    new_y = min(new_y, ry1)
+    return new_y
+
+
+def _clamp_x_for_rooms(new_x, fixed_x, ny1, ny2, rooms, skip_idx, s):
+    """Clamp new_x so the new room keeps >= wall_thickness from existing rooms.
+    Solid walls require W clearance; door-frame openings allow touching (zero gap)."""
+    t = s.wall_thickness
+    if new_x == fixed_x:
+        return new_x
+    going_west = new_x < fixed_x
+    for i, r in enumerate(rooms):
+        if i == skip_idx:
+            continue
+        rx1, ry1, rx2, ry2 = r["x1"], r["y1"], r["x2"], r["y2"]
+        if ny2 <= ry1 or ny1 >= ry2:
+            continue
+        if going_west:
+            if rx2 <= fixed_x:
+                if _solid_y_overlap(ny1, ny2, r, 'E', s):
+                    new_x = max(new_x, rx2 + t)   # solid wall — keep W gap
+                else:
+                    new_x = max(new_x, rx2)        # door frame — allow touching
+        else:
+            if rx1 >= fixed_x:
+                if _solid_y_overlap(ny1, ny2, r, 'W', s):
+                    new_x = min(new_x, rx1 - t)
+                else:
+                    new_x = min(new_x, rx1)
+    return new_x
 
 
 def _find_partner_wall(rooms, room_idx, wall_char, t_fallback):
@@ -806,34 +899,71 @@ class ROOM_OT_draw(bpy.types.Operator):
 
             elif self._phase == 1:
                 # Phase 1: one side along axis1 from the snap/start point
+                # Clamp against all other rooms at the snap-wall coordinate
+                rooms_p1 = ROOM_OT_draw._room_list
+                sidx_p1  = self._snap_info[2] if self._snap_info else -1
                 if self._axis1_char == 'X':
-                    self._end = Vector((pt.x, self._start.y, z))
+                    nx = _clamp_x_for_rooms(pt.x, self._start.x,
+                                            self._start.y, self._start.y,
+                                            rooms_p1, sidx_p1, s)
+                    self._end = Vector((nx, self._start.y, z))
                 else:
-                    self._end = Vector((self._start.x, pt.y, z))
+                    ny = _clamp_y_for_rooms(pt.y, self._start.y,
+                                            self._start.x, self._start.x,
+                                            rooms_p1, sidx_p1, s)
+                    self._end = Vector((self._start.x, ny, z))
                 self._update_preview_mesh(context)
 
             elif self._phase == 2:
                 if self._snap_info is not None:
                     # Snapped phase 2: second side — same axis, start locked at first-side endpoint
+                    # Clamp this side as well so neither edge can enter another room
+                    rooms_p2 = ROOM_OT_draw._room_list
+                    sidx_p2  = self._snap_info[2]
                     if self._axis1_char == 'X':
-                        self._end = Vector((pt.x, self._start.y, z))
+                        nx = _clamp_x_for_rooms(pt.x, self._start.x,
+                                                self._start.y, self._start.y,
+                                                rooms_p2, sidx_p2, s)
+                        self._end = Vector((nx, self._start.y, z))
                     else:
-                        self._end = Vector((self._start.x, pt.y, z))
+                        ny = _clamp_y_for_rooms(pt.y, self._start.y,
+                                                self._start.x, self._start.x,
+                                                rooms_p2, sidx_p2, s)
+                        self._end = Vector((self._start.x, ny, z))
                 else:
                     # Standalone phase 2: depth — perpendicular axis, phase1_end locked
+                    rooms = ROOM_OT_draw._room_list
                     if self._axis1_char == 'X':
-                        self._end = Vector((self._phase1_end.x, pt.y, z))
+                        nx1 = min(self._start.x, self._phase1_end.x)
+                        nx2 = max(self._start.x, self._phase1_end.x)
+                        ny  = _clamp_y_for_rooms(pt.y, self._start.y,
+                                                 nx1, nx2, rooms, -1, s)
+                        self._end = Vector((self._phase1_end.x, ny, z))
                     else:
-                        self._end = Vector((pt.x, self._phase1_end.y, z))
+                        ny1 = min(self._start.y, self._phase1_end.y)
+                        ny2 = max(self._start.y, self._phase1_end.y)
+                        nx  = _clamp_x_for_rooms(pt.x, self._start.x,
+                                                 ny1, ny2, rooms, -1, s)
+                        self._end = Vector((nx, self._phase1_end.y, z))
                     _apply_snap_constraint(self._end, self._start, self._snap_info)
                 self._update_preview_mesh(context)
 
             elif self._phase == 3:
                 # Snapped phase 3: depth — perpendicular axis, Y (or X) range already locked
+                rooms    = ROOM_OT_draw._room_list
+                snap_idx = self._snap_info[2] if self._snap_info else -1
                 if self._axis1_char == 'X':
-                    self._end = Vector((self._end.x, pt.y, z))
+                    nx1 = min(self._start.x, self._end.x)
+                    nx2 = max(self._start.x, self._end.x)
+                    ny  = _clamp_y_for_rooms(pt.y, self._start.y,
+                                             nx1, nx2, rooms, snap_idx, s)
+                    self._end = Vector((self._end.x, ny, z))
                 else:
-                    self._end = Vector((pt.x, self._end.y, z))
+                    ny1 = min(self._start.y, self._end.y)
+                    ny2 = max(self._start.y, self._end.y)
+                    nx  = _clamp_x_for_rooms(pt.x, self._start.x,
+                                             ny1, ny2, rooms, snap_idx, s)
+                    self._end = Vector((nx, self._end.y, z))
                 _apply_snap_constraint(self._end, self._start, self._snap_info)
                 self._update_preview_mesh(context)
 
