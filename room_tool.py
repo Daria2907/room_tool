@@ -7,7 +7,7 @@ bl_info = {
     "category": "Mesh",
 }
 
-import bpy, bmesh, gpu
+import bpy, bmesh, gpu, json
 from bpy_extras import view3d_utils
 from mathutils import Vector
 from gpu_extras.batch import batch_for_shader
@@ -29,6 +29,22 @@ class ROOM_PG_door_preset(bpy.types.PropertyGroup):
         name="Width",  default=0.9, min=0.1, max=10.0, unit="LENGTH")
     door_height: bpy.props.FloatProperty(
         name="Height", default=2.0, min=0.1, max=15.0, unit="LENGTH")
+
+
+class ROOM_PG_registry_entry(bpy.types.PropertyGroup):
+    """One room's registry data persisted in the scene for addon-reload survival."""
+    x1: bpy.props.FloatProperty()
+    y1: bpy.props.FloatProperty()
+    x2: bpy.props.FloatProperty()
+    y2: bpy.props.FloatProperty()
+    t:  bpy.props.FloatProperty(default=0.125)
+    z:  bpy.props.FloatProperty(default=0.0)
+    door_walls:   bpy.props.StringProperty()   # comma-separated e.g. "S,W"
+    no_walls:     bpy.props.StringProperty()   # comma-separated
+    door_anchors: bpy.props.StringProperty()   # JSON e.g. '{"S": 1.5}'
+    obj_name:     bpy.props.StringProperty()
+    door_width:   bpy.props.FloatProperty(default=0.9)
+    door_height:  bpy.props.FloatProperty(default=2.0)
 
 
 class ROOM_PG_settings(bpy.types.PropertyGroup):
@@ -471,6 +487,64 @@ def _find_partner_wall(rooms, room_idx, wall_char, t_fallback):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Registry persistence helpers
+# ═════════════════════════════════════════════════════════════════════════════
+def _reg_to_entry(reg, entry):
+    """Copy a registry dict into a ROOM_PG_registry_entry PropertyGroup item."""
+    entry.x1 = reg["x1"]
+    entry.y1 = reg["y1"]
+    entry.x2 = reg["x2"]
+    entry.y2 = reg["y2"]
+    entry.t  = reg.get("t", 0.125)
+    entry.z  = reg.get("z", 0.0)
+    entry.door_walls   = ",".join(reg.get("door_walls", []))
+    entry.no_walls     = ",".join(reg.get("no_walls", []))
+    entry.door_anchors = json.dumps(reg.get("door_anchors", {}))
+    entry.obj_name     = reg.get("obj_name", "")
+    entry.door_width   = reg.get("door_width", 0.9)
+    entry.door_height  = reg.get("door_height", 2.0)
+
+
+def _entry_to_reg(entry):
+    """Convert a ROOM_PG_registry_entry back into a registry dict."""
+    return {
+        "x1": entry.x1, "y1": entry.y1,
+        "x2": entry.x2, "y2": entry.y2,
+        "t":  entry.t,
+        "z":  entry.z,
+        "door_walls":   [w for w in entry.door_walls.split(",") if w],
+        "no_walls":     [w for w in entry.no_walls.split(",") if w],
+        "door_anchors": json.loads(entry.door_anchors) if entry.door_anchors else {},
+        "obj_name":     entry.obj_name,
+        "door_width":   entry.door_width,
+        "door_height":  entry.door_height,
+    }
+
+
+def _sync_to_scene(context):
+    """Persist _room_list into scene.room_registry so it survives addon reloads."""
+    entries = getattr(context.scene, "room_registry", None)
+    if entries is None:
+        return
+    entries.clear()
+    for reg in ROOM_OT_draw._room_list:
+        _reg_to_entry(reg, entries.add())
+
+
+def _sync_from_scene(context):
+    """Repopulate _room_list from scene.room_registry when the list is empty
+    (e.g. after addon reload or Blender file load)."""
+    if ROOM_OT_draw._room_list:
+        return
+    entries = getattr(context.scene, "room_registry", None)
+    if not entries:
+        return
+    for entry in entries:
+        if entry.obj_name in bpy.data.objects:
+            ROOM_OT_draw._room_list.append(_entry_to_reg(entry))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # GPU highlight helpers
 # ═════════════════════════════════════════════════════════════════════════════
 def _wall_face_verts(r, wall_char, z, h, t_fallback):
@@ -615,6 +689,7 @@ class ROOM_OT_draw(bpy.types.Operator):
         if context.area.type != "VIEW_3D":
             self.report({"WARNING"}, "Must be used inside the 3D Viewport")
             return {"CANCELLED"}
+        _sync_from_scene(context)
         self._start        = None
         self._end          = None
         self._prev         = None
@@ -667,6 +742,7 @@ class ROOM_OT_draw(bpy.types.Operator):
                     ex_reg["door_walls"] = prev_dw
                     _rebuild_room_mesh(ex_reg, s)
                 self._hovered = None
+                _sync_to_scene(context)
                 context.area.tag_redraw()
                 self._msg(context,
                     f"Undid last room  ({len(self._session_rooms)} this session)  |  "
@@ -905,6 +981,7 @@ class ROOM_OT_draw(bpy.types.Operator):
                     }
                     ROOM_OT_draw._room_list.append(reg)
                     self._session_rooms.append((obj, reg, ex_reg, prev_dw))
+                    _sync_to_scene(context)
                     for o in list(context.selected_objects):
                         o.select_set(False)
                     obj.select_set(True)
@@ -991,6 +1068,13 @@ def _room_registry_cleanup(scene, depsgraph):
         r for r in ROOM_OT_draw._room_list
         if r.get("obj_name", "") in bpy.data.objects
     ]
+
+
+@bpy.app.handlers.persistent
+def _room_on_load(*args):
+    """Clear the in-memory registry when a new file is loaded so that
+    _sync_from_scene repopulates it from the freshly loaded scene data."""
+    ROOM_OT_draw._room_list.clear()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1107,6 +1191,7 @@ class ROOM_OT_add_door(bpy.types.Operator):
         if context.area.type != "VIEW_3D":
             self.report({"WARNING"}, "Must be used inside the 3D Viewport")
             return {"CANCELLED"}
+        _sync_from_scene(context)
         self._phase       = 0     # 0 = hover, 1 = slide
         self._hovered     = None  # (room_idx, wall_char, anchor)
         self._locked_idx  = None
@@ -1145,6 +1230,7 @@ class ROOM_OT_add_door(bpy.types.Operator):
                 self._remove_door(s, rooms, self._locked_idx,
                                   self._locked_wc, self._partner)
                 self._reset_to_hover(context)
+                _sync_to_scene(context)
                 return {'RUNNING_MODAL'}
             # Phase 0 → exit
             self._remove_draw_handle()
@@ -1204,6 +1290,7 @@ class ROOM_OT_add_door(bpy.types.Operator):
                     self._partner    = partner
                     self._hovered    = (room_idx, wall_char, anchor)
                     self._phase      = 1
+                    _sync_to_scene(context)
                     context.area.header_text_set(
                         "Drag to slide door · Click to confirm  |  RMB – cancel door")
                     context.area.tag_redraw()
@@ -1211,6 +1298,7 @@ class ROOM_OT_add_door(bpy.types.Operator):
             else:
                 # Confirm slide position → back to hover for next door
                 self._reset_to_hover(context)
+                _sync_to_scene(context)
 
             return {'RUNNING_MODAL'}
 
@@ -1381,6 +1469,7 @@ class ROOM_OT_apply_door_preset(bpy.types.Operator):
         if context.area.type != "VIEW_3D":
             self.report({"WARNING"}, "Must be used inside the 3D Viewport")
             return {"CANCELLED"}
+        _sync_from_scene(context)
         active = context.scene.room_active_door_preset
         if active == -1 or active >= len(context.scene.room_door_presets):
             self.report({"WARNING"}, "Select a door preset first")
@@ -1442,6 +1531,7 @@ class ROOM_OT_apply_door_preset(bpy.types.Operator):
                 p_reg["door_width"]  = dp.door_width
                 p_reg["door_height"] = dp.door_height
                 _rebuild_room_mesh(p_reg, s)
+            _sync_to_scene(context)
             context.area.tag_redraw()
             return {'RUNNING_MODAL'}
 
@@ -1563,6 +1653,7 @@ class ROOM_PT_door_panel(bpy.types.Panel):
 # Register / Unregister
 # ═════════════════════════════════════════════════════════════════════════════
 _classes = (
+    ROOM_PG_registry_entry,
     ROOM_PG_floor,
     ROOM_PG_door_preset,
     ROOM_PG_settings,
@@ -1589,6 +1680,7 @@ def register():
     bpy.types.Scene.room_active_floor       = bpy.props.IntProperty(default=-1)
     bpy.types.Scene.room_door_presets       = bpy.props.CollectionProperty(type=ROOM_PG_door_preset)
     bpy.types.Scene.room_active_door_preset = bpy.props.IntProperty(default=-1)
+    bpy.types.Scene.room_registry           = bpy.props.CollectionProperty(type=ROOM_PG_registry_entry)
 
     for km, kmi in ROOM_OT_draw._addon_kmaps:
         try: km.keymap_items.remove(kmi)
@@ -1604,11 +1696,15 @@ def register():
 
     if _room_registry_cleanup not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_room_registry_cleanup)
+    if _room_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_room_on_load)
 
 
 def unregister():
     if _room_registry_cleanup in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_room_registry_cleanup)
+    if _room_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_room_on_load)
 
     for km, kmi in ROOM_OT_draw._addon_kmaps:
         try: km.keymap_items.remove(kmi)
@@ -1616,7 +1712,8 @@ def unregister():
     ROOM_OT_draw._addon_kmaps.clear()
 
     for attr in ("room_settings", "room_floors", "room_active_floor",
-                 "room_door_presets", "room_active_door_preset"):
+                 "room_door_presets", "room_active_door_preset",
+                 "room_registry"):
         if hasattr(bpy.types.Scene, attr):
             delattr(bpy.types.Scene, attr)
 
