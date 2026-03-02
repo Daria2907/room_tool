@@ -1200,6 +1200,9 @@ class ROOM_OT_add_door(bpy.types.Operator):
         self._draw_handle = None
         self._add_draw_handle(context)
         context.window_manager.modal_handler_add(self)
+        context.scene.room_add_door_active = True
+        if context.area:
+            context.area.tag_redraw()
         context.area.header_text_set(
             "Hover wall · Click to place door  |  Enter – exit")
         return {"RUNNING_MODAL"}
@@ -1221,6 +1224,8 @@ class ROOM_OT_add_door(bpy.types.Operator):
         if event.type in {"RET", "NUMPAD_ENTER"} and event.value == 'PRESS':
             self._remove_draw_handle()
             context.area.header_text_set(None)
+            context.scene.room_add_door_active = False
+            context.area.tag_redraw()
             return {"FINISHED"}
 
         # ── ESC / RMB ─────────────────────────────────────────────────────
@@ -1235,6 +1240,8 @@ class ROOM_OT_add_door(bpy.types.Operator):
             # Phase 0 → exit
             self._remove_draw_handle()
             context.area.header_text_set(None)
+            context.scene.room_add_door_active = False
+            context.area.tag_redraw()
             return {"CANCELLED"}
 
         # ── Mouse move ────────────────────────────────────────────────────
@@ -1307,6 +1314,9 @@ class ROOM_OT_add_door(bpy.types.Operator):
     def cancel(self, context):
         self._remove_draw_handle()
         context.area.header_text_set(None)
+        context.scene.room_add_door_active = False
+        if context.area:
+            context.area.tag_redraw()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1614,7 +1624,9 @@ class ROOM_PT_door_panel(bpy.types.Panel):
         s = context.scene.room_settings
         col = L.column(align=True)
         col.scale_y = 1.3
-        col.operator("room.add_door", icon="OUTLINER_OB_EMPTY", text="Add Door")
+        is_adding = getattr(context.scene, "room_add_door_active", False)
+        col.operator("room.add_door", icon="OUTLINER_OB_EMPTY",
+                     text="Add Door  (Ctrl+Shift+D)", depress=is_adding)
         col.separator()
 
         # Door dimensions + save preset
@@ -1681,6 +1693,7 @@ def register():
     bpy.types.Scene.room_door_presets       = bpy.props.CollectionProperty(type=ROOM_PG_door_preset)
     bpy.types.Scene.room_active_door_preset = bpy.props.IntProperty(default=-1)
     bpy.types.Scene.room_registry           = bpy.props.CollectionProperty(type=ROOM_PG_registry_entry)
+    bpy.types.Scene.room_add_door_active    = bpy.props.BoolProperty(default=False)
 
     for km, kmi in ROOM_OT_draw._addon_kmaps:
         try: km.keymap_items.remove(kmi)
@@ -1693,6 +1706,8 @@ def register():
         km  = kc.keymaps.new(name="3D View", space_type="VIEW_3D")
         kmi = km.keymap_items.new("room.draw", "R", "PRESS", shift=True)
         ROOM_OT_draw._addon_kmaps.append((km, kmi))
+        kmi2 = km.keymap_items.new("room.add_door", "D", "PRESS", shift=True, ctrl=True)
+        ROOM_OT_draw._addon_kmaps.append((km, kmi2))
 
     if _room_registry_cleanup not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_room_registry_cleanup)
@@ -1713,7 +1728,7 @@ def unregister():
 
     for attr in ("room_settings", "room_floors", "room_active_floor",
                  "room_door_presets", "room_active_door_preset",
-                 "room_registry"):
+                 "room_registry", "room_add_door_active"):
         if hasattr(bpy.types.Scene, attr):
             delattr(bpy.types.Scene, attr)
 
