@@ -23,6 +23,14 @@ class ROOM_PG_floor(bpy.types.PropertyGroup):
     z_offset: bpy.props.FloatProperty(name="Z Offset", default=0.0)
 
 
+class ROOM_PG_door_preset(bpy.types.PropertyGroup):
+    """One saved door-size preset (name inherited from PropertyGroup)."""
+    door_width : bpy.props.FloatProperty(
+        name="Width",  default=0.9, min=0.1, max=10.0, unit="LENGTH")
+    door_height: bpy.props.FloatProperty(
+        name="Height", default=2.0, min=0.1, max=15.0, unit="LENGTH")
+
+
 class ROOM_PG_settings(bpy.types.PropertyGroup):
     z_foundation : bpy.props.FloatProperty(
         name="Foundation Z",
@@ -78,21 +86,25 @@ def _face4(bm, v0, v1, v2, v3):
     bm.faces.new([bm.verts.new(co) for co in (v0, v1, v2, v3)])
 
 
-def _fill_room(bm, x1, y1, x2, y2, z, s, door_walls=(), no_walls=(), door_anchors=None):
+def _fill_room(bm, x1, y1, x2, y2, z, s, door_walls=(), no_walls=(), door_anchors=None,
+               door_width=None, door_height=None):
     """
     Populate *bm* with room geometry as an interior shell.
     door_walls:   wall chars that get a door opening.
     no_walls:     wall chars to skip entirely.
     door_anchors: {wall_char: center_along_wall} to pin door centres.
                   E/W walls use a Y anchor; N/S walls use an X anchor.
+    door_width/door_height: per-room overrides; fall back to s.door_width/door_height.
     """
     da = door_anchors or {}
     t  = s.wall_thickness
     h  = s.wall_height
     zt = z + h
     fd = t          # tunnel reveal depth = wall thickness
-    dw = min(s.door_width,  (x2 - x1) * 0.85) if s.add_door else 0
-    dh = min(s.door_height, h - t)              if s.add_door else 0
+    dw = min(door_width  if door_width  is not None else s.door_width,
+             (x2 - x1) * 0.85) if s.add_door else 0
+    dh = min(door_height if door_height is not None else s.door_height,
+             h - t)             if s.add_door else 0
 
     # Pre-compute strip split positions used by both walls and ceiling/floor
     _ey = []   # Y splits for E/W door columns
@@ -273,7 +285,9 @@ def _rebuild_room_mesh(reg, s):
                reg.get("z", s.z_foundation), s,
                door_walls=tuple(reg.get("door_walls", [])),
                no_walls=tuple(reg.get("no_walls", [])),
-               door_anchors=reg.get("door_anchors", {}))
+               door_anchors=reg.get("door_anchors", {}),
+               door_width=reg.get("door_width"),
+               door_height=reg.get("door_height"))
     bm.to_mesh(me)
     bm.free()
     me.update()
@@ -354,6 +368,68 @@ def _wall_snap_any(pt, rooms, t_fallback):
                 best_d = dist
                 best   = (i, wc, anchor)
     return best
+
+
+def _door_snap(pt, rooms, s, t_fallback):
+    """Return (room_idx, wall_char) of the nearest door frame, or None.
+    Only walls that already have a door are considered; cursor must be within
+    the door-width span along that wall."""
+    best_d, best = _SNAP_DIST, None
+    px, py = pt.x, pt.y
+    for i, r in enumerate(rooms):
+        dw = r.get("door_width", s.door_width)
+        for wc in r.get("door_walls", []):
+            anchor = r.get("door_anchors", {}).get(
+                wc, (r["y1"] + r["y2"]) * 0.5 if wc in ('E', 'W')
+                    else (r["x1"] + r["x2"]) * 0.5)
+            x1, y1, x2, y2 = r["x1"], r["y1"], r["x2"], r["y2"]
+            t = r.get("t", t_fallback)
+            if wc == 'E':
+                dist  = abs(px - x2)
+                along = py
+                lo, hi = anchor - dw * 0.5 - t, anchor + dw * 0.5 + t
+            elif wc == 'W':
+                dist  = abs(px - x1)
+                along = py
+                lo, hi = anchor - dw * 0.5 - t, anchor + dw * 0.5 + t
+            elif wc == 'N':
+                dist  = abs(py - y2)
+                along = px
+                lo, hi = anchor - dw * 0.5 - t, anchor + dw * 0.5 + t
+            else:  # S
+                dist  = abs(py - y1)
+                along = px
+                lo, hi = anchor - dw * 0.5 - t, anchor + dw * 0.5 + t
+            if dist < best_d and lo <= along <= hi:
+                best_d = dist
+                best   = (i, wc)
+    return best
+
+
+def _door_frame_verts(r, wall_char, z, dw, dh):
+    """Return 4 CCW 3-D corners of the door opening face for GPU highlighting."""
+    anchor = r.get("door_anchors", {}).get(
+        wall_char,
+        (r["y1"] + r["y2"]) * 0.5 if wall_char in ('E', 'W')
+                                    else (r["x1"] + r["x2"]) * 0.5)
+    x1, y1, x2, y2 = r["x1"], r["y1"], r["x2"], r["y2"]
+    z0, z1 = z, z + dh
+    if wall_char == 'E':
+        lo = max(y1, anchor - dw * 0.5)
+        hi = min(y2, anchor + dw * 0.5)
+        return [(x2, lo, z0), (x2, hi, z0), (x2, hi, z1), (x2, lo, z1)]
+    elif wall_char == 'W':
+        lo = max(y1, anchor - dw * 0.5)
+        hi = min(y2, anchor + dw * 0.5)
+        return [(x1, hi, z0), (x1, lo, z0), (x1, lo, z1), (x1, hi, z1)]
+    elif wall_char == 'N':
+        lo = max(x1, anchor - dw * 0.5)
+        hi = min(x2, anchor + dw * 0.5)
+        return [(lo, y2, z0), (hi, y2, z0), (hi, y2, z1), (lo, y2, z1)]
+    else:  # S
+        lo = max(x1, anchor - dw * 0.5)
+        hi = min(x2, anchor + dw * 0.5)
+        return [(hi, y1, z0), (lo, y1, z0), (lo, y1, z1), (hi, y1, z1)]
 
 
 def _find_partner_wall(rooms, room_idx, wall_char, t_fallback):
@@ -824,6 +900,8 @@ class ROOM_OT_draw(bpy.types.Operator):
                         "no_walls":     list(nw),
                         "door_anchors": dict(da),
                         "obj_name":     obj.name,
+                        "door_width":   s.door_width,
+                        "door_height":  s.door_height,
                     }
                     ROOM_OT_draw._room_list.append(reg)
                     self._session_rooms.append((obj, reg, ex_reg, prev_dw))
@@ -1196,6 +1274,185 @@ class ROOM_OT_remove_floor(bpy.types.Operator):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Door-preset operators
+# ═════════════════════════════════════════════════════════════════════════════
+class ROOM_OT_save_door_preset(bpy.types.Operator):
+    bl_idname     = "room.save_door_preset"
+    bl_label      = "Save Door Preset"
+    bl_description = "Save current door dimensions as a named preset"
+
+    def execute(self, context):
+        s       = context.scene.room_settings
+        presets = context.scene.room_door_presets
+        n       = len(presets) + 1
+        dp           = presets.add()
+        dp.name      = f"Door.{n:02}"
+        dp.door_width  = s.door_width
+        dp.door_height = s.door_height
+        context.scene.room_active_door_preset = len(presets) - 1
+        return {"FINISHED"}
+
+
+class ROOM_OT_select_door_preset(bpy.types.Operator):
+    bl_idname     = "room.select_door_preset"
+    bl_label      = "Select Door Preset"
+    bl_description = "Switch active door preset and copy its dimensions to the settings"
+
+    preset_index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        presets = context.scene.room_door_presets
+        idx     = self.preset_index
+        if 0 <= idx < len(presets):
+            context.scene.room_active_door_preset = idx
+            dp = presets[idx]
+            context.scene.room_settings.door_width  = dp.door_width
+            context.scene.room_settings.door_height = dp.door_height
+        return {"FINISHED"}
+
+
+class ROOM_OT_remove_door_preset(bpy.types.Operator):
+    bl_idname     = "room.remove_door_preset"
+    bl_label      = "Remove Door Preset"
+    bl_description = "Remove this door preset"
+
+    preset_index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        presets = context.scene.room_door_presets
+        idx     = self.preset_index
+        if 0 <= idx < len(presets):
+            presets.remove(idx)
+            active = context.scene.room_active_door_preset
+            context.scene.room_active_door_preset = max(-1, min(active, len(presets) - 1))
+        return {"FINISHED"}
+
+
+class ROOM_OT_apply_door_preset(bpy.types.Operator):
+    bl_idname  = "room.apply_door_preset"
+    bl_label   = "Apply Preset to Door Frame"
+    bl_description = ("Hover a door frame to highlight it, click to resize it "
+                      "with the active door preset.  RMB/Enter to exit.")
+    bl_options = {"REGISTER", "UNDO"}
+
+    # ── GPU draw callback ──────────────────────────────────────────────────
+    def _draw_cb(self, context):
+        if self._hovered is None:
+            return
+        room_idx, wall_char = self._hovered
+        rooms = ROOM_OT_draw._room_list
+        if room_idx >= len(rooms):
+            return
+        s  = context.scene.room_settings
+        r  = rooms[room_idx]
+        dw = r.get("door_width",  s.door_width)
+        dh = r.get("door_height", s.door_height)
+        z  = r.get("z", s.z_foundation)
+        verts = _door_frame_verts(r, wall_char, z, dw, dh)
+        idx_fill = [(0, 1, 2), (0, 2, 3)]
+        idx_line = [(0, 1), (1, 2), (2, 3), (3, 0)]
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('LESS_EQUAL')
+        b = batch_for_shader(shader, 'TRIS', {"pos": verts}, indices=idx_fill)
+        shader.uniform_float("color", (1.0, 0.55, 0.0, 0.28))
+        b.draw(shader)
+        gpu.state.line_width_set(2.5)
+        b2 = batch_for_shader(shader, 'LINES', {"pos": verts}, indices=idx_line)
+        shader.uniform_float("color", (1.0, 0.78, 0.0, 0.95))
+        b2.draw(shader)
+        gpu.state.blend_set('NONE')
+        gpu.state.depth_test_set('NONE')
+
+    def _add_draw_handle(self, context):
+        self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            self._draw_cb, (context,), 'WINDOW', 'POST_VIEW')
+
+    def _remove_draw_handle(self):
+        if self._draw_handle:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(self._draw_handle, 'WINDOW')
+            except Exception:
+                pass
+            self._draw_handle = None
+
+    # ── lifecycle ─────────────────────────────────────────────────────────
+    def invoke(self, context, event):
+        if context.area.type != "VIEW_3D":
+            self.report({"WARNING"}, "Must be used inside the 3D Viewport")
+            return {"CANCELLED"}
+        active = context.scene.room_active_door_preset
+        if active == -1 or active >= len(context.scene.room_door_presets):
+            self.report({"WARNING"}, "Select a door preset first")
+            return {"CANCELLED"}
+        self._hovered     = None
+        self._draw_handle = None
+        self._add_draw_handle(context)
+        context.window_manager.modal_handler_add(self)
+        context.area.header_text_set(
+            "Hover door frame · Click to apply preset  |  Enter/RMB – exit")
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        s       = context.scene.room_settings
+        rooms   = ROOM_OT_draw._room_list
+        presets = context.scene.room_door_presets
+        active  = context.scene.room_active_door_preset
+
+        # Navigation pass-through
+        if event.type in {
+                'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
+                'NUMPAD_0', 'NUMPAD_1', 'NUMPAD_2', 'NUMPAD_3',
+                'NUMPAD_4', 'NUMPAD_5', 'NUMPAD_6', 'NUMPAD_7',
+                'NUMPAD_8', 'NUMPAD_9', 'NUMPAD_DECIMAL', 'NUMPAD_PERIOD',
+                'F', 'TILDE'}:
+            return {'PASS_THROUGH'}
+
+        # Exit
+        if event.type in {"RET", "NUMPAD_ENTER", "RIGHTMOUSE", "ESC"} and event.value == 'PRESS':
+            self._remove_draw_handle()
+            context.area.header_text_set(None)
+            return {"FINISHED"}
+
+        # Mouse move — update hover
+        if event.type == "MOUSEMOVE":
+            pt = _ray_to_z(context, event, s.z_foundation)
+            self._hovered = _door_snap(pt, rooms, s, s.wall_thickness) if pt else None
+            context.area.tag_redraw()
+            return {'PASS_THROUGH'}
+
+        # Left click — apply preset to hovered door frame
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            if self._hovered is None:
+                return {'RUNNING_MODAL'}
+            if active < 0 or active >= len(presets):
+                self.report({"WARNING"}, "No active door preset")
+                return {'RUNNING_MODAL'}
+            room_idx, wall_char = self._hovered
+            dp = presets[active]
+            reg = rooms[room_idx]
+            reg["door_width"]  = dp.door_width
+            reg["door_height"] = dp.door_height
+            _rebuild_room_mesh(reg, s)
+            # Update partner if adjacent
+            partner = _find_partner_wall(rooms, room_idx, wall_char, s.wall_thickness)
+            if partner is not None:
+                p_idx, _p_wc = partner
+                p_reg = rooms[p_idx]
+                p_reg["door_width"]  = dp.door_width
+                p_reg["door_height"] = dp.door_height
+                _rebuild_room_mesh(p_reg, s)
+            context.area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        return {'PASS_THROUGH'}
+
+    def cancel(self, context):
+        self._remove_draw_handle()
+        context.area.header_text_set(None)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # N-Panel
 # ═════════════════════════════════════════════════════════════════════════════
 class ROOM_PT_panel(bpy.types.Panel):
@@ -1269,9 +1526,37 @@ class ROOM_PT_door_panel(bpy.types.Panel):
         col.scale_y = 1.3
         col.operator("room.add_door", icon="OUTLINER_OB_EMPTY", text="Add Door")
         col.separator()
+
+        # Door dimensions + save preset
         col = L.column(align=True)
         col.prop(s, "door_width")
         col.prop(s, "door_height")
+        col.operator("room.save_door_preset", icon="ADD", text="Save Door Preset")
+
+        # Preset list
+        presets = context.scene.room_door_presets
+        active  = context.scene.room_active_door_preset
+        if presets:
+            col.separator()
+            for i, dp in enumerate(presets):
+                is_active = (i == active)
+                row = col.row(align=True)
+                op = row.operator(
+                    "room.select_door_preset",
+                    text=f"{dp.name}  {dp.door_width:.2f}\u00d7{dp.door_height:.2f}m",
+                    icon="LAYER_ACTIVE" if is_active else "LAYER_USED",
+                    depress=is_active,
+                )
+                op.preset_index = i
+                rem = row.operator("room.remove_door_preset", text="", icon="X")
+                rem.preset_index = i
+                if is_active:
+                    col.prop(dp, "name", text="Rename")
+
+        if active != -1:
+            col.separator()
+            col.operator("room.apply_door_preset",
+                         icon="EYEDROPPER", text="Apply Preset to Door Frame")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1279,6 +1564,7 @@ class ROOM_PT_door_panel(bpy.types.Panel):
 # ═════════════════════════════════════════════════════════════════════════════
 _classes = (
     ROOM_PG_floor,
+    ROOM_PG_door_preset,
     ROOM_PG_settings,
     ROOM_OT_draw,
     ROOM_OT_clear,
@@ -1286,6 +1572,10 @@ _classes = (
     ROOM_OT_add_floor,
     ROOM_OT_select_floor,
     ROOM_OT_remove_floor,
+    ROOM_OT_save_door_preset,
+    ROOM_OT_select_door_preset,
+    ROOM_OT_remove_door_preset,
+    ROOM_OT_apply_door_preset,
     ROOM_PT_panel,
     ROOM_PT_door_panel,
 )
@@ -1294,9 +1584,11 @@ _classes = (
 def register():
     for c in _classes:
         bpy.utils.register_class(c)
-    bpy.types.Scene.room_settings     = bpy.props.PointerProperty(type=ROOM_PG_settings)
-    bpy.types.Scene.room_floors       = bpy.props.CollectionProperty(type=ROOM_PG_floor)
-    bpy.types.Scene.room_active_floor = bpy.props.IntProperty(default=-1)
+    bpy.types.Scene.room_settings           = bpy.props.PointerProperty(type=ROOM_PG_settings)
+    bpy.types.Scene.room_floors             = bpy.props.CollectionProperty(type=ROOM_PG_floor)
+    bpy.types.Scene.room_active_floor       = bpy.props.IntProperty(default=-1)
+    bpy.types.Scene.room_door_presets       = bpy.props.CollectionProperty(type=ROOM_PG_door_preset)
+    bpy.types.Scene.room_active_door_preset = bpy.props.IntProperty(default=-1)
 
     for km, kmi in ROOM_OT_draw._addon_kmaps:
         try: km.keymap_items.remove(kmi)
@@ -1323,7 +1615,8 @@ def unregister():
         except Exception: pass
     ROOM_OT_draw._addon_kmaps.clear()
 
-    for attr in ("room_settings", "room_floors", "room_active_floor"):
+    for attr in ("room_settings", "room_floors", "room_active_floor",
+                 "room_door_presets", "room_active_door_preset"):
         if hasattr(bpy.types.Scene, attr):
             delattr(bpy.types.Scene, attr)
 
