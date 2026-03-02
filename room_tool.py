@@ -42,6 +42,7 @@ class ROOM_PG_registry_entry(bpy.types.PropertyGroup):
     door_walls:   bpy.props.StringProperty()   # comma-separated e.g. "S,W"
     no_walls:     bpy.props.StringProperty()   # comma-separated
     door_anchors: bpy.props.StringProperty()   # JSON e.g. '{"S": 1.5}'
+    door_dims:    bpy.props.StringProperty(default="{}")  # JSON e.g. '{"S": {"w": 1.2, "h": 2.1}}'
     obj_name:     bpy.props.StringProperty()
     door_width:   bpy.props.FloatProperty(default=0.9)
     door_height:  bpy.props.FloatProperty(default=2.0)
@@ -103,146 +104,165 @@ def _face4(bm, v0, v1, v2, v3):
 
 
 def _fill_room(bm, x1, y1, x2, y2, z, s, door_walls=(), no_walls=(), door_anchors=None,
-               door_width=None, door_height=None):
+               door_width=None, door_height=None, door_dims=None):
     """
     Populate *bm* with room geometry as an interior shell.
     door_walls:   wall chars that get a door opening.
     no_walls:     wall chars to skip entirely.
     door_anchors: {wall_char: center_along_wall} to pin door centres.
                   E/W walls use a Y anchor; N/S walls use an X anchor.
-    door_width/door_height: per-room overrides; fall back to s.door_width/door_height.
+    door_dims:    {wall_char: {"w": float, "h": float}} per-door overrides.
+    door_width/door_height: room-level fallback; fall back to s.door_width/door_height.
     """
+    dd = door_dims or {}
     da = door_anchors or {}
     t  = s.wall_thickness
     h  = s.wall_height
     zt = z + h
     fd = t * 0.5    # tunnel reveal depth = half wall thickness (two frames meet flush)
-    dw = min(door_width  if door_width  is not None else s.door_width,
-             (x2 - x1) * 0.85) if s.add_door else 0
-    dh = min(door_height if door_height is not None else s.door_height,
-             h - t)             if s.add_door else 0
+
+    # Per-wall door size helpers ─────────────────────────────────────────────
+    def _dw(wc):
+        """Door opening width for wall wc, clamped to 85 % of room span."""
+        raw = dd.get(wc, {}).get("w", door_width if door_width is not None else s.door_width)
+        span = (x2 - x1) if wc in ('N', 'S') else (y2 - y1)
+        return min(raw, span * 0.85)
+
+    def _dh(wc):
+        """Door opening height for wall wc, clamped below ceiling."""
+        raw = dd.get(wc, {}).get("h", door_height if door_height is not None else s.door_height)
+        return min(raw, h - t)
+
+    # Fallback dh for non-door wall height seams
+    _dh_fallback = min(door_height if door_height is not None else s.door_height, h - t)
 
     # Pre-compute strip split positions used by both walls and ceiling/floor
     _ey = []   # Y splits for E/W door columns
     _ex = []   # X splits for N/S door columns
-    if s.add_door and dw > 0:
+    if s.add_door:
         for _wc in door_walls:
-            if _wc in ('E', 'W'):
-                _cy = da.get(_wc, (y1 + y2) * 0.5)
-                _ey += [max(y1, _cy - dw * 0.5), min(y2, _cy + dw * 0.5)]
-            elif _wc in ('N', 'S'):
-                _cx = da.get(_wc, (x1 + x2) * 0.5)
-                _ex += [max(x1, _cx - dw * 0.5), min(x2, _cx + dw * 0.5)]
+            _w = _dw(_wc)
+            if _w > 0:
+                if _wc in ('E', 'W'):
+                    _cy = da.get(_wc, (y1 + y2) * 0.5)
+                    _ey += [max(y1, _cy - _w * 0.5), min(y2, _cy + _w * 0.5)]
+                elif _wc in ('N', 'S'):
+                    _cx = da.get(_wc, (x1 + x2) * 0.5)
+                    _ex += [max(x1, _cx - _w * 0.5), min(x2, _cx + _w * 0.5)]
     _ey = sorted(set(_ey))
     _ex = sorted(set(_ex))
 
     # ── South inner panel (at y = y1, reveals go –Y) ──────────────────────────
     if 'S' not in no_walls:
-        if 'S' in door_walls and s.add_door and dw > 0:
+        dw_s = _dw('S'); dh_s = _dh('S')
+        if 'S' in door_walls and s.add_door and dw_s > 0:
             cx = da.get('S', (x1 + x2) * 0.5)
-            dl = max(x1, cx - dw * 0.5)   # clamp: never west of room
-            dr = min(x2, cx + dw * 0.5)   # clamp: never east of room
+            dl = max(x1, cx - dw_s * 0.5)   # clamp: never west of room
+            dr = min(x2, cx + dw_s * 0.5)   # clamp: never east of room
             if dl > x1:
-                _face4(bm, (dl,y1,z),    (x1,y1,z),    (x1,y1,z+dh),    (dl,y1,z+dh))
-                _face4(bm, (dl,y1,z+dh), (x1,y1,z+dh), (x1,y1,zt),      (dl,y1,zt))
+                _face4(bm, (dl,y1,z),    (x1,y1,z),    (x1,y1,z+dh_s),    (dl,y1,z+dh_s))
+                _face4(bm, (dl,y1,z+dh_s), (x1,y1,z+dh_s), (x1,y1,zt),    (dl,y1,zt))
             if dr < x2:
-                _face4(bm, (x2,y1,z),    (dr,y1,z),    (dr,y1,z+dh),    (x2,y1,z+dh))
-                _face4(bm, (x2,y1,z+dh), (dr,y1,z+dh), (dr,y1,zt),      (x2,y1,zt))
-            _face4(bm, (dr,y1,z+dh), (dl,y1,z+dh), (dl,y1,zt),      (dr,y1,zt))
-            _face4(bm, (dl,y1,z),    (dl,y1-fd,z),    (dl,y1-fd,z+dh), (dl,y1,z+dh))
-            _face4(bm, (dr,y1-fd,z), (dr,y1,z),       (dr,y1,z+dh),    (dr,y1-fd,z+dh))
-            _face4(bm, (dr,y1,z+dh), (dl,y1,z+dh),   (dl,y1-fd,z+dh), (dr,y1-fd,z+dh))
-            _face4(bm, (dl,y1-fd,z), (dr,y1-fd,z),   (dr,y1,z),       (dl,y1,z))
+                _face4(bm, (x2,y1,z),    (dr,y1,z),    (dr,y1,z+dh_s),    (x2,y1,z+dh_s))
+                _face4(bm, (x2,y1,z+dh_s), (dr,y1,z+dh_s), (dr,y1,zt),    (x2,y1,zt))
+            _face4(bm, (dr,y1,z+dh_s), (dl,y1,z+dh_s), (dl,y1,zt),     (dr,y1,zt))
+            _face4(bm, (dl,y1,z),      (dl,y1-fd,z),    (dl,y1-fd,z+dh_s), (dl,y1,z+dh_s))
+            _face4(bm, (dr,y1-fd,z),   (dr,y1,z),       (dr,y1,z+dh_s),    (dr,y1-fd,z+dh_s))
+            _face4(bm, (dr,y1,z+dh_s), (dl,y1,z+dh_s),  (dl,y1-fd,z+dh_s), (dr,y1-fd,z+dh_s))
+            _face4(bm, (dl,y1-fd,z),   (dr,y1-fd,z),    (dr,y1,z),         (dl,y1,z))
         else:
             if _ex:
                 xs = [x1] + _ex + [x2]
                 for i in range(len(xs) - 1):
-                    _face4(bm, (xs[i+1],y1,z),    (xs[i],y1,z),    (xs[i],y1,z+dh),    (xs[i+1],y1,z+dh))
-                    _face4(bm, (xs[i+1],y1,z+dh), (xs[i],y1,z+dh), (xs[i],y1,zt),      (xs[i+1],y1,zt))
+                    _face4(bm, (xs[i+1],y1,z),           (xs[i],y1,z),           (xs[i],y1,z+_dh_fallback),   (xs[i+1],y1,z+_dh_fallback))
+                    _face4(bm, (xs[i+1],y1,z+_dh_fallback), (xs[i],y1,z+_dh_fallback), (xs[i],y1,zt),         (xs[i+1],y1,zt))
             else:
-                _face4(bm, (x2,y1,z),    (x1,y1,z),    (x1,y1,z+dh), (x2,y1,z+dh))
-                _face4(bm, (x2,y1,z+dh), (x1,y1,z+dh), (x1,y1,zt),   (x2,y1,zt))
+                _face4(bm, (x2,y1,z),    (x1,y1,z),    (x1,y1,z+_dh_fallback), (x2,y1,z+_dh_fallback))
+                _face4(bm, (x2,y1,z+_dh_fallback), (x1,y1,z+_dh_fallback), (x1,y1,zt), (x2,y1,zt))
 
     # ── North inner panel (at y = y2, reveals go +Y) ──────────────────────────
     if 'N' not in no_walls:
-        if 'N' in door_walls and s.add_door and dw > 0:
+        dw_n = _dw('N'); dh_n = _dh('N')
+        if 'N' in door_walls and s.add_door and dw_n > 0:
             cx = da.get('N', (x1 + x2) * 0.5)
-            dl = max(x1, cx - dw * 0.5)   # clamp: never west of room
-            dr = min(x2, cx + dw * 0.5)   # clamp: never east of room
+            dl = max(x1, cx - dw_n * 0.5)   # clamp: never west of room
+            dr = min(x2, cx + dw_n * 0.5)   # clamp: never east of room
             if dl > x1:
-                _face4(bm, (x1,y2,z),    (dl,y2,z),    (dl,y2,z+dh),    (x1,y2,z+dh))
-                _face4(bm, (x1,y2,z+dh), (dl,y2,z+dh), (dl,y2,zt),      (x1,y2,zt))
+                _face4(bm, (x1,y2,z),    (dl,y2,z),    (dl,y2,z+dh_n),    (x1,y2,z+dh_n))
+                _face4(bm, (x1,y2,z+dh_n), (dl,y2,z+dh_n), (dl,y2,zt),    (x1,y2,zt))
             if dr < x2:
-                _face4(bm, (dr,y2,z),    (x2,y2,z),    (x2,y2,z+dh),    (dr,y2,z+dh))
-                _face4(bm, (dr,y2,z+dh), (x2,y2,z+dh), (x2,y2,zt),      (dr,y2,zt))
-            _face4(bm, (dl,y2,z+dh), (dr,y2,z+dh), (dr,y2,zt),      (dl,y2,zt))
-            _face4(bm, (dl,y2+fd,z), (dl,y2,z),    (dl,y2,z+dh),    (dl,y2+fd,z+dh))
-            _face4(bm, (dr,y2,z),    (dr,y2+fd,z), (dr,y2+fd,z+dh), (dr,y2,z+dh))
-            _face4(bm, (dl,y2,z+dh), (dr,y2,z+dh), (dr,y2+fd,z+dh), (dl,y2+fd,z+dh))
-            _face4(bm, (dl,y2,z),    (dr,y2,z),    (dr,y2+fd,z),    (dl,y2+fd,z))
+                _face4(bm, (dr,y2,z),    (x2,y2,z),    (x2,y2,z+dh_n),    (dr,y2,z+dh_n))
+                _face4(bm, (dr,y2,z+dh_n), (x2,y2,z+dh_n), (x2,y2,zt),    (dr,y2,zt))
+            _face4(bm, (dl,y2,z+dh_n), (dr,y2,z+dh_n), (dr,y2,zt),     (dl,y2,zt))
+            _face4(bm, (dl,y2+fd,z),   (dl,y2,z),      (dl,y2,z+dh_n),    (dl,y2+fd,z+dh_n))
+            _face4(bm, (dr,y2,z),      (dr,y2+fd,z),   (dr,y2+fd,z+dh_n), (dr,y2,z+dh_n))
+            _face4(bm, (dl,y2,z+dh_n), (dr,y2,z+dh_n), (dr,y2+fd,z+dh_n), (dl,y2+fd,z+dh_n))
+            _face4(bm, (dl,y2,z),      (dr,y2,z),      (dr,y2+fd,z),      (dl,y2+fd,z))
         else:
             if _ex:
                 xs = [x1] + _ex + [x2]
                 for i in range(len(xs) - 1):
-                    _face4(bm, (xs[i],y2,z),    (xs[i+1],y2,z),    (xs[i+1],y2,z+dh), (xs[i],y2,z+dh))
-                    _face4(bm, (xs[i],y2,z+dh), (xs[i+1],y2,z+dh), (xs[i+1],y2,zt),   (xs[i],y2,zt))
+                    _face4(bm, (xs[i],y2,z),           (xs[i+1],y2,z),           (xs[i+1],y2,z+_dh_fallback), (xs[i],y2,z+_dh_fallback))
+                    _face4(bm, (xs[i],y2,z+_dh_fallback), (xs[i+1],y2,z+_dh_fallback), (xs[i+1],y2,zt),       (xs[i],y2,zt))
             else:
-                _face4(bm, (x1,y2,z),    (x2,y2,z),    (x2,y2,z+dh), (x1,y2,z+dh))
-                _face4(bm, (x1,y2,z+dh), (x2,y2,z+dh), (x2,y2,zt),   (x1,y2,zt))
+                _face4(bm, (x1,y2,z),    (x2,y2,z),    (x2,y2,z+_dh_fallback), (x1,y2,z+_dh_fallback))
+                _face4(bm, (x1,y2,z+_dh_fallback), (x2,y2,z+_dh_fallback), (x2,y2,zt), (x1,y2,zt))
 
     # ── West inner panel (at x = x1, reveals go –X) ───────────────────────────
     if 'W' not in no_walls:
-        if 'W' in door_walls and s.add_door and dw > 0:
+        dw_w = _dw('W'); dh_w = _dh('W')
+        if 'W' in door_walls and s.add_door and dw_w > 0:
             cy = da.get('W', (y1 + y2) * 0.5)
-            db = max(y1, cy - dw * 0.5)   # clamp: never south of room
-            df = min(y2, cy + dw * 0.5)   # clamp: never north of room
+            db = max(y1, cy - dw_w * 0.5)   # clamp: never south of room
+            df = min(y2, cy + dw_w * 0.5)   # clamp: never north of room
             if db > y1:
-                _face4(bm, (x1,y1,z),    (x1,db,z),    (x1,db,z+dh),    (x1,y1,z+dh))
-                _face4(bm, (x1,y1,z+dh), (x1,db,z+dh), (x1,db,zt),      (x1,y1,zt))
+                _face4(bm, (x1,y1,z),    (x1,db,z),    (x1,db,z+dh_w),    (x1,y1,z+dh_w))
+                _face4(bm, (x1,y1,z+dh_w), (x1,db,z+dh_w), (x1,db,zt),    (x1,y1,zt))
             if df < y2:
-                _face4(bm, (x1,df,z),    (x1,y2,z),    (x1,y2,z+dh),    (x1,df,z+dh))
-                _face4(bm, (x1,df,z+dh), (x1,y2,z+dh), (x1,y2,zt),      (x1,df,zt))
-            _face4(bm, (x1,db,z+dh), (x1,df,z+dh), (x1,df,zt),      (x1,db,zt))
-            _face4(bm, (x1,db,z),    (x1-fd,db,z),    (x1-fd,db,z+dh), (x1,db,z+dh))
-            _face4(bm, (x1-fd,df,z), (x1,df,z),       (x1,df,z+dh),    (x1-fd,df,z+dh))
-            _face4(bm, (x1,db,z+dh), (x1-fd,db,z+dh), (x1-fd,df,z+dh), (x1,df,z+dh))
-            _face4(bm, (x1-fd,db,z), (x1,db,z),       (x1,df,z),       (x1-fd,df,z))
+                _face4(bm, (x1,df,z),    (x1,y2,z),    (x1,y2,z+dh_w),    (x1,df,z+dh_w))
+                _face4(bm, (x1,df,z+dh_w), (x1,y2,z+dh_w), (x1,y2,zt),    (x1,df,zt))
+            _face4(bm, (x1,db,z+dh_w), (x1,df,z+dh_w), (x1,df,zt),     (x1,db,zt))
+            _face4(bm, (x1,db,z),      (x1-fd,db,z),    (x1-fd,db,z+dh_w), (x1,db,z+dh_w))
+            _face4(bm, (x1-fd,df,z),   (x1,df,z),       (x1,df,z+dh_w),    (x1-fd,df,z+dh_w))
+            _face4(bm, (x1,db,z+dh_w), (x1-fd,db,z+dh_w), (x1-fd,df,z+dh_w), (x1,df,z+dh_w))
+            _face4(bm, (x1-fd,db,z),   (x1,db,z),       (x1,df,z),         (x1-fd,df,z))
         else:
             if _ey:
                 ys = [y1] + _ey + [y2]
                 for i in range(len(ys) - 1):
-                    _face4(bm, (x1,ys[i],z),    (x1,ys[i+1],z),    (x1,ys[i+1],z+dh), (x1,ys[i],z+dh))
-                    _face4(bm, (x1,ys[i],z+dh), (x1,ys[i+1],z+dh), (x1,ys[i+1],zt),   (x1,ys[i],zt))
+                    _face4(bm, (x1,ys[i],z),           (x1,ys[i+1],z),           (x1,ys[i+1],z+_dh_fallback), (x1,ys[i],z+_dh_fallback))
+                    _face4(bm, (x1,ys[i],z+_dh_fallback), (x1,ys[i+1],z+_dh_fallback), (x1,ys[i+1],zt),       (x1,ys[i],zt))
             else:
-                _face4(bm, (x1,y1,z),    (x1,y2,z),    (x1,y2,z+dh), (x1,y1,z+dh))
-                _face4(bm, (x1,y1,z+dh), (x1,y2,z+dh), (x1,y2,zt),   (x1,y1,zt))
+                _face4(bm, (x1,y1,z),    (x1,y2,z),    (x1,y2,z+_dh_fallback), (x1,y1,z+_dh_fallback))
+                _face4(bm, (x1,y1,z+_dh_fallback), (x1,y2,z+_dh_fallback), (x1,y2,zt), (x1,y1,zt))
 
     # ── East inner panel (at x = x2, reveals go +X) ───────────────────────────
     if 'E' not in no_walls:
-        if 'E' in door_walls and s.add_door and dw > 0:
+        dw_e = _dw('E'); dh_e = _dh('E')
+        if 'E' in door_walls and s.add_door and dw_e > 0:
             cy = da.get('E', (y1 + y2) * 0.5)
-            db = max(y1, cy - dw * 0.5)   # clamp: never south of room
-            df = min(y2, cy + dw * 0.5)   # clamp: never north of room
+            db = max(y1, cy - dw_e * 0.5)   # clamp: never south of room
+            df = min(y2, cy + dw_e * 0.5)   # clamp: never north of room
             if db > y1:
-                _face4(bm, (x2,db,z),    (x2,y1,z),    (x2,y1,z+dh),    (x2,db,z+dh))
-                _face4(bm, (x2,db,z+dh), (x2,y1,z+dh), (x2,y1,zt),      (x2,db,zt))
+                _face4(bm, (x2,db,z),    (x2,y1,z),    (x2,y1,z+dh_e),    (x2,db,z+dh_e))
+                _face4(bm, (x2,db,z+dh_e), (x2,y1,z+dh_e), (x2,y1,zt),    (x2,db,zt))
             if df < y2:
-                _face4(bm, (x2,y2,z),    (x2,df,z),    (x2,df,z+dh),    (x2,y2,z+dh))
-                _face4(bm, (x2,y2,z+dh), (x2,df,z+dh), (x2,df,zt),      (x2,y2,zt))
-            _face4(bm, (x2,df,z+dh), (x2,db,z+dh), (x2,db,zt),      (x2,df,zt))
-            _face4(bm, (x2+fd,db,z), (x2,db,z),    (x2,db,z+dh),    (x2+fd,db,z+dh))
-            _face4(bm, (x2,df,z),    (x2+fd,df,z), (x2+fd,df,z+dh), (x2,df,z+dh))
-            _face4(bm, (x2+fd,db,z+dh), (x2,db,z+dh), (x2,df,z+dh), (x2+fd,df,z+dh))
-            _face4(bm, (x2,db,z),    (x2+fd,db,z), (x2+fd,df,z),    (x2,df,z))
+                _face4(bm, (x2,y2,z),    (x2,df,z),    (x2,df,z+dh_e),    (x2,y2,z+dh_e))
+                _face4(bm, (x2,y2,z+dh_e), (x2,df,z+dh_e), (x2,df,zt),    (x2,y2,zt))
+            _face4(bm, (x2,df,z+dh_e), (x2,db,z+dh_e), (x2,db,zt),     (x2,df,zt))
+            _face4(bm, (x2+fd,db,z),   (x2,db,z),      (x2,db,z+dh_e),    (x2+fd,db,z+dh_e))
+            _face4(bm, (x2,df,z),      (x2+fd,df,z),   (x2+fd,df,z+dh_e), (x2,df,z+dh_e))
+            _face4(bm, (x2+fd,db,z+dh_e), (x2,db,z+dh_e), (x2,df,z+dh_e), (x2+fd,df,z+dh_e))
+            _face4(bm, (x2,db,z),      (x2+fd,db,z),   (x2+fd,df,z),      (x2,df,z))
         else:
             if _ey:
                 ys = [y1] + _ey + [y2]
                 for i in range(len(ys) - 1):
-                    _face4(bm, (x2,ys[i+1],z),    (x2,ys[i],z),    (x2,ys[i],z+dh),    (x2,ys[i+1],z+dh))
-                    _face4(bm, (x2,ys[i+1],z+dh), (x2,ys[i],z+dh), (x2,ys[i],zt),      (x2,ys[i+1],zt))
+                    _face4(bm, (x2,ys[i+1],z),           (x2,ys[i],z),           (x2,ys[i],z+_dh_fallback),   (x2,ys[i+1],z+_dh_fallback))
+                    _face4(bm, (x2,ys[i+1],z+_dh_fallback), (x2,ys[i],z+_dh_fallback), (x2,ys[i],zt),         (x2,ys[i+1],zt))
             else:
-                _face4(bm, (x2,y2,z),    (x2,y1,z),    (x2,y1,z+dh), (x2,y2,z+dh))
-                _face4(bm, (x2,y2,z+dh), (x2,y1,z+dh), (x2,y1,zt),   (x2,y2,zt))
+                _face4(bm, (x2,y2,z),    (x2,y1,z),    (x2,y1,z+_dh_fallback), (x2,y2,z+_dh_fallback))
+                _face4(bm, (x2,y2,z+_dh_fallback), (x2,y1,z+_dh_fallback), (x2,y1,zt), (x2,y2,zt))
 
     # ── Ceiling & Floor — split at door-column edges to share vertices ─────────
 
@@ -304,7 +324,8 @@ def _rebuild_room_mesh(reg, s):
                no_walls=tuple(reg.get("no_walls", [])),
                door_anchors=reg.get("door_anchors", {}),
                door_width=reg.get("door_width"),
-               door_height=reg.get("door_height"))
+               door_height=reg.get("door_height"),
+               door_dims=reg.get("door_dims", {}))
     bm.to_mesh(me)
     bm.free()
     me.update()
@@ -593,6 +614,7 @@ def _reg_to_entry(reg, entry):
     entry.door_walls   = ",".join(reg.get("door_walls", []))
     entry.no_walls     = ",".join(reg.get("no_walls", []))
     entry.door_anchors = json.dumps(reg.get("door_anchors", {}))
+    entry.door_dims    = json.dumps(reg.get("door_dims", {}))
     entry.obj_name     = reg.get("obj_name", "")
     entry.door_width   = reg.get("door_width", 0.9)
     entry.door_height  = reg.get("door_height", 2.0)
@@ -608,6 +630,7 @@ def _entry_to_reg(entry):
         "door_walls":   [w for w in entry.door_walls.split(",") if w],
         "no_walls":     [w for w in entry.no_walls.split(",") if w],
         "door_anchors": json.loads(entry.door_anchors) if entry.door_anchors else {},
+        "door_dims":    json.loads(entry.door_dims)    if entry.door_dims    else {},
         "obj_name":     entry.obj_name,
         "door_width":   entry.door_width,
         "door_height":  entry.door_height,
@@ -761,16 +784,16 @@ class ROOM_OT_draw(bpy.types.Operator):
                 if self._ds_prev_dw is not None:
                     ex_reg["door_walls"] = self._ds_prev_dw
                 ex_reg.get("door_anchors", {}).pop(self._ds_wall_char, None)
-                if self._ds_prev_door_w is not None:
-                    ex_reg["door_width"]  = self._ds_prev_door_w
-                if self._ds_prev_door_h is not None:
-                    ex_reg["door_height"] = self._ds_prev_door_h
+                # Restore per-door dims for this wall char (or remove if it wasn't set)
+                if self._ds_prev_door_dims_wc is not None:
+                    ex_reg.setdefault("door_dims", {})[self._ds_wall_char] = self._ds_prev_door_dims_wc
+                else:
+                    ex_reg.get("door_dims", {}).pop(self._ds_wall_char, None)
                 _rebuild_room_mesh(ex_reg, context.scene.room_settings)
-        self._ds_room_idx    = None
-        self._ds_wall_char   = None
-        self._ds_prev_dw     = None
-        self._ds_prev_door_w = None
-        self._ds_prev_door_h = None
+        self._ds_room_idx         = None
+        self._ds_wall_char        = None
+        self._ds_prev_dw          = None
+        self._ds_prev_door_dims_wc = None
         self._delete_preview()
         self._phase       = 0
         self._phase1_end  = None
@@ -801,11 +824,10 @@ class ROOM_OT_draw(bpy.types.Operator):
         self._axis1_char   = 'X'   # axis moved in phase 1 ('X' or 'Y')
         self._phase1_end   = None  # end Vector locked at phase 1 → 2 transition
         # DS (door-slide) phase state — only used for snapped rooms
-        self._ds_room_idx  = None  # existing room index during DS
-        self._ds_wall_char = None  # wall char on existing room during DS
-        self._ds_prev_dw   = None  # door_walls before DS (used for cancel/undo)
-        self._ds_prev_door_w = None  # door_width before DS (restored on cancel)
-        self._ds_prev_door_h = None  # door_height before DS (restored on cancel)
+        self._ds_room_idx          = None  # existing room index during DS
+        self._ds_wall_char         = None  # wall char on existing room during DS
+        self._ds_prev_dw           = None  # door_walls before DS (used for cancel/undo)
+        self._ds_prev_door_dims_wc = None  # door_dims[wc] before DS (None = wasn't set)
         self._add_draw_handle(context)
         context.window_manager.modal_handler_add(self)
         self._msg(context,
@@ -994,17 +1016,15 @@ class ROOM_OT_draw(bpy.types.Operator):
                     self._hovered    = None
                     # Enter DS phase: add door to existing room at snap position
                     ex_reg = ROOM_OT_draw._room_list[room_idx]
-                    self._ds_room_idx    = room_idx
-                    self._ds_wall_char   = wc
-                    self._ds_prev_dw     = list(ex_reg.get("door_walls", []))
-                    self._ds_prev_door_w = ex_reg.get("door_width",  0.9)
-                    self._ds_prev_door_h = ex_reg.get("door_height", 2.0)
+                    self._ds_room_idx          = room_idx
+                    self._ds_wall_char         = wc
+                    self._ds_prev_dw           = list(ex_reg.get("door_walls", []))
+                    self._ds_prev_door_dims_wc = ex_reg.get("door_dims", {}).get(wc)  # None if not set
                     anchor = sp.y if wc in ('E', 'W') else sp.x
                     if wc not in ex_reg.get("door_walls", []):
                         ex_reg.setdefault("door_walls", []).append(wc)
                     ex_reg.setdefault("door_anchors", {})[wc] = anchor
-                    ex_reg["door_width"]  = s.door_width
-                    ex_reg["door_height"] = s.door_height
+                    ex_reg.setdefault("door_dims", {})[wc] = {"w": s.door_width, "h": s.door_height}
                     _rebuild_room_mesh(ex_reg, s)
                     self._end  = self._start.copy()
                     self._phase = 'DS'
@@ -1117,6 +1137,7 @@ class ROOM_OT_draw(bpy.types.Operator):
                         "door_walls":   list(dw),
                         "no_walls":     list(nw),
                         "door_anchors": dict(da),
+                        "door_dims":    {wc: {"w": s.door_width, "h": s.door_height} for wc in dw},
                         "obj_name":     obj.name,
                         "door_width":   s.door_width,
                         "door_height":  s.door_height,
@@ -1422,8 +1443,7 @@ class ROOM_OT_add_door(bpy.types.Operator):
                     if wall_char not in reg.get("door_walls", []):
                         reg.setdefault("door_walls", []).append(wall_char)
                     reg.setdefault("door_anchors", {})[wall_char] = anchor
-                    reg["door_width"]  = s.door_width
-                    reg["door_height"] = s.door_height
+                    reg.setdefault("door_dims", {})[wall_char] = {"w": s.door_width, "h": s.door_height}
                     _rebuild_room_mesh(reg, s)
 
                     partner = _find_partner_wall(rooms, room_idx, wall_char,
@@ -1434,8 +1454,7 @@ class ROOM_OT_add_door(bpy.types.Operator):
                         if p_wc not in p_reg.get("door_walls", []):
                             p_reg.setdefault("door_walls", []).append(p_wc)
                         p_reg.setdefault("door_anchors", {})[p_wc] = anchor
-                        p_reg["door_width"]  = s.door_width
-                        p_reg["door_height"] = s.door_height
+                        p_reg.setdefault("door_dims", {})[p_wc] = {"w": s.door_width, "h": s.door_height}
                         _rebuild_room_mesh(p_reg, s)
 
                     self._locked_idx = room_idx
@@ -1589,8 +1608,9 @@ class ROOM_OT_apply_door_preset(bpy.types.Operator):
             return
         s  = context.scene.room_settings
         r  = rooms[room_idx]
-        dw = r.get("door_width",  s.door_width)
-        dh = r.get("door_height", s.door_height)
+        dd = r.get("door_dims", {}).get(wall_char, {})
+        dw = dd.get("w", r.get("door_width",  s.door_width))
+        dh = dd.get("h", r.get("door_height", s.door_height))
         z  = r.get("z", s.z_foundation)
         verts = _door_frame_verts(r, wall_char, z, dw, dh)
         idx_fill = [(0, 1, 2), (0, 2, 3)]
@@ -1676,16 +1696,14 @@ class ROOM_OT_apply_door_preset(bpy.types.Operator):
             room_idx, wall_char = self._hovered
             dp = presets[active]
             reg = rooms[room_idx]
-            reg["door_width"]  = dp.door_width
-            reg["door_height"] = dp.door_height
+            reg.setdefault("door_dims", {})[wall_char] = {"w": dp.door_width, "h": dp.door_height}
             _rebuild_room_mesh(reg, s)
-            # Update partner if adjacent
+            # Update partner door (same opening, same dims)
             partner = _find_partner_wall(rooms, room_idx, wall_char, s.wall_thickness)
             if partner is not None:
-                p_idx, _p_wc = partner
+                p_idx, p_wc = partner
                 p_reg = rooms[p_idx]
-                p_reg["door_width"]  = dp.door_width
-                p_reg["door_height"] = dp.door_height
+                p_reg.setdefault("door_dims", {})[p_wc] = {"w": dp.door_width, "h": dp.door_height}
                 _rebuild_room_mesh(p_reg, s)
             _sync_to_scene(context)
             context.area.tag_redraw()
