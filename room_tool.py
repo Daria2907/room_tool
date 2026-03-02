@@ -761,10 +761,16 @@ class ROOM_OT_draw(bpy.types.Operator):
                 if self._ds_prev_dw is not None:
                     ex_reg["door_walls"] = self._ds_prev_dw
                 ex_reg.get("door_anchors", {}).pop(self._ds_wall_char, None)
+                if self._ds_prev_door_w is not None:
+                    ex_reg["door_width"]  = self._ds_prev_door_w
+                if self._ds_prev_door_h is not None:
+                    ex_reg["door_height"] = self._ds_prev_door_h
                 _rebuild_room_mesh(ex_reg, context.scene.room_settings)
-        self._ds_room_idx  = None
-        self._ds_wall_char = None
-        self._ds_prev_dw   = None
+        self._ds_room_idx    = None
+        self._ds_wall_char   = None
+        self._ds_prev_dw     = None
+        self._ds_prev_door_w = None
+        self._ds_prev_door_h = None
         self._delete_preview()
         self._phase       = 0
         self._phase1_end  = None
@@ -798,6 +804,8 @@ class ROOM_OT_draw(bpy.types.Operator):
         self._ds_room_idx  = None  # existing room index during DS
         self._ds_wall_char = None  # wall char on existing room during DS
         self._ds_prev_dw   = None  # door_walls before DS (used for cancel/undo)
+        self._ds_prev_door_w = None  # door_width before DS (restored on cancel)
+        self._ds_prev_door_h = None  # door_height before DS (restored on cancel)
         self._add_draw_handle(context)
         context.window_manager.modal_handler_add(self)
         self._msg(context,
@@ -986,13 +994,17 @@ class ROOM_OT_draw(bpy.types.Operator):
                     self._hovered    = None
                     # Enter DS phase: add door to existing room at snap position
                     ex_reg = ROOM_OT_draw._room_list[room_idx]
-                    self._ds_room_idx  = room_idx
-                    self._ds_wall_char = wc
-                    self._ds_prev_dw   = list(ex_reg.get("door_walls", []))
+                    self._ds_room_idx    = room_idx
+                    self._ds_wall_char   = wc
+                    self._ds_prev_dw     = list(ex_reg.get("door_walls", []))
+                    self._ds_prev_door_w = ex_reg.get("door_width",  0.9)
+                    self._ds_prev_door_h = ex_reg.get("door_height", 2.0)
                     anchor = sp.y if wc in ('E', 'W') else sp.x
                     if wc not in ex_reg.get("door_walls", []):
                         ex_reg.setdefault("door_walls", []).append(wc)
                     ex_reg.setdefault("door_anchors", {})[wc] = anchor
+                    ex_reg["door_width"]  = s.door_width
+                    ex_reg["door_height"] = s.door_height
                     _rebuild_room_mesh(ex_reg, s)
                     self._end  = self._start.copy()
                     self._phase = 'DS'
@@ -1410,6 +1422,8 @@ class ROOM_OT_add_door(bpy.types.Operator):
                     if wall_char not in reg.get("door_walls", []):
                         reg.setdefault("door_walls", []).append(wall_char)
                     reg.setdefault("door_anchors", {})[wall_char] = anchor
+                    reg["door_width"]  = s.door_width
+                    reg["door_height"] = s.door_height
                     _rebuild_room_mesh(reg, s)
 
                     partner = _find_partner_wall(rooms, room_idx, wall_char,
@@ -1420,6 +1434,8 @@ class ROOM_OT_add_door(bpy.types.Operator):
                         if p_wc not in p_reg.get("door_walls", []):
                             p_reg.setdefault("door_walls", []).append(p_wc)
                         p_reg.setdefault("door_anchors", {})[p_wc] = anchor
+                        p_reg["door_width"]  = s.door_width
+                        p_reg["door_height"] = s.door_height
                         _rebuild_room_mesh(p_reg, s)
 
                     self._locked_idx = room_idx
