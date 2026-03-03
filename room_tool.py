@@ -7,7 +7,7 @@ bl_info = {
     "category": "Mesh",
 }
 
-import bpy, bmesh, gpu, json
+import bpy, bmesh, gpu, json, time
 from bpy_extras import view3d_utils
 from mathutils import Vector
 from gpu_extras.batch import batch_for_shader
@@ -64,6 +64,10 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         name="Door Width",  default=0.9, min=0.1, max=10.0, unit="LENGTH")
     door_height : bpy.props.FloatProperty(
         name="Door Height", default=2.0, min=0.1, max=15.0, unit="LENGTH")
+    door_margin : bpy.props.FloatProperty(
+        name="Door Edge Margin",
+        description="Minimum distance from door edge to wall corner",
+        default=0.15, min=0.0, max=2.0, unit="LENGTH")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -415,8 +419,9 @@ def _door_snap(pt, rooms, s, t_fallback):
     best_d, best = _SNAP_DIST, None
     px, py = pt.x, pt.y
     for i, r in enumerate(rooms):
-        dw = r.get("door_width", s.door_width)
         for wc in r.get("door_walls", []):
+            dd = r.get("door_dims", {}).get(wc, {})
+            dw = dd.get("w", r.get("door_width", s.door_width))
             anchor = r.get("door_anchors", {}).get(
                 wc, (r["y1"] + r["y2"]) * 0.5 if wc in ('E', 'W')
                     else (r["x1"] + r["x2"]) * 0.5)
@@ -442,6 +447,21 @@ def _door_snap(pt, rooms, s, t_fallback):
                 best_d = dist
                 best   = (i, wc)
     return best
+
+
+def _clamp_anchor(anchor, reg, wall_char, door_width, margin):
+    """Clamp door centre so both edges stay >= margin from the wall's corners.
+    If the wall is too narrow, centre the door instead of clamping."""
+    if wall_char in ('E', 'W'):
+        lo = reg["y1"] + door_width * 0.5 + margin
+        hi = reg["y2"] - door_width * 0.5 - margin
+    else:
+        lo = reg["x1"] + door_width * 0.5 + margin
+        hi = reg["x2"] - door_width * 0.5 - margin
+    if lo > hi:   # wall too narrow — centre the door
+        return ((reg["y1"] + reg["y2"]) * 0.5 if wall_char in ('E', 'W')
+                else (reg["x1"] + reg["x2"]) * 0.5)
+    return max(lo, min(hi, anchor))
 
 
 def _door_frame_verts(r, wall_char, z, dw, dh):
@@ -839,12 +859,40 @@ class ROOM_OT_draw(bpy.types.Operator):
         z = s.z_foundation
 
         # ── navigation pass-through (all phases) ──────────────────────────────
-        if event.type in {
-                'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
+        if event.type in {'MIDDLEMOUSE',
                 'NUMPAD_0','NUMPAD_1','NUMPAD_2','NUMPAD_3',
                 'NUMPAD_4','NUMPAD_5','NUMPAD_6','NUMPAD_7',
                 'NUMPAD_8','NUMPAD_9','NUMPAD_DECIMAL','NUMPAD_PERIOD',
                 'F', 'TILDE'}:
+            return {'PASS_THROUGH'}
+
+        # Scroll — cycle door presets during DS phase, navigation otherwise
+        if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} and event.value == 'PRESS':
+            if self._phase == 'DS':
+                presets = context.scene.room_door_presets
+                active  = context.scene.room_active_door_preset
+                if len(presets) > 1:
+                    delta      = 1 if event.type == 'WHEELUPMOUSE' else -1
+                    new_active = (active + delta) % len(presets)
+                    context.scene.room_active_door_preset = new_active
+                    dp   = presets[new_active]
+                    dims = {"w": dp.door_width, "h": dp.door_height}
+                    ex_reg = ROOM_OT_draw._room_list[self._ds_room_idx]
+                    wc     = self._ds_wall_char
+                    ex_reg.setdefault("door_dims", {})[wc] = dims
+                    _rebuild_room_mesh(ex_reg, s)
+                    partner = _find_partner_wall(
+                        ROOM_OT_draw._room_list, self._ds_room_idx, wc, s.wall_thickness)
+                    if partner is not None:
+                        p_idx, p_wc = partner
+                        ROOM_OT_draw._room_list[p_idx].setdefault("door_dims", {})[p_wc] = dims
+                        _rebuild_room_mesh(ROOM_OT_draw._room_list[p_idx], s)
+                    _sync_to_scene(context)
+                    context.area.header_text_set(
+                        f"Preset: {dp.name} ({dp.door_width:.2f}×{dp.door_height:.2f}m)  |  "
+                        "Scroll to cycle · Click to confirm  |  RMB – cancel")
+                    context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
             return {'PASS_THROUGH'}
 
         # ── Ctrl+Z — undo last placed room (only in hover phase) ──────────────
@@ -910,17 +958,19 @@ class ROOM_OT_draw(bpy.types.Operator):
                 return {'PASS_THROUGH'}
 
             if pt is None:
-                return {'RUNNING_MODAL'}
+                return {'RUNNING_MODAL', 'PASS_THROUGH'}
 
             if self._phase == 'DS':
-                # Door-slide: slide anchor along the existing wall, keep start point aligned
+                # Door-slide: slide anchor along the existing wall with margin clamping
                 ex_reg = ROOM_OT_draw._room_list[self._ds_room_idx]
                 wc     = self._ds_wall_char
+                dd     = ex_reg.get("door_dims", {}).get(wc, {})
+                dw     = dd.get("w", s.door_width)
+                raw    = pt.y if wc in ('E', 'W') else pt.x
+                anchor = _clamp_anchor(raw, ex_reg, wc, dw, s.door_margin)
                 if wc in ('E', 'W'):
-                    anchor = max(ex_reg["y1"], min(ex_reg["y2"], pt.y))
                     self._start.y = anchor
                 else:
-                    anchor = max(ex_reg["x1"], min(ex_reg["x2"], pt.x))
                     self._start.x = anchor
                 ex_reg.setdefault("door_anchors", {})[wc] = anchor
                 _rebuild_room_mesh(ex_reg, s)
@@ -997,7 +1047,7 @@ class ROOM_OT_draw(bpy.types.Operator):
                 _apply_snap_constraint(self._end, self._start, self._snap_info)
                 self._update_preview_mesh(context)
 
-            return {'RUNNING_MODAL'}
+            return {'RUNNING_MODAL', 'PASS_THROUGH'}
 
         # ── left mouse ────────────────────────────────────────────────────────
         if event.type == "LEFTMOUSE" and event.value == "PRESS":
@@ -1020,7 +1070,8 @@ class ROOM_OT_draw(bpy.types.Operator):
                     self._ds_wall_char         = wc
                     self._ds_prev_dw           = list(ex_reg.get("door_walls", []))
                     self._ds_prev_door_dims_wc = ex_reg.get("door_dims", {}).get(wc)  # None if not set
-                    anchor = sp.y if wc in ('E', 'W') else sp.x
+                    raw_anchor = sp.y if wc in ('E', 'W') else sp.x
+                    anchor = _clamp_anchor(raw_anchor, ex_reg, wc, s.door_width, s.door_margin)
                     if wc not in ex_reg.get("door_walls", []):
                         ex_reg.setdefault("door_walls", []).append(wc)
                     ex_reg.setdefault("door_anchors", {})[wc] = anchor
@@ -1130,6 +1181,14 @@ class ROOM_OT_draw(bpy.types.Operator):
                     room_col = _room_target_collection(context, n)
                     obj      = _make_room_obj(f"Room.{n:03}", x1, y1, x2, y2, s,
                                               dw, nw, da, room_col)
+                    # Inherit DS dims for the new room's connecting wall.
+                    # _preview_door_walls returns (_OPPOSITE[wc],) so the new
+                    # room's door wall char is _OPPOSITE[snap_wc], not snap_wc.
+                    _snap_wc   = self._snap_info[1] if self._snap_info else None
+                    _snap_dims = None
+                    if _snap_wc is not None and ex_reg is not None:
+                        _snap_dims = ex_reg.get("door_dims", {}).get(_snap_wc)
+                    _opp_snap  = _OPPOSITE.get(_snap_wc, _snap_wc) if _snap_wc else None
                     reg = {
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                         "t":  s.wall_thickness,
@@ -1137,7 +1196,11 @@ class ROOM_OT_draw(bpy.types.Operator):
                         "door_walls":   list(dw),
                         "no_walls":     list(nw),
                         "door_anchors": dict(da),
-                        "door_dims":    {wc: {"w": s.door_width, "h": s.door_height} for wc in dw},
+                        "door_dims":    {
+                            _wc: (dict(_snap_dims) if _snap_dims and _wc == _opp_snap
+                                  else {"w": s.door_width, "h": s.door_height})
+                            for _wc in dw
+                        },
                         "obj_name":     obj.name,
                         "door_width":   s.door_width,
                         "door_height":  s.door_height,
@@ -1256,40 +1319,76 @@ class ROOM_OT_clear(bpy.types.Operator):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Add-door operator
+# Unified door-frame edit-mode operator
+# LMB click        → add door (no drag)
+# LMB hold + drag  → slide door along wall
+# Double-click     → remove door
+# LMB hold + scroll→ cycle preset live
+# RMB / Esc        → cancel / exit
 # ═════════════════════════════════════════════════════════════════════════════
-class ROOM_OT_add_door(bpy.types.Operator):
-    bl_idname  = "room.add_door"
-    bl_label   = "Add Door"
-    bl_description = ("Click a wall to place a door frame, drag to slide it, "
-                      "click again to confirm.  RMB cancels current door.")
+class ROOM_OT_door_edit(bpy.types.Operator):
+    bl_idname  = "room.door_edit"
+    bl_label   = "Door Frame Edit Mode"
+    bl_description = ("Edit door frames.  "
+                      "LMB=add  ·  LMB+drag=slide  ·  Double-click=remove  ·  "
+                      "LMB+scroll=change preset  |  RMB/Esc=exit")
     bl_options = {"REGISTER", "UNDO"}
+
+    _DRAG_PX = 8   # pixel threshold for press → slide transition
 
     # ── GPU draw callback ──────────────────────────────────────────────────
     def _draw_cb(self, context):
-        if not self._hovered:
-            return
-        room_idx, wall_char, _anchor = self._hovered
+        s     = context.scene.room_settings
         rooms = ROOM_OT_draw._room_list
-        if room_idx >= len(rooms):
-            return
-        s = context.scene.room_settings
-        r = rooms[room_idx]
-        verts = _wall_face_verts(r, wall_char,
-                                 r.get("z", s.z_foundation),
-                                 s.wall_height, s.wall_thickness)
-        idx_fill = [(0, 1, 2), (0, 2, 3)]
-        idx_line = [(0, 1), (1, 2), (2, 3), (3, 0)]
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
-        gpu.state.depth_test_set('LESS_EQUAL')
-        b = batch_for_shader(shader, 'TRIS', {"pos": verts}, indices=idx_fill)
-        shader.uniform_float("color", (1.0, 0.55, 0.0, 0.28))
-        b.draw(shader)
-        gpu.state.line_width_set(2.5)
-        b2 = batch_for_shader(shader, 'LINES', {"pos": verts}, indices=idx_line)
-        shader.uniform_float("color", (1.0, 0.78, 0.0, 0.95))
-        b2.draw(shader)
+        gpu.state.depth_test_set('ALWAYS')
+        idx_fill = [(0, 1, 2), (0, 2, 3)]
+        idx_line = [(0, 1), (1, 2), (2, 3), (3, 0)]
+
+        if self._hovered_door is not None:
+            # ── Green highlight on existing hovered door ──────────────────
+            ri, wc = self._hovered_door
+            if ri < len(rooms):
+                r  = rooms[ri]
+                dd = r.get("door_dims", {}).get(wc, {})
+                dw = dd.get("w", r.get("door_width",  s.door_width))
+                dh = dd.get("h", r.get("door_height", s.door_height))
+                verts = _door_frame_verts(r, wc, r.get("z", s.z_foundation), dw, dh)
+                b = batch_for_shader(shader, 'TRIS', {"pos": verts}, indices=idx_fill)
+                shader.uniform_float("color", (0.05, 0.85, 0.2, 0.30))
+                b.draw(shader)
+                gpu.state.line_width_set(2.5)
+                b2 = batch_for_shader(shader, 'LINES', {"pos": verts}, indices=idx_line)
+                shader.uniform_float("color", (0.1, 1.0, 0.3, 1.0))
+                b2.draw(shader)
+
+        elif self._hover_snap is not None:
+            # ── Orange ghost where a new door would land ──────────────────
+            ri, wc, anchor = self._hover_snap
+            if ri < len(rooms):
+                r  = rooms[ri]
+                # Use active preset dims for the ghost
+                dw = s.door_width
+                dh = s.door_height
+                active  = context.scene.room_active_door_preset
+                presets = context.scene.room_door_presets
+                if 0 <= active < len(presets):
+                    dp = presets[active]
+                    dw, dh = dp.door_width, dp.door_height
+                # Build a temporary reg with the snapped anchor for verts
+                ghost = dict(r)
+                ghost["door_anchors"] = dict(r.get("door_anchors", {}))
+                ghost["door_anchors"][wc] = anchor
+                verts = _door_frame_verts(ghost, wc, r.get("z", s.z_foundation), dw, dh)
+                b = batch_for_shader(shader, 'TRIS', {"pos": verts}, indices=idx_fill)
+                shader.uniform_float("color", (1.0, 0.55, 0.0, 0.18))
+                b.draw(shader)
+                gpu.state.line_width_set(2.0)
+                b2 = batch_for_shader(shader, 'LINES', {"pos": verts}, indices=idx_line)
+                shader.uniform_float("color", (1.0, 0.78, 0.0, 0.7))
+                b2.draw(shader)
+
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
 
@@ -1306,30 +1405,34 @@ class ROOM_OT_add_door(bpy.types.Operator):
             self._draw_handle = None
 
     # ── helpers ───────────────────────────────────────────────────────────
-    def _anchor_from_pt(self, pt, reg, wall_char):
-        """Cursor position clamped along the wall span."""
-        if wall_char in ('E', 'W'):
-            return max(reg["y1"], min(reg["y2"], pt.y))
-        else:
-            return max(reg["x1"], min(reg["x2"], pt.x))
+    def _header(self, context):
+        context.area.header_text_set(
+            "LMB=add  ·  LMB+drag=slide  ·  Double-click=remove  ·  "
+            "LMB+scroll=preset  |  RMB/Esc=exit")
 
-    def _set_anchor(self, s, rooms, room_idx, wall_char, anchor, partner):
-        """Update anchor on room (and partner) and rebuild both meshes."""
-        reg = rooms[room_idx]
-        reg.setdefault("door_anchors", {})[wall_char] = anchor
-        _rebuild_room_mesh(reg, s)
-        if partner is not None:
-            p_idx, p_wc = partner
-            p_reg = rooms[p_idx]
-            p_reg.setdefault("door_anchors", {})[p_wc] = anchor
-            _rebuild_room_mesh(p_reg, s)
+    def _restore_preview(self, context, rooms, s):
+        """Revert preset dims saved in _preview_orig back to the rooms."""
+        if self._preview_orig is None:
+            return
+        poi = self._preview_orig
+        if poi["room_idx"] < len(rooms):
+            rooms[poi["room_idx"]].setdefault("door_dims", {})[poi["wall_char"]] = poi["dims"]
+            _rebuild_room_mesh(rooms[poi["room_idx"]], s)
+        if poi["partner"] is not None:
+            p_idx, p_wc, p_dims = poi["partner"]
+            if p_idx < len(rooms):
+                rooms[p_idx].setdefault("door_dims", {})[p_wc] = p_dims
+                _rebuild_room_mesh(rooms[p_idx], s)
+        _sync_to_scene(context)
+        self._preview_orig = None
 
-    def _remove_door(self, s, rooms, room_idx, wall_char, partner):
-        """Remove door from room (and partner) and rebuild both meshes."""
+    def _remove_active_door(self, context, rooms, s, room_idx, wall_char, partner):
+        """Remove door frame from room (and partner) and rebuild."""
         reg = rooms[room_idx]
         if wall_char in reg.get("door_walls", []):
             reg["door_walls"].remove(wall_char)
         reg.get("door_anchors", {}).pop(wall_char, None)
+        reg.get("door_dims",    {}).pop(wall_char, None)
         _rebuild_room_mesh(reg, s)
         if partner is not None:
             p_idx, p_wc = partner
@@ -1337,17 +1440,31 @@ class ROOM_OT_add_door(bpy.types.Operator):
             if p_wc in p_reg.get("door_walls", []):
                 p_reg["door_walls"].remove(p_wc)
             p_reg.get("door_anchors", {}).pop(p_wc, None)
+            p_reg.get("door_dims",    {}).pop(p_wc, None)
             _rebuild_room_mesh(p_reg, s)
+        _sync_to_scene(context)
 
-    def _reset_to_hover(self, context):
-        self._phase      = 0
-        self._locked_idx = None
-        self._locked_wc  = None
-        self._partner    = None
-        self._hovered    = None
-        context.area.header_text_set(
-            "Hover wall · Click to place door  |  Enter – exit")
+    def _go_hover(self, context):
+        """Reset to HOVER state."""
+        self._phase          = 'HOVER'
+        self._active_idx     = None
+        self._active_wc      = None
+        self._active_partner = None
+        self._orig_anchor    = None
+        self._added_in_press = False
+        self._preview_orig   = None
+        self._press_screen   = None
+        self._hovered_door   = None
+        self._hover_snap     = None
+        self._header(context)
         context.area.tag_redraw()
+
+    def _finish(self, context):
+        self._remove_draw_handle()
+        context.area.header_text_set(None)
+        context.scene.room_door_edit_active = False
+        if context.area:
+            context.area.tag_redraw()
 
     # ── lifecycle ─────────────────────────────────────────────────────────
     def invoke(self, context, event):
@@ -1355,131 +1472,268 @@ class ROOM_OT_add_door(bpy.types.Operator):
             self.report({"WARNING"}, "Must be used inside the 3D Viewport")
             return {"CANCELLED"}
         _sync_from_scene(context)
-        self._phase       = 0     # 0 = hover, 1 = slide
-        self._hovered     = None  # (room_idx, wall_char, anchor)
-        self._locked_idx  = None
-        self._locked_wc   = None
-        self._partner     = None  # (p_idx, p_wc) or None
-        self._draw_handle = None
+        self._phase           = 'HOVER'
+        self._hovered_door    = None   # (room_idx, wall_char) — existing door
+        self._hover_snap      = None   # (room_idx, wall_char, anchor) — wall snap
+        self._last_press_time = 0.0
+        self._last_press_door = None   # door hovered at last LMB press (for double-click)
+        self._press_screen    = None   # (x, y) screen px at press start
+        self._active_idx      = None
+        self._active_wc       = None
+        self._active_partner  = None
+        self._orig_anchor     = None
+        self._added_in_press  = False
+        self._preview_orig    = None
+        self._draw_handle     = None
         self._add_draw_handle(context)
         context.window_manager.modal_handler_add(self)
-        context.scene.room_add_door_active = True
+        context.scene.room_door_edit_active = True
         if context.area:
             context.area.tag_redraw()
-        context.area.header_text_set(
-            "Hover wall · Click to place door  |  Enter – exit")
+        self._header(context)
         return {"RUNNING_MODAL"}
 
     def modal(self, context, event):
         s     = context.scene.room_settings
         rooms = ROOM_OT_draw._room_list
 
-        # Navigation pass-through
-        if event.type in {
-                'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
-                'NUMPAD_0', 'NUMPAD_1', 'NUMPAD_2', 'NUMPAD_3',
-                'NUMPAD_4', 'NUMPAD_5', 'NUMPAD_6', 'NUMPAD_7',
-                'NUMPAD_8', 'NUMPAD_9', 'NUMPAD_DECIMAL', 'NUMPAD_PERIOD',
-                'F', 'TILDE'}:
+        # ── Navigation pass-through ────────────────────────────────────────
+        if event.type in {'MIDDLEMOUSE',
+                'NUMPAD_0','NUMPAD_1','NUMPAD_2','NUMPAD_3',
+                'NUMPAD_4','NUMPAD_5','NUMPAD_6','NUMPAD_7',
+                'NUMPAD_8','NUMPAD_9','NUMPAD_DECIMAL','NUMPAD_PERIOD',
+                'F','TILDE'}:
             return {'PASS_THROUGH'}
 
-        # ── Enter → exit (confirm if sliding, otherwise just close) ───────
+        # ── Scroll — cycle presets while LMB is held, navigate otherwise ───
+        if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} and event.value == 'PRESS':
+            if self._phase in ('LMB_DOWN', 'SLIDING') and self._active_idx is not None:
+                presets = context.scene.room_door_presets
+                active  = context.scene.room_active_door_preset
+                if len(presets) > 0:
+                    delta      = 1 if event.type == 'WHEELUPMOUSE' else -1
+                    new_active = (active + delta) % len(presets)
+                    context.scene.room_active_door_preset = new_active
+                    dp   = presets[new_active]
+                    dims = {"w": dp.door_width, "h": dp.door_height}
+                    reg  = rooms[self._active_idx]
+                    # Save original dims on first scroll
+                    if self._preview_orig is None:
+                        orig_dims    = dict(reg.get("door_dims", {}).get(
+                                           self._active_wc,
+                                           {"w": s.door_width, "h": s.door_height}))
+                        partner_info = None
+                        if self._active_partner is not None:
+                            p_idx, p_wc = self._active_partner
+                            p_dims = dict(rooms[p_idx].get("door_dims", {}).get(
+                                         p_wc, {"w": s.door_width, "h": s.door_height}))
+                            partner_info = (p_idx, p_wc, p_dims)
+                        self._preview_orig = {
+                            "room_idx":  self._active_idx,
+                            "wall_char": self._active_wc,
+                            "dims":      orig_dims,
+                            "partner":   partner_info,
+                        }
+                    reg.setdefault("door_dims", {})[self._active_wc] = dims
+                    _rebuild_room_mesh(reg, s)
+                    if self._active_partner is not None:
+                        p_idx, p_wc = self._active_partner
+                        rooms[p_idx].setdefault("door_dims", {})[p_wc] = dims
+                        _rebuild_room_mesh(rooms[p_idx], s)
+                    _sync_to_scene(context)
+                    context.area.header_text_set(
+                        f"Preset: {dp.name} ({dp.door_width:.2f}×{dp.door_height:.2f}m)  |  "
+                        "Scroll to cycle  ·  Release LMB to confirm  |  RMB=cancel")
+                    context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+            return {'PASS_THROUGH'}
+
+        # ── Exit ──────────────────────────────────────────────────────────
         if event.type in {"RET", "NUMPAD_ENTER"} and event.value == 'PRESS':
-            self._remove_draw_handle()
-            context.area.header_text_set(None)
-            context.scene.room_add_door_active = False
-            context.area.tag_redraw()
+            if self._phase != 'HOVER':
+                _sync_to_scene(context)
+            self._finish(context)
             return {"FINISHED"}
 
-        # ── ESC / RMB ─────────────────────────────────────────────────────
         if event.type in {"RIGHTMOUSE", "ESC"} and event.value == 'PRESS':
-            if self._phase == 1:
-                # Cancel the door currently being slid → back to hover
-                self._remove_door(s, rooms, self._locked_idx,
-                                  self._locked_wc, self._partner)
-                self._reset_to_hover(context)
-                _sync_to_scene(context)
+            if self._phase != 'HOVER':
+                # Cancel: restore dims then anchor
+                self._restore_preview(context, rooms, s)
+                if self._active_idx is not None and self._orig_anchor is not None:
+                    reg = rooms[self._active_idx]
+                    reg.setdefault("door_anchors", {})[self._active_wc] = self._orig_anchor
+                    _rebuild_room_mesh(reg, s)
+                    if self._active_partner is not None:
+                        p_idx, p_wc = self._active_partner
+                        rooms[p_idx].setdefault("door_anchors", {})[p_wc] = self._orig_anchor
+                        _rebuild_room_mesh(rooms[p_idx], s)
+                if self._added_in_press and self._active_idx is not None:
+                    self._remove_active_door(context, rooms, s,
+                                             self._active_idx, self._active_wc,
+                                             self._active_partner)
+                else:
+                    _sync_to_scene(context)
+                self._go_hover(context)
                 return {'RUNNING_MODAL'}
-            # Phase 0 → exit
-            self._remove_draw_handle()
-            context.area.header_text_set(None)
-            context.scene.room_add_door_active = False
-            context.area.tag_redraw()
+            self._finish(context)
             return {"CANCELLED"}
 
         # ── Mouse move ────────────────────────────────────────────────────
         if event.type == "MOUSEMOVE":
             pt = _ray_to_z(context, event, s.z_foundation)
-            if self._phase == 0:
-                self._hovered = (
-                    _wall_snap_any(pt, rooms, s.wall_thickness) if pt else None
-                )
-            else:
-                # Slide: clamp cursor along the locked wall, live-rebuild
-                if pt is not None and self._locked_idx is not None:
-                    reg    = rooms[self._locked_idx]
-                    anchor = self._anchor_from_pt(pt, reg, self._locked_wc)
-                    self._hovered = (self._locked_idx, self._locked_wc, anchor)
-                    self._set_anchor(s, rooms, self._locked_idx,
-                                     self._locked_wc, anchor, self._partner)
-            context.area.tag_redraw()
-            return {'PASS_THROUGH'}
 
-        # ── Left mouse ────────────────────────────────────────────────────
-        if event.type == "LEFTMOUSE" and event.value == "PRESS":
-            pt = _ray_to_z(context, event, s.z_foundation)
-            if pt is None:
-                return {'RUNNING_MODAL'}
+            if self._phase == 'HOVER':
+                if pt:
+                    self._hovered_door = _door_snap(pt, rooms, s, s.wall_thickness)
+                    self._hover_snap   = (_wall_snap_any(pt, rooms, s.wall_thickness)
+                                         if self._hovered_door is None else None)
+                else:
+                    self._hovered_door = None
+                    self._hover_snap   = None
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL', 'PASS_THROUGH'}
 
-            if self._phase == 0:
-                # Pick wall
-                snap = _wall_snap_any(pt, rooms, s.wall_thickness)
-                if snap is None:
-                    return {'RUNNING_MODAL'}
-                room_idx, wall_char, anchor = snap
-
-                if 0 <= room_idx < len(rooms):
-                    reg = rooms[room_idx]
-                    if wall_char not in reg.get("door_walls", []):
-                        reg.setdefault("door_walls", []).append(wall_char)
-                    reg.setdefault("door_anchors", {})[wall_char] = anchor
-                    reg.setdefault("door_dims", {})[wall_char] = {"w": s.door_width, "h": s.door_height}
-                    _rebuild_room_mesh(reg, s)
-
-                    partner = _find_partner_wall(rooms, room_idx, wall_char,
-                                                 s.wall_thickness)
-                    if partner is not None:
-                        p_idx, p_wc = partner
-                        p_reg = rooms[p_idx]
-                        if p_wc not in p_reg.get("door_walls", []):
-                            p_reg.setdefault("door_walls", []).append(p_wc)
-                        p_reg.setdefault("door_anchors", {})[p_wc] = anchor
-                        p_reg.setdefault("door_dims", {})[p_wc] = {"w": s.door_width, "h": s.door_height}
-                        _rebuild_room_mesh(p_reg, s)
-
-                    self._locked_idx = room_idx
-                    self._locked_wc  = wall_char
-                    self._partner    = partner
-                    self._hovered    = (room_idx, wall_char, anchor)
-                    self._phase      = 1
-                    _sync_to_scene(context)
+            elif self._phase == 'LMB_DOWN':
+                # Check drag threshold
+                if (self._press_screen and
+                        (abs(event.mouse_region_x - self._press_screen[0]) > self._DRAG_PX or
+                         abs(event.mouse_region_y - self._press_screen[1]) > self._DRAG_PX)):
+                    self._phase = 'SLIDING'
                     context.area.header_text_set(
-                        "Drag to slide door · Click to confirm  |  RMB – cancel door")
-                    context.area.tag_redraw()
+                        "Sliding door  ·  Scroll to change preset  |  "
+                        "Release to confirm  ·  RMB=cancel")
+                else:
+                    return {'RUNNING_MODAL'}
 
-            else:
-                # Confirm slide position → back to hover for next door
-                self._reset_to_hover(context)
-                _sync_to_scene(context)
+            if self._phase == 'SLIDING' and pt is not None and self._active_idx is not None:
+                reg = rooms[self._active_idx]
+                dw  = reg.get("door_dims", {}).get(self._active_wc, {}).get("w", s.door_width)
+                raw = pt.y if self._active_wc in ('E', 'W') else pt.x
+                anchor = _clamp_anchor(raw, reg, self._active_wc, dw, s.door_margin)
+                reg.setdefault("door_anchors", {})[self._active_wc] = anchor
+                _rebuild_room_mesh(reg, s)
+                if self._active_partner is not None:
+                    p_idx, p_wc = self._active_partner
+                    rooms[p_idx].setdefault("door_anchors", {})[p_wc] = anchor
+                    _rebuild_room_mesh(rooms[p_idx], s)
+                context.area.tag_redraw()
 
             return {'RUNNING_MODAL'}
 
-        return {'PASS_THROUGH'}
+        # ── Left mouse ────────────────────────────────────────────────────
+        if event.type == "LEFTMOUSE":
+            # Ignore clicks outside the region
+            in_region = (0 <= event.mouse_region_x < context.region.width and
+                         0 <= event.mouse_region_y < context.region.height)
+
+            if event.value == "PRESS":
+                if not in_region:
+                    return {'PASS_THROUGH'}
+
+                pt  = _ray_to_z(context, event, s.z_foundation)
+                now = time.time()
+
+                # ── Double-click: remove the door that was pressed last ────
+                is_double = ((now - self._last_press_time) < 0.3 and
+                             self._last_press_door is not None)
+                if is_double and pt is not None:
+                    current_door = _door_snap(pt, rooms, s, s.wall_thickness)
+                    if current_door is not None and current_door == self._last_press_door:
+                        ri, wc = current_door
+                        partner = _find_partner_wall(rooms, ri, wc, s.wall_thickness)
+                        self._remove_active_door(context, rooms, s, ri, wc, partner)
+                        self._last_press_time = 0.0
+                        self._last_press_door = None
+                        self._hovered_door    = None
+                        context.area.tag_redraw()
+                        return {'RUNNING_MODAL'}
+
+                # ── Single press ──────────────────────────────────────────
+                self._last_press_time = now
+                self._press_screen    = (event.mouse_region_x, event.mouse_region_y)
+
+                if pt is None:
+                    return {'PASS_THROUGH'}
+
+                if self._hovered_door is not None:
+                    # Press on existing door → ready to slide / scroll
+                    ri, wc = self._hovered_door
+                    self._last_press_door = (ri, wc)
+                    self._active_idx      = ri
+                    self._active_wc       = wc
+                    self._active_partner  = _find_partner_wall(rooms, ri, wc, s.wall_thickness)
+                    reg = rooms[ri]
+                    self._orig_anchor     = reg.get("door_anchors", {}).get(
+                        wc, (reg["y1"] + reg["y2"]) * 0.5 if wc in ('E', 'W')
+                            else (reg["x1"] + reg["x2"]) * 0.5)
+                    self._added_in_press  = False
+                    self._preview_orig    = None
+                    self._phase           = 'LMB_DOWN'
+                    context.area.header_text_set(
+                        "Hold+drag=slide  ·  Hold+scroll=change preset  |  "
+                        "Release=confirm  ·  RMB=cancel")
+
+                elif self._hover_snap is not None:
+                    # Press on wall → add new door
+                    ri, wc, raw_anchor = self._hover_snap
+                    self._last_press_door = None   # new door: no double-click remove
+                    if 0 <= ri < len(rooms):
+                        reg = rooms[ri]
+                        # Use active preset dims (or settings fallback)
+                        dw = s.door_width
+                        dh = s.door_height
+                        active  = context.scene.room_active_door_preset
+                        presets = context.scene.room_door_presets
+                        if 0 <= active < len(presets):
+                            dp = presets[active]
+                            dw, dh = dp.door_width, dp.door_height
+                        anchor = _clamp_anchor(raw_anchor, reg, wc, dw, s.door_margin)
+                        if wc not in reg.get("door_walls", []):
+                            reg.setdefault("door_walls", []).append(wc)
+                        reg.setdefault("door_anchors", {})[wc] = anchor
+                        reg.setdefault("door_dims",    {})[wc] = {"w": dw, "h": dh}
+                        _rebuild_room_mesh(reg, s)
+                        partner = _find_partner_wall(rooms, ri, wc, s.wall_thickness)
+                        if partner is not None:
+                            p_idx, p_wc = partner
+                            p_reg = rooms[p_idx]
+                            if p_wc not in p_reg.get("door_walls", []):
+                                p_reg.setdefault("door_walls", []).append(p_wc)
+                            p_reg.setdefault("door_anchors", {})[p_wc] = anchor
+                            p_reg.setdefault("door_dims",    {})[p_wc] = {"w": dw, "h": dh}
+                            _rebuild_room_mesh(p_reg, s)
+                        self._active_idx      = ri
+                        self._active_wc       = wc
+                        self._active_partner  = partner
+                        self._orig_anchor     = anchor
+                        self._added_in_press  = True
+                        self._preview_orig    = None
+                        self._phase           = 'LMB_DOWN'
+                        _sync_to_scene(context)
+                        context.area.tag_redraw()
+                        context.area.header_text_set(
+                            "Hold+drag=slide  ·  Hold+scroll=change preset  |  "
+                            "Release=confirm  ·  RMB=cancel")
+                else:
+                    self._last_press_door = None
+                    return {'PASS_THROUGH'}
+
+                return {'RUNNING_MODAL'}
+
+            elif event.value == "RELEASE":
+                if self._phase in ('LMB_DOWN', 'SLIDING'):
+                    # Finalize: sync and return to hover
+                    self._preview_orig = None   # dims are confirmed
+                    _sync_to_scene(context)
+                    self._go_hover(context)
+                return {'RUNNING_MODAL'}
+
+        return {'RUNNING_MODAL', 'PASS_THROUGH'}
 
     def cancel(self, context):
         self._remove_draw_handle()
         context.area.header_text_set(None)
-        context.scene.room_add_door_active = False
+        context.scene.room_door_edit_active = False
         if context.area:
             context.area.tag_redraw()
 
@@ -1591,129 +1845,6 @@ class ROOM_OT_remove_door_preset(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class ROOM_OT_apply_door_preset(bpy.types.Operator):
-    bl_idname  = "room.apply_door_preset"
-    bl_label   = "Apply Preset to Door Frame"
-    bl_description = ("Hover a door frame to highlight it, click to resize it "
-                      "with the active door preset.  RMB/Enter to exit.")
-    bl_options = {"REGISTER", "UNDO"}
-
-    # ── GPU draw callback ──────────────────────────────────────────────────
-    def _draw_cb(self, context):
-        if self._hovered is None:
-            return
-        room_idx, wall_char = self._hovered
-        rooms = ROOM_OT_draw._room_list
-        if room_idx >= len(rooms):
-            return
-        s  = context.scene.room_settings
-        r  = rooms[room_idx]
-        dd = r.get("door_dims", {}).get(wall_char, {})
-        dw = dd.get("w", r.get("door_width",  s.door_width))
-        dh = dd.get("h", r.get("door_height", s.door_height))
-        z  = r.get("z", s.z_foundation)
-        verts = _door_frame_verts(r, wall_char, z, dw, dh)
-        idx_fill = [(0, 1, 2), (0, 2, 3)]
-        idx_line = [(0, 1), (1, 2), (2, 3), (3, 0)]
-        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-        gpu.state.blend_set('ALPHA')
-        gpu.state.depth_test_set('LESS_EQUAL')
-        b = batch_for_shader(shader, 'TRIS', {"pos": verts}, indices=idx_fill)
-        shader.uniform_float("color", (1.0, 0.55, 0.0, 0.28))
-        b.draw(shader)
-        gpu.state.line_width_set(2.5)
-        b2 = batch_for_shader(shader, 'LINES', {"pos": verts}, indices=idx_line)
-        shader.uniform_float("color", (1.0, 0.78, 0.0, 0.95))
-        b2.draw(shader)
-        gpu.state.blend_set('NONE')
-        gpu.state.depth_test_set('NONE')
-
-    def _add_draw_handle(self, context):
-        self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
-            self._draw_cb, (context,), 'WINDOW', 'POST_VIEW')
-
-    def _remove_draw_handle(self):
-        if self._draw_handle:
-            try:
-                bpy.types.SpaceView3D.draw_handler_remove(self._draw_handle, 'WINDOW')
-            except Exception:
-                pass
-            self._draw_handle = None
-
-    # ── lifecycle ─────────────────────────────────────────────────────────
-    def invoke(self, context, event):
-        if context.area.type != "VIEW_3D":
-            self.report({"WARNING"}, "Must be used inside the 3D Viewport")
-            return {"CANCELLED"}
-        _sync_from_scene(context)
-        active = context.scene.room_active_door_preset
-        if active == -1 or active >= len(context.scene.room_door_presets):
-            self.report({"WARNING"}, "Select a door preset first")
-            return {"CANCELLED"}
-        self._hovered     = None
-        self._draw_handle = None
-        self._add_draw_handle(context)
-        context.window_manager.modal_handler_add(self)
-        context.area.header_text_set(
-            "Hover door frame · Click to apply preset  |  Enter/RMB – exit")
-        return {"RUNNING_MODAL"}
-
-    def modal(self, context, event):
-        s       = context.scene.room_settings
-        rooms   = ROOM_OT_draw._room_list
-        presets = context.scene.room_door_presets
-        active  = context.scene.room_active_door_preset
-
-        # Navigation pass-through
-        if event.type in {
-                'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
-                'NUMPAD_0', 'NUMPAD_1', 'NUMPAD_2', 'NUMPAD_3',
-                'NUMPAD_4', 'NUMPAD_5', 'NUMPAD_6', 'NUMPAD_7',
-                'NUMPAD_8', 'NUMPAD_9', 'NUMPAD_DECIMAL', 'NUMPAD_PERIOD',
-                'F', 'TILDE'}:
-            return {'PASS_THROUGH'}
-
-        # Exit
-        if event.type in {"RET", "NUMPAD_ENTER", "RIGHTMOUSE", "ESC"} and event.value == 'PRESS':
-            self._remove_draw_handle()
-            context.area.header_text_set(None)
-            return {"FINISHED"}
-
-        # Mouse move — update hover
-        if event.type == "MOUSEMOVE":
-            pt = _ray_to_z(context, event, s.z_foundation)
-            self._hovered = _door_snap(pt, rooms, s, s.wall_thickness) if pt else None
-            context.area.tag_redraw()
-            return {'PASS_THROUGH'}
-
-        # Left click — apply preset to hovered door frame
-        if event.type == "LEFTMOUSE" and event.value == "PRESS":
-            if self._hovered is None:
-                return {'RUNNING_MODAL'}
-            if active < 0 or active >= len(presets):
-                self.report({"WARNING"}, "No active door preset")
-                return {'RUNNING_MODAL'}
-            room_idx, wall_char = self._hovered
-            dp = presets[active]
-            reg = rooms[room_idx]
-            reg.setdefault("door_dims", {})[wall_char] = {"w": dp.door_width, "h": dp.door_height}
-            _rebuild_room_mesh(reg, s)
-            # Update partner door (same opening, same dims)
-            partner = _find_partner_wall(rooms, room_idx, wall_char, s.wall_thickness)
-            if partner is not None:
-                p_idx, p_wc = partner
-                p_reg = rooms[p_idx]
-                p_reg.setdefault("door_dims", {})[p_wc] = {"w": dp.door_width, "h": dp.door_height}
-                _rebuild_room_mesh(p_reg, s)
-            _sync_to_scene(context)
-            context.area.tag_redraw()
-            return {'RUNNING_MODAL'}
-
-        return {'PASS_THROUGH'}
-
-    def cancel(self, context):
-        self._remove_draw_handle()
-        context.area.header_text_set(None)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1786,20 +1917,23 @@ class ROOM_PT_door_panel(bpy.types.Panel):
     def draw(self, context):
         L = self.layout
         s = context.scene.room_settings
+
+        # ── Unified door-edit mode button ─────────────────────────────────
         col = L.column(align=True)
         col.scale_y = 1.3
-        is_adding = getattr(context.scene, "room_add_door_active", False)
-        col.operator("room.add_door", icon="OUTLINER_OB_EMPTY",
-                     text="Add Door  (Ctrl+Shift+D)", depress=is_adding)
+        is_editing = getattr(context.scene, "room_door_edit_active", False)
+        col.operator("room.door_edit", icon="OUTLINER_OB_EMPTY",
+                     text="Door Frame Edit Mode  (Ctrl+Shift+D)", depress=is_editing)
         col.separator()
 
-        # Door dimensions + save preset
+        # ── Door default dimensions + margin ─────────────────────────────
         col = L.column(align=True)
         col.prop(s, "door_width")
         col.prop(s, "door_height")
+        col.prop(s, "door_margin")
         col.operator("room.save_door_preset", icon="ADD", text="Save Door Preset")
 
-        # Preset list
+        # ── Preset list ───────────────────────────────────────────────────
         presets = context.scene.room_door_presets
         active  = context.scene.room_active_door_preset
         if presets:
@@ -1819,11 +1953,6 @@ class ROOM_PT_door_panel(bpy.types.Panel):
                 if is_active:
                     col.prop(dp, "name", text="Rename")
 
-        if active != -1:
-            col.separator()
-            col.operator("room.apply_door_preset",
-                         icon="EYEDROPPER", text="Apply Preset to Door Frame")
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Register / Unregister
@@ -1835,14 +1964,13 @@ _classes = (
     ROOM_PG_settings,
     ROOM_OT_draw,
     ROOM_OT_clear,
-    ROOM_OT_add_door,
+    ROOM_OT_door_edit,
     ROOM_OT_add_floor,
     ROOM_OT_select_floor,
     ROOM_OT_remove_floor,
     ROOM_OT_save_door_preset,
     ROOM_OT_select_door_preset,
     ROOM_OT_remove_door_preset,
-    ROOM_OT_apply_door_preset,
     ROOM_PT_panel,
     ROOM_PT_door_panel,
 )
@@ -1856,8 +1984,8 @@ def register():
     bpy.types.Scene.room_active_floor       = bpy.props.IntProperty(default=-1)
     bpy.types.Scene.room_door_presets       = bpy.props.CollectionProperty(type=ROOM_PG_door_preset)
     bpy.types.Scene.room_active_door_preset = bpy.props.IntProperty(default=-1)
-    bpy.types.Scene.room_registry           = bpy.props.CollectionProperty(type=ROOM_PG_registry_entry)
-    bpy.types.Scene.room_add_door_active    = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.room_registry            = bpy.props.CollectionProperty(type=ROOM_PG_registry_entry)
+    bpy.types.Scene.room_door_edit_active   = bpy.props.BoolProperty(default=False)
 
     for km, kmi in ROOM_OT_draw._addon_kmaps:
         try: km.keymap_items.remove(kmi)
@@ -1870,7 +1998,7 @@ def register():
         km  = kc.keymaps.new(name="3D View", space_type="VIEW_3D")
         kmi = km.keymap_items.new("room.draw", "R", "PRESS", shift=True)
         ROOM_OT_draw._addon_kmaps.append((km, kmi))
-        kmi2 = km.keymap_items.new("room.add_door", "D", "PRESS", shift=True, ctrl=True)
+        kmi2 = km.keymap_items.new("room.door_edit", "D", "PRESS", shift=True, ctrl=True)
         ROOM_OT_draw._addon_kmaps.append((km, kmi2))
 
     if _room_registry_cleanup not in bpy.app.handlers.depsgraph_update_post:
@@ -1892,7 +2020,7 @@ def unregister():
 
     for attr in ("room_settings", "room_floors", "room_active_floor",
                  "room_door_presets", "room_active_door_preset",
-                 "room_registry", "room_add_door_active"):
+                 "room_registry", "room_door_edit_active"):
         if hasattr(bpy.types.Scene, attr):
             delattr(bpy.types.Scene, attr)
 
