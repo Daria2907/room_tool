@@ -4085,6 +4085,22 @@ def _find_room_at(pt2d, z, rooms):
     return None
 
 
+def _rect_fits_in_room(rx1, ry1, rx2, ry2, z, rooms):
+    """Return the room index if the rectangle fits entirely inside the inner floor area
+    (inside the wall thickness) of any room at the given Z, else None."""
+    for i, r in enumerate(rooms):
+        if abs(r.get("z", 0.0) - z) > 0.01:
+            continue
+        t = r.get("t", 0.125)
+        ix1 = r["x1"] + t
+        iy1 = r["y1"] + t
+        ix2 = r["x2"] - t
+        iy2 = r["y2"] - t
+        if rx1 >= ix1 and ry1 >= iy1 and rx2 <= ix2 and ry2 <= iy2:
+            return i
+    return None
+
+
 class ROOM_OT_stair_edit(bpy.types.Operator):
     bl_idname  = "room.stair_edit"
     bl_label   = "Stair Edit Mode"
@@ -4096,39 +4112,65 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
     # ── GPU draw callback ──────────────────────────────────────────────────
     def _draw_cb(self, context):
+        rooms  = ROOM_OT_draw._room_list
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         gpu.state.depth_test_set('ALWAYS')
 
-        def _rect_lines(x0, y0, x1, y1, z, col):
-            corners = [(x0,y0,z),(x1,y0,z),(x1,y1,z),(x0,y1,z)]
+        COL_GREEN_FILL = (0.05, 0.85, 0.2,  0.15)
+        COL_GREEN_LINE = (0.1,  1.0,  0.3,  1.0)
+        COL_RED_FILL   = (1.0,  0.08, 0.05, 0.20)
+        COL_RED_LINE   = (1.0,  0.12, 0.05, 1.0)
+        COL_OK_DONE    = (1.0,  0.55, 0.0,  1.0)   # orange = lower rect locked in
+
+        def _rect_fill(x0, y0, x1, y1, z, col_fill, col_line):
+            mn_x, mx_x = min(x0, x1), max(x0, x1)
+            mn_y, mx_y = min(y0, y1), max(y0, y1)
+            tris = [(mn_x, mn_y, z), (mx_x, mn_y, z), (mx_x, mx_y, z),
+                    (mn_x, mn_y, z), (mx_x, mx_y, z), (mn_x, mx_y, z)]
+            bf = batch_for_shader(shader, 'TRIS', {"pos": tris})
+            shader.uniform_float("color", col_fill)
+            bf.draw(shader)
+            corners = [(mn_x,mn_y,z),(mx_x,mn_y,z),(mx_x,mx_y,z),(mn_x,mx_y,z)]
             lines   = [corners[i] for pair in ((0,1),(1,2),(2,3),(3,0)) for i in pair]
-            b = batch_for_shader(shader, 'LINES', {"pos": lines})
-            shader.uniform_float("color", col)
-            gpu.state.line_width_set(2.0)
-            b.draw(shader)
+            bl = batch_for_shader(shader, 'LINES', {"pos": lines})
+            shader.uniform_float("color", col_line)
+            gpu.state.line_width_set(2.5)
+            bl.draw(shader)
 
-        # Phase LOWER_DRAG: show orange live rectangle on lower floor
+        # ── Phase LOWER_DRAG: live rectangle on lower floor ────────────────
         if self._phase == 'LOWER_DRAG' and self._lower_c1 is not None:
-            _rect_lines(self._lower_c1.x, self._lower_c1.y,
-                        self._cursor.x,   self._cursor.y,
-                        self._z_lower, (1.0, 0.55, 0.0, 0.9))
+            cx, cy = self._cursor.x, self._cursor.y
+            fits = _rect_fits_in_room(
+                min(self._lower_c1.x, cx), min(self._lower_c1.y, cy),
+                max(self._lower_c1.x, cx), max(self._lower_c1.y, cy),
+                self._z_lower, rooms) is not None
+            cf = COL_GREEN_FILL if fits else COL_RED_FILL
+            cl = COL_GREEN_LINE if fits else COL_RED_LINE
+            _rect_fill(self._lower_c1.x, self._lower_c1.y, cx, cy,
+                       self._z_lower, cf, cl)
 
-        # Once lower rect is finalised, keep it shown (orange solid)
+        # ── Once lower rect is locked: keep it shown in orange ─────────────
         if self._lower_c2 is not None:
             lx1 = min(self._lower_c1.x, self._lower_c2.x)
             ly1 = min(self._lower_c1.y, self._lower_c2.y)
             lx2 = max(self._lower_c1.x, self._lower_c2.x)
             ly2 = max(self._lower_c1.y, self._lower_c2.y)
-            _rect_lines(lx1, ly1, lx2, ly2, self._z_lower, (1.0, 0.55, 0.0, 1.0))
+            _rect_fill(lx1, ly1, lx2, ly2,
+                       self._z_lower, (1.0, 0.55, 0.0, 0.12), COL_OK_DONE)
 
-            # Phase UPPER_CLICK: preview the same-size rect centred on cursor
+            # ── Phase UPPER_CLICK: same-size rect centred on cursor ─────────
             if self._phase == 'UPPER_CLICK':
                 hw = (lx2 - lx1) * 0.5
                 hh = (ly2 - ly1) * 0.5
                 cx, cy = self._cursor.x, self._cursor.y
-                _rect_lines(cx - hw, cy - hh, cx + hw, cy + hh,
-                            self._z_upper, (0.2, 0.7, 1.0, 0.9))
+                ux1, uy1 = cx - hw, cy - hh
+                ux2, uy2 = cx + hw, cy + hh
+                fits = _rect_fits_in_room(ux1, uy1, ux2, uy2,
+                                          self._z_upper, rooms) is not None
+                cf = COL_GREEN_FILL if fits else COL_RED_FILL
+                cl = COL_GREEN_LINE if fits else COL_RED_LINE
+                _rect_fill(ux1, uy1, ux2, uy2, self._z_upper, cf, cl)
 
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
@@ -4160,11 +4202,18 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
         if (lx2 - lx1) < 0.05 or (ly2 - ly1) < 0.05:
             self.report({'WARNING'}, "Rectangle too small — draw a larger footprint")
-            return
+            return False
 
         if (self._z_upper - self._z_lower) < 0.05:
             self.report({'WARNING'}, "Floor height difference too small")
-            return
+            return False
+
+        # Validate: lower rect must be fully inside a lower-floor room
+        li = _rect_fits_in_room(lx1, ly1, lx2, ly2, self._z_lower, rooms)
+        if li is None:
+            self.report({'WARNING'}, "Lower footprint is outside room bounds — "
+                                     "place it fully inside the lower room")
+            return False
 
         # Upper rect: same dimensions, centred on the click point
         hw = (lx2 - lx1) * 0.5
@@ -4173,9 +4222,15 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         ux1, uy1 = cx - hw, cy - hh
         ux2, uy2 = cx + hw, cy + hh
 
+        # Validate: upper rect must be fully inside an upper-floor room
+        ui = _rect_fits_in_room(ux1, uy1, ux2, uy2, self._z_upper, rooms)
+        if ui is None:
+            self.report({'WARNING'}, "Upper footprint is outside room bounds — "
+                                     "click inside the upper room")
+            return False
+
         sd = {
             "lx1": lx1, "ly1": ly1, "lx2": lx2, "ly2": ly2,
-            "ux1": ux1, "uy1": uy1, "ux2": ux2, "uy2": uy2,
             "z_bot":          self._z_lower,
             "z_top":          self._z_upper,
             "step_rise":      s.stair_rise,
@@ -4196,30 +4251,19 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         stair_obj = _make_stair_obj(obj_name, sd, s, collection=col)
         if stair_obj is None:
             self.report({'WARNING'}, "Could not build stair geometry — check floor heights")
-            return
+            return False
 
         ROOM_OT_draw._stair_list.append(sd)
 
-        # ── Cut holes: ceiling of lower room + floor of upper room ──────
+        # ── Cut hole only in the ceiling of the lower room ──────────────
         lower_hole = {"x1": lx1, "y1": ly1, "x2": lx2, "y2": ly2,
                       "stair_obj": obj_name}
-        upper_hole = {"x1": ux1, "y1": uy1, "x2": ux2, "y2": uy2,
-                      "stair_obj": obj_name}
-
-        lc = Vector(((lx1 + lx2) * 0.5, (ly1 + ly2) * 0.5))
-        uc = Vector(((ux1 + ux2) * 0.5, (uy1 + uy2) * 0.5))
-        li = _find_room_at(lc, self._z_lower, rooms)
-        ui = _find_room_at(uc, self._z_upper, rooms)
-
-        if li is not None:
-            rooms[li].setdefault("stair_holes", []).append(lower_hole)
-            _rebuild_room_mesh(rooms[li], s)
-        if ui is not None:
-            rooms[ui].setdefault("stair_holes", []).append(upper_hole)
-            _rebuild_room_mesh(rooms[ui], s)
+        rooms[li].setdefault("stair_holes", []).append(lower_hole)
+        _rebuild_room_mesh(rooms[li], s)
 
         _sync_to_scene(context)
         self.report({'INFO'}, f"Created {obj_name}")
+        return True
 
     # ── Modal ──────────────────────────────────────────────────────────────
     def invoke(self, context, event):
@@ -4286,6 +4330,13 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                         self.report({'WARNING'}, "Too small — drag further to define footprint")
                         self._phase = 'LOWER_FIRST'
                         return {'RUNNING_MODAL'}
+                    rx1 = min(self._lower_c1.x, pt.x); rx2 = max(self._lower_c1.x, pt.x)
+                    ry1 = min(self._lower_c1.y, pt.y); ry2 = max(self._lower_c1.y, pt.y)
+                    if _rect_fits_in_room(rx1, ry1, rx2, ry2,
+                                          self._z_lower, ROOM_OT_draw._room_list) is None:
+                        self.report({'WARNING'}, "Footprint must be fully inside a lower-floor room")
+                        self._phase = 'LOWER_FIRST'
+                        return {'RUNNING_MODAL'}
                     self._lower_c2 = pt.copy()
                     self._phase    = 'UPPER_CLICK'
                     self.report({'INFO'},
@@ -4293,10 +4344,11 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
                 elif self._phase == 'UPPER_CLICK':
                     self._upper_click = pt.copy()
-                    self._finalise(context)
-                    self._remove_draw_handle()
-                    context.scene.room_stair_edit_active = False
-                    return {'FINISHED'}
+                    if self._finalise(context):
+                        self._remove_draw_handle()
+                        context.scene.room_stair_edit_active = False
+                        return {'FINISHED'}
+                    # Invalid placement — keep modal running so user can click again
 
         return {'RUNNING_MODAL'}
 
