@@ -161,14 +161,6 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         ],
         default='WORLD_ORIGIN')
     # ── Stairs ────────────────────────────────────────────────────────────────
-    stair_shape : bpy.props.EnumProperty(
-        name="Shape",
-        items=[
-            ('STRAIGHT', "Straight",  "Single straight flight"),
-            ('L',        "L-Shape",   "Two flights with a 90° turn and landing"),
-            ('U',        "U-Shape",   "Two flights with a 180° turn and landing"),
-        ],
-        default='STRAIGHT')
     stair_rise  : bpy.props.FloatProperty(
         name="Step Rise",   default=0.18, min=0.05, max=0.5,  unit="LENGTH",
         description="Target height of each step")
@@ -182,6 +174,10 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         name="Railing Thickness", default=0.05, min=0.01, max=0.3, unit="LENGTH")
     stair_floor_lower : bpy.props.IntProperty(name="From Floor", default=0, min=0)
     stair_floor_upper : bpy.props.IntProperty(name="To Floor",   default=1, min=0)
+    stair_flip_dir    : bpy.props.BoolProperty(
+        name="Flip Direction",
+        description="Reverse which end of the rectangle is the bottom of the stairs",
+        default=False)
     mat_stair         : bpy.props.PointerProperty(type=bpy.types.Material, name="Stairs")
     mat_stair_tiling  : bpy.props.FloatProperty(
         name="Tiling", default=1.0, min=0.001, max=1000.0)
@@ -824,216 +820,190 @@ def _apply_uvs_all_rooms(s):
 
 
 def _build_stair_mesh(sd, s):
-    """Generate stair + railing geometry.
-    Returns (verts, faces, cats) lists suitable for building a bmesh.
-    sd keys: lx1 ly1 lx2 ly2 (lower rect), ux1 uy1 ux2 uy2 (upper rect),
-             z_bot, z_top, shape ('STRAIGHT'|'L'|'U'),
-             step_rise, step_depth, add_railing, railing_height, railing_thick.
+    """Straight solid staircase fitting a rectangular footprint.
+
+    The long axis of the rectangle is the travel direction.
+    Steps ascend from z_bot at one short edge to z_top at the other.
+
+    Geometry (fully enclosed):
+      - treads (top face of each step, +Z normal)
+      - risers (front vertical face of each step)
+      - flat soffit at z_bot (-Z normal)
+      - back wall at the high end of the run
+      - left / right solid stringer walls (fan-triangulated staircase profile)
+      - optional railing panels on each side
+
+    sd keys: lx1,ly1,lx2,ly2 (footprint rectangle, identical on both floors)
+             z_bot, z_top
+             step_rise, add_railing, railing_height, railing_thick
+             flip_dir (True = stair ascends from the far end of the long axis)
     """
-    lx1, ly1 = sd["lx1"], sd["ly1"]
-    lx2, ly2 = sd["lx2"], sd["ly2"]
-    ux1, uy1 = sd["ux1"], sd["uy1"]
-    ux2, uy2 = sd["ux2"], sd["uy2"]
+    lx1 = min(sd["lx1"], sd["lx2"]); lx2 = max(sd["lx1"], sd["lx2"])
+    ly1 = min(sd["ly1"], sd["ly2"]); ly2 = max(sd["ly1"], sd["ly2"])
     z_bot  = sd["z_bot"]
     z_top  = sd["z_top"]
-    shape  = sd.get("shape", "STRAIGHT")
-    rise   = max(sd.get("step_rise",  getattr(s, "stair_rise",  0.18)), 0.05)
-    depth  = max(sd.get("step_depth", getattr(s, "stair_depth", 0.28)), 0.05)
-    add_r  = sd.get("add_railing",    getattr(s, "stair_add_railing",    True))
-    rh     = sd.get("railing_height", getattr(s, "stair_railing_height", 0.9))
-    rt     = sd.get("railing_thick",  getattr(s, "stair_railing_thick",  0.05))
+    flip   = sd.get("flip_dir", False)
+    rise_t = max(sd.get("step_rise",      getattr(s, "stair_rise",           0.18)), 0.05)
+    add_r  = sd.get("add_railing",        getattr(s, "stair_add_railing",     True))
+    rh     = sd.get("railing_height",     getattr(s, "stair_railing_height",  0.9))
 
     dz = z_top - z_bot
     if dz < 0.01:
         return [], [], []
 
-    n = max(2, round(dz / rise))
+    n = max(2, round(dz / rise_t))
     actual_rise = dz / n
 
-    verts_out = []
-    faces_out = []
-    cats_out  = []
+    rw = lx2 - lx1
+    rl = ly2 - ly1
+    x_travel = rw >= rl     # True → steps travel along X; False → along Y
 
-    def _quad(a, b, c, d, cat):
+    verts_out, faces_out, cats_out = [], [], []
+
+    def _quad(a, b, c, d_, cat=_CAT_STAIR):
         base = len(verts_out)
-        verts_out.extend([tuple(a), tuple(b), tuple(c), tuple(d)])
+        verts_out.extend([tuple(a), tuple(b), tuple(c), tuple(d_)])
         faces_out.append((base, base + 1, base + 2, base + 3))
         cats_out.append(cat)
 
-    def _flight(n_steps, tx, ty, wx, wy, ox, oy,
-                t0, w0, w1, z0, rise_s, depth_s):
-        """Emit n_steps treads + risers from origin (ox,oy).
-        tx,ty = travel unit vector; wx,wy = width unit vector.
-        t0 = start position on travel axis; w0,w1 = left/right on width axis.
-        z0 = height of first riser bottom."""
-        for i in range(n_steps):
-            tf = t0 + i * depth_s
-            tb = tf + depth_s
-            zl = z0 + i * rise_s
-            zh = zl + rise_s
-            # World coords for the 4 tread corners (all at zh)
-            pfl = (ox + tf*tx + w0*wx, oy + tf*ty + w0*wy, zh)
-            pfr = (ox + tf*tx + w1*wx, oy + tf*ty + w1*wy, zh)
-            pbl = (ox + tb*tx + w0*wx, oy + tb*ty + w0*wy, zh)
-            pbr = (ox + tb*tx + w1*wx, oy + tb*ty + w1*wy, zh)
-            _quad(pfl, pbl, pbr, pfr, _CAT_STAIR)   # tread (top)
-            # Riser: from zl to zh at front edge
-            rfl = (ox + tf*tx + w0*wx, oy + tf*ty + w0*wy, zl)
-            rfr = (ox + tf*tx + w1*wx, oy + tf*ty + w1*wy, zl)
-            _quad(rfl, rfr, pfr, pfl, _CAT_STAIR)   # riser (facing back)
+    def _tri(a, b, c, cat=_CAT_STAIR):
+        base = len(verts_out)
+        verts_out.extend([tuple(a), tuple(b), tuple(c)])
+        faces_out.append((base, base + 1, base + 2))
+        cats_out.append(cat)
 
-        if add_r:
-            # Left stringer panel
-            _stringer(n_steps, tx, ty, wx, wy, ox, oy,
-                      t0, w0,  rt,  z0, rise_s, depth_s, rh, side=+1)
-            # Right stringer panel
-            _stringer(n_steps, tx, ty, wx, wy, ox, oy,
-                      t0, w1, -rt,  z0, rise_s, depth_s, rh, side=-1)
-
-    def _stringer(n_steps, tx, ty, wx, wy, ox, oy,
-                  t0, w_edge, rt_sign, z0, rise_s, depth_s, rh, side):
-        """Solid railing panel along one side of the flight."""
+    def _step_profile(t_lo, t_hi, n_steps, rise_per_step):
+        """Build sorted (t, z) list describing the staircase side profile.
+        Includes bottom-left corner, each riser top + tread end, and bottom-right corner.
+        Also returns steps_lr list of (t_left, t_right, z_top) sorted left-to-right."""
+        d = (t_hi - t_lo) / n_steps
+        steps_lr = []
         for i in range(n_steps):
-            tf = t0 + i * depth_s
-            tb = tf + depth_s
-            zl = z0 + i * rise_s
-            zh = zl + rise_s
-            zt = zh + rh    # top of railing at this step
-            ztl = zl + rh   # railing top at step bottom (for sloped top)
-            # Front and back X,Y of this panel strip
-            xf = ox + tf*tx + w_edge*wx
-            yf = oy + tf*ty + w_edge*wy
-            xb = ox + tb*tx + w_edge*wx
-            yb = oy + tb*ty + w_edge*wy
-            # Face quad (from zl to zt at front, zh to zt at back) — sloped top
-            a = (xf, yf, zl)
-            b = (xb, yb, zh)
-            c = (xb, yb, zt)
-            d = (xf, yf, zt)
-            if side > 0:
-                _quad(a, b, c, d, _CAT_RAILING)
+            if not flip:
+                t_f = t_lo + i * d
+                t_b = t_f + d
             else:
-                _quad(d, c, b, a, _CAT_RAILING)
+                t_f = t_hi - i * d
+                t_b = t_f - d
+            zh  = z_bot + (i + 1) * rise_per_step
+            tl  = min(t_f, t_b)
+            tr  = max(t_f, t_b)
+            steps_lr.append((tl, tr, zh))
+        steps_lr.sort()
+        profile = [(t_lo, z_bot)]
+        for (tl, tr, zh) in steps_lr:
+            profile.append((tl, zh))    # top of riser (left edge)
+            profile.append((tr, zh))    # end of tread  (right edge)
+        profile.append((t_hi, z_bot))   # bottom-right corner
+        return profile, steps_lr
 
-    def _landing(x0, y0, x1, y1, z, cat=_CAT_STAIR):
-        """Flat landing quad at height z."""
-        _quad((x0, y0, z), (x1, y0, z), (x1, y1, z), (x0, y1, z), cat)
+    if x_travel:
+        d  = rw / n
+        ya = ly1;  yb = ly2         # width edges
+        ts = lx2 if flip else lx1   # travel start
+        td = -1  if flip else 1     # travel direction (+1 or -1)
 
-    # ── Direction helpers ──────────────────────────────────────────────────
-    lcx = (lx1 + lx2) * 0.5;  lcy = (ly1 + ly2) * 0.5
-    ucx = (ux1 + ux2) * 0.5;  ucy = (uy1 + uy2) * 0.5
-    dx = ucx - lcx;  dy = ucy - lcy
-    dist = math.sqrt(dx*dx + dy*dy)
-    if dist < 1e-6:
-        tx, ty = 0.0, 1.0
-    else:
-        tx, ty = dx / dist, dy / dist
-    # Width vector = 90° CCW from travel
-    wx, wy = -ty, tx
+        # ── Treads + Risers ────────────────────────────────────────────────
+        for i in range(n):
+            xf = ts + td * i * d
+            xb = ts + td * (i + 1) * d
+            zl = z_bot + i * actual_rise
+            zh = zl + actual_rise
+            if td > 0:
+                _quad((xf, ya, zh), (xb, ya, zh), (xb, yb, zh), (xf, yb, zh))   # tread
+                _quad((xf, yb, zl), (xf, ya, zl), (xf, ya, zh), (xf, yb, zh))   # riser
+            else:
+                _quad((xb, ya, zh), (xf, ya, zh), (xf, yb, zh), (xb, yb, zh))   # tread
+                _quad((xf, ya, zl), (xf, yb, zl), (xf, yb, zh), (xf, ya, zh))   # riser
 
-    def _rect_extent(x1, y1, x2, y2, tx_, ty_, wx_, wy_):
-        """Return (t_min, t_max, w_min, w_max) of a rectangle in travel/width coords."""
-        pts = [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]
-        ts = [p[0]*tx_ + p[1]*ty_ for p in pts]
-        ws = [p[0]*wx_ + p[1]*wy_ for p in pts]
-        return min(ts), max(ts), min(ws), max(ws)
+        # ── Soffit (bottom face, -Z normal) ───────────────────────────────
+        _quad((lx1, yb, z_bot), (lx2, yb, z_bot), (lx2, ya, z_bot), (lx1, ya, z_bot))
 
-    lt0, lt1, lw0, lw1 = _rect_extent(lx1, ly1, lx2, ly2, tx, ty, wx, wy)
-    ut0, ut1, uw0, uw1 = _rect_extent(ux1, uy1, ux2, uy2, tx, ty, wx, wy)
+        # ── Back wall (at the high end of the run) ─────────────────────────
+        xw = lx1 if flip else lx2
+        _quad((xw, ya, z_bot), (xw, yb, z_bot), (xw, yb, z_top), (xw, ya, z_top))
 
-    # Shared width extents
-    w0 = max(lw0, uw0)
-    w1 = min(lw1, uw1)
-    if w1 <= w0:   # no overlap → use lower rect width
-        w0 = lw0;  w1 = lw1
+        # ── Stringers ─────────────────────────────────────────────────────
+        profile, steps_lr = _step_profile(lx1, lx2, n, actual_rise)
+        p0 = profile[0]
+        # Left stringer at ya, facing -Y  (CCW from -Y = use reversed winding)
+        for i in range(1, len(profile) - 1):
+            a = (p0[0],          ya, p0[1])
+            b = (profile[i][0],  ya, profile[i][1])
+            c = (profile[i+1][0],ya, profile[i+1][1])
+            _tri(a, c, b)
+        # Right stringer at yb, facing +Y
+        for i in range(1, len(profile) - 1):
+            a = (p0[0],          yb, p0[1])
+            b = (profile[i][0],  yb, profile[i][1])
+            c = (profile[i+1][0],yb, profile[i+1][1])
+            _tri(a, b, c)
 
-    if shape == 'STRAIGHT':
-        actual_depth = (ut1 - lt0) / n if (ut1 - lt0) > 0.01 else depth
-        _flight(n, tx, ty, wx, wy, 0.0, 0.0,
-                lt0, w0, w1, z_bot, actual_rise, actual_depth)
+        # ── Railings ──────────────────────────────────────────────────────
+        if add_r:
+            for (tl, tr, zh) in steps_lr:
+                zl = zh - actual_rise
+                for side_y, fwd in ((ya, +1), (yb, -1)):
+                    a = (tl, side_y, zl);       b = (tr, side_y, zh)
+                    c = (tr, side_y, zh + rh);  d_ = (tl, side_y, zl + rh)
+                    if fwd > 0:
+                        _quad(d_, c, b, a, _CAT_RAILING)
+                    else:
+                        _quad(a, b, c, d_, _CAT_RAILING)
 
-    elif shape == 'L':
-        # Flight 1: travel in the primary direction for n1 steps
-        # Flight 2: 90° perpendicular for n2 steps
-        n1 = n // 2
-        n2 = n - n1
-        z_land = z_bot + n1 * actual_rise  # landing height
-        run1   = n1 * depth
-        run2   = n2 * depth
-        # Flight 1 direction = tx, ty
-        # Flight 2 direction: perpendicular toward upper rect center
-        # Determine which 90° turn to take
-        # After flight 1 the position is at (lt0 + run1) along tx, centre of w
-        end1_cx = (w0 + w1) * 0.5 * wx + (lt0 + run1) * tx
-        end1_cy = (w0 + w1) * 0.5 * wy + (lt0 + run1) * ty
-        # Compare upper rect centre to landing centre
-        to_ucx = ucx - end1_cx
-        to_ucy = ucy - end1_cy
-        # Choose the 90° that better aligns with to_u
-        t2x_a, t2y_a = -ty, tx   # left turn
-        t2x_b, t2y_b =  ty, -tx  # right turn
-        dot_a = to_ucx*t2x_a + to_ucy*t2y_a
-        dot_b = to_ucx*t2x_b + to_ucy*t2y_b
-        if dot_a >= dot_b:
-            t2x, t2y = t2x_a, t2y_a
-        else:
-            t2x, t2y = t2x_b, t2y_b
-        w2x, w2y = -t2y, t2x
+    else:   # Y travel
+        d  = rl / n
+        xa = lx1;  xb = lx2         # width edges
+        ts = ly2 if flip else ly1
+        td = -1  if flip else 1
 
-        # Landing rectangle (at z_land)
-        land_t0 = lt0 + run1
-        land_t1 = land_t0 + run2
-        land_w0, land_w1 = w0, w1
-        # Convert landing corners back to world for _landing()
-        def _tw_to_xy(t, w):
-            return t*tx + w*wx, t*ty + w*wy
-        lc0x, lc0y = _tw_to_xy(land_t0, land_w0)
-        lc1x, lc1y = _tw_to_xy(land_t1, land_w1)
-        _landing(lc0x, lc0y, lc1x, lc1y, z_land)
+        # ── Treads + Risers ────────────────────────────────────────────────
+        for i in range(n):
+            yf = ts + td * i * d
+            yb_ = ts + td * (i + 1) * d
+            zl  = z_bot + i * actual_rise
+            zh  = zl + actual_rise
+            if td > 0:
+                _quad((xa, yf, zh), (xa, yb_, zh), (xb, yb_, zh), (xb, yf, zh))   # tread
+                _quad((xb, yf, zl), (xa, yf, zl), (xa, yf, zh), (xb, yf, zh))     # riser
+            else:
+                _quad((xa, yb_, zh), (xa, yf, zh), (xb, yf, zh), (xb, yb_, zh))   # tread
+                _quad((xa, yf, zl), (xb, yf, zl), (xb, yf, zh), (xa, yf, zh))     # riser
 
-        # Flight 1 (lower half)
-        _flight(n1, tx, ty, wx, wy, 0.0, 0.0,
-                lt0, w0, w1, z_bot, actual_rise, depth)
+        # ── Soffit ────────────────────────────────────────────────────────
+        _quad((xa, ly1, z_bot), (xa, ly2, z_bot), (xb, ly2, z_bot), (xb, ly1, z_bot))
 
-        # Flight 2 starts from landing, travels in t2 direction
-        # Origin for flight 2 = world position of (land_t0, w0) at z_land
-        f2_ox = land_t0 * tx + land_w0 * wx
-        f2_oy = land_t0 * ty + land_w0 * wy
-        # Width in new coord system = w1-w0 along w2
-        f2_w  = w1 - w0
-        _flight(n2, t2x, t2y, w2x, w2y, f2_ox, f2_oy,
-                0.0, 0.0, f2_w, z_land, actual_rise, depth)
+        # ── Back wall ─────────────────────────────────────────────────────
+        yw = ly1 if flip else ly2
+        _quad((xb, yw, z_bot), (xa, yw, z_bot), (xa, yw, z_top), (xb, yw, z_top))
 
-    elif shape == 'U':
-        # Flight 1 in tx,ty; landing; Flight 2 in -tx,-ty
-        n1 = n // 2
-        n2 = n - n1
-        z_land = z_bot + n1 * actual_rise
-        run1   = n1 * depth
-        # Landing at end of flight 1, width = 2*(stair_width) to allow U turn
-        stair_w = w1 - w0
-        land_w0_l = w0 - stair_w   # extra width on one side for the return flight
-        land_w1_l = w1
-        # Flight 1
-        _flight(n1, tx, ty, wx, wy, 0.0, 0.0,
-                lt0, w0, w1, z_bot, actual_rise, depth)
-        # Landing at top of flight 1
-        land_t0 = lt0 + run1
-        land_t1 = land_t0 + depth   # one step deep for the landing
-        lc0x = land_t0 * tx + land_w0_l * wx
-        lc0y = land_t0 * ty + land_w0_l * wy
-        lc1x = land_t1 * tx + land_w1_l * wx
-        lc1y = land_t1 * ty + land_w1_l * wy
-        _landing(lc0x, lc0y, lc1x, lc1y, z_land)
-        # Flight 2 returns in reverse travel direction, offset to the side
-        ret_w0 = land_w0_l
-        ret_w1 = w0           # the return flight occupies the extra width
-        f2_ox  = (land_t1) * tx + ret_w0 * wx
-        f2_oy  = (land_t1) * ty + ret_w0 * wy
-        f2_w   = ret_w1 - ret_w0
-        # Return direction = -tx, -ty; width dir = wx, wy (same, so stringer is correct)
-        _flight(n2, -tx, -ty, wx, wy, f2_ox, f2_oy,
-                0.0, 0.0, f2_w, z_land, actual_rise, depth)
+        # ── Stringers ─────────────────────────────────────────────────────
+        profile, steps_lr = _step_profile(ly1, ly2, n, actual_rise)
+        p0 = profile[0]
+        # Left stringer at xa, facing -X
+        for i in range(1, len(profile) - 1):
+            a = (xa, p0[0],           p0[1])
+            b = (xa, profile[i][0],   profile[i][1])
+            c = (xa, profile[i+1][0], profile[i+1][1])
+            _tri(a, b, c)
+        # Right stringer at xb, facing +X
+        for i in range(1, len(profile) - 1):
+            a = (xb, p0[0],           p0[1])
+            b = (xb, profile[i][0],   profile[i][1])
+            c = (xb, profile[i+1][0], profile[i+1][1])
+            _tri(a, c, b)
+
+        # ── Railings ──────────────────────────────────────────────────────
+        if add_r:
+            for (tl, tr, zh) in steps_lr:
+                zl = zh - actual_rise
+                for side_x, fwd in ((xa, +1), (xb, -1)):
+                    a = (side_x, tl, zl);       b = (side_x, tr, zh)
+                    c = (side_x, tr, zh + rh);  d_ = (side_x, tl, zl + rh)
+                    if fwd > 0:
+                        _quad(d_, c, b, a, _CAT_RAILING)
+                    else:
+                        _quad(a, b, c, d_, _CAT_RAILING)
 
     return verts_out, faces_out, cats_out
 
@@ -4119,52 +4089,46 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
     bl_idname  = "room.stair_edit"
     bl_label   = "Stair Edit Mode"
     bl_description = ("Draw stairs between two floor levels.  "
-                      "LMB-drag = draw rectangle on lower floor,  "
-                      "then LMB-drag = draw rectangle on upper floor.  "
-                      "RMB/Esc = exit")
+                      "Step 1: LMB-drag on lower floor to draw the stair footprint rectangle.  "
+                      "Step 2: single LMB click on upper floor to place the matching opening.  "
+                      "RMB/Esc = cancel")
     bl_options = {"REGISTER", "UNDO"}
 
     # ── GPU draw callback ──────────────────────────────────────────────────
     def _draw_cb(self, context):
-        s      = context.scene.room_settings
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         gpu.state.depth_test_set('ALWAYS')
 
-        def _rect_lines(p0, p1, col):
-            """Draw a 2D rectangle outline at z_bot/z_top heights."""
-            x0, y0 = min(p0.x, p1.x), min(p0.y, p1.y)
-            x1_, y1_ = max(p0.x, p1.x), max(p0.y, p1.y)
-            z = p0.z
-            corners = [
-                (x0, y0, z), (x1_, y0, z),
-                (x1_, y1_, z), (x0, y1_, z),
-            ]
-            lines = [
-                corners[0], corners[1],
-                corners[1], corners[2],
-                corners[2], corners[3],
-                corners[3], corners[0],
-            ]
+        def _rect_lines(x0, y0, x1, y1, z, col):
+            corners = [(x0,y0,z),(x1,y0,z),(x1,y1,z),(x0,y1,z)]
+            lines   = [corners[i] for pair in ((0,1),(1,2),(2,3),(3,0)) for i in pair]
             b = batch_for_shader(shader, 'LINES', {"pos": lines})
             shader.uniform_float("color", col)
             gpu.state.line_width_set(2.0)
             b.draw(shader)
 
+        # Phase LOWER_DRAG: show orange live rectangle on lower floor
         if self._phase == 'LOWER_DRAG' and self._lower_c1 is not None:
-            p0 = Vector((self._lower_c1.x, self._lower_c1.y, self._z_lower))
-            p1 = Vector((self._cursor.x,   self._cursor.y,   self._z_lower))
-            _rect_lines(p0, p1, (1.0, 0.55, 0.0, 0.9))
+            _rect_lines(self._lower_c1.x, self._lower_c1.y,
+                        self._cursor.x,   self._cursor.y,
+                        self._z_lower, (1.0, 0.55, 0.0, 0.9))
 
-        if self._lower_c1 is not None and self._lower_c2 is not None:
-            p0 = Vector((self._lower_c1.x, self._lower_c1.y, self._z_lower))
-            p1 = Vector((self._lower_c2.x, self._lower_c2.y, self._z_lower))
-            _rect_lines(p0, p1, (1.0, 0.55, 0.0, 1.0))
+        # Once lower rect is finalised, keep it shown (orange solid)
+        if self._lower_c2 is not None:
+            lx1 = min(self._lower_c1.x, self._lower_c2.x)
+            ly1 = min(self._lower_c1.y, self._lower_c2.y)
+            lx2 = max(self._lower_c1.x, self._lower_c2.x)
+            ly2 = max(self._lower_c1.y, self._lower_c2.y)
+            _rect_lines(lx1, ly1, lx2, ly2, self._z_lower, (1.0, 0.55, 0.0, 1.0))
 
-        if self._phase == 'UPPER_DRAG' and self._upper_c1 is not None:
-            p0 = Vector((self._upper_c1.x, self._upper_c1.y, self._z_upper))
-            p1 = Vector((self._cursor.x,   self._cursor.y,   self._z_upper))
-            _rect_lines(p0, p1, (0.2, 0.7, 1.0, 0.9))
+            # Phase UPPER_CLICK: preview the same-size rect centred on cursor
+            if self._phase == 'UPPER_CLICK':
+                hw = (lx2 - lx1) * 0.5
+                hh = (ly2 - ly1) * 0.5
+                cx, cy = self._cursor.x, self._cursor.y
+                _rect_lines(cx - hw, cy - hh, cx + hw, cy + hh,
+                            self._z_upper, (0.2, 0.7, 1.0, 0.9))
 
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
@@ -4185,67 +4149,65 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
     # ── Finalise ───────────────────────────────────────────────────────────
     def _finalise(self, context):
-        s      = context.scene.room_settings
-        rooms  = ROOM_OT_draw._room_list
-        floors = context.scene.room_floors
+        s     = context.scene.room_settings
+        rooms = ROOM_OT_draw._room_list
 
+        # Lower rect (drawn by user)
         lx1 = min(self._lower_c1.x, self._lower_c2.x)
         ly1 = min(self._lower_c1.y, self._lower_c2.y)
         lx2 = max(self._lower_c1.x, self._lower_c2.x)
         ly2 = max(self._lower_c1.y, self._lower_c2.y)
-        ux1 = min(self._upper_c1.x, self._upper_c2.x)
-        uy1 = min(self._upper_c1.y, self._upper_c2.y)
-        ux2 = max(self._upper_c1.x, self._upper_c2.x)
-        uy2 = max(self._upper_c1.y, self._upper_c2.y)
 
         if (lx2 - lx1) < 0.05 or (ly2 - ly1) < 0.05:
-            self.report({'WARNING'}, "Lower rectangle too small")
-            return
-        if (ux2 - ux1) < 0.05 or (uy2 - uy1) < 0.05:
-            self.report({'WARNING'}, "Upper rectangle too small")
+            self.report({'WARNING'}, "Rectangle too small — draw a larger footprint")
             return
 
-        dz = self._z_upper - self._z_lower
-        if dz < 0.05:
+        if (self._z_upper - self._z_lower) < 0.05:
             self.report({'WARNING'}, "Floor height difference too small")
             return
+
+        # Upper rect: same dimensions, centred on the click point
+        hw = (lx2 - lx1) * 0.5
+        hh = (ly2 - ly1) * 0.5
+        cx, cy = self._upper_click.x, self._upper_click.y
+        ux1, uy1 = cx - hw, cy - hh
+        ux2, uy2 = cx + hw, cy + hh
 
         sd = {
             "lx1": lx1, "ly1": ly1, "lx2": lx2, "ly2": ly2,
             "ux1": ux1, "uy1": uy1, "ux2": ux2, "uy2": uy2,
-            "z_bot": self._z_lower,
-            "z_top": self._z_upper,
-            "shape":          s.stair_shape,
+            "z_bot":          self._z_lower,
+            "z_top":          self._z_upper,
             "step_rise":      s.stair_rise,
-            "step_depth":     s.stair_depth,
             "add_railing":    s.stair_add_railing,
             "railing_height": s.stair_railing_height,
             "railing_thick":  s.stair_railing_thick,
+            "flip_dir":       s.stair_flip_dir,
         }
 
-        # ── Create stair mesh object ────────────────────────────────────
+        # ── Create stair mesh ───────────────────────────────────────────
         col = _get_or_create_stair_col(context)
-        n   = len(ROOM_OT_draw._stair_list) + 1
-        obj_name = f"Stair.{n:03}"
+        num = len(ROOM_OT_draw._stair_list) + 1
+        obj_name = f"Stair.{num:03}"
         while obj_name in bpy.data.objects:
-            n += 1
-            obj_name = f"Stair.{n:03}"
+            num += 1
+            obj_name = f"Stair.{num:03}"
         sd["obj_name"] = obj_name
         stair_obj = _make_stair_obj(obj_name, sd, s, collection=col)
         if stair_obj is None:
-            self.report({'WARNING'}, "Could not build stair geometry (check floor heights)")
+            self.report({'WARNING'}, "Could not build stair geometry — check floor heights")
             return
 
         ROOM_OT_draw._stair_list.append(sd)
 
-        # ── Cut holes in affected rooms ─────────────────────────────────
+        # ── Cut holes: ceiling of lower room + floor of upper room ──────
         lower_hole = {"x1": lx1, "y1": ly1, "x2": lx2, "y2": ly2,
                       "stair_obj": obj_name}
         upper_hole = {"x1": ux1, "y1": uy1, "x2": ux2, "y2": uy2,
                       "stair_obj": obj_name}
 
-        lc = Vector(((lx1+lx2)*0.5, (ly1+ly2)*0.5))
-        uc = Vector(((ux1+ux2)*0.5, (uy1+uy2)*0.5))
+        lc = Vector(((lx1 + lx2) * 0.5, (ly1 + ly2) * 0.5))
+        uc = Vector(((ux1 + ux2) * 0.5, (uy1 + uy2) * 0.5))
         li = _find_room_at(lc, self._z_lower, rooms)
         ui = _find_room_at(uc, self._z_upper, rooms)
 
@@ -4261,7 +4223,7 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
     # ── Modal ──────────────────────────────────────────────────────────────
     def invoke(self, context, event):
-        s = context.scene.room_settings
+        s      = context.scene.room_settings
         floors = context.scene.room_floors
         lo = s.stair_floor_lower
         hi = s.stair_floor_upper
@@ -4275,18 +4237,18 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             self.report({'ERROR'}, "'From Floor' and 'To Floor' must be different")
             return {'CANCELLED'}
 
-        self._z_lower = floors[lo].z_offset
-        self._z_upper = floors[hi].z_offset
+        self._z_lower   = floors[lo].z_offset
+        self._z_upper   = floors[hi].z_offset
         if self._z_lower >= self._z_upper:
             self._z_lower, self._z_upper = self._z_upper, self._z_lower
 
-        self._phase     = 'LOWER_FIRST'   # LOWER_FIRST → LOWER_DRAG → UPPER_FIRST → UPPER_DRAG
-        self._lower_c1  = None
-        self._lower_c2  = None
-        self._upper_c1  = None
-        self._upper_c2  = None
-        self._cursor    = Vector((0, 0, 0))
-        self._handle    = None
+        # Phases: LOWER_FIRST → LOWER_DRAG → UPPER_CLICK
+        self._phase       = 'LOWER_FIRST'
+        self._lower_c1    = None
+        self._lower_c2    = None
+        self._upper_click = None
+        self._cursor      = Vector((0, 0, 0))
+        self._handle      = None
 
         context.scene.room_stair_edit_active = True
         self._add_draw_handle(context)
@@ -4302,8 +4264,7 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             context.scene.room_stair_edit_active = False
             return {'CANCELLED'}
 
-        # Update cursor position on current Z plane
-        z_plane = self._z_upper if self._phase in ('UPPER_FIRST', 'UPPER_DRAG') else self._z_lower
+        z_plane = self._z_upper if self._phase == 'UPPER_CLICK' else self._z_lower
         if event.type == 'MOUSEMOVE':
             pt = _ray_to_z(context, event, z_plane)
             if pt is not None:
@@ -4317,19 +4278,21 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             if event.value == 'PRESS':
                 if self._phase == 'LOWER_FIRST':
                     self._lower_c1 = pt.copy()
-                    self._phase = 'LOWER_DRAG'
-                elif self._phase == 'UPPER_FIRST':
-                    self._upper_c1 = pt.copy()
-                    self._phase = 'UPPER_DRAG'
+                    self._phase    = 'LOWER_DRAG'
 
             elif event.value == 'RELEASE':
                 if self._phase == 'LOWER_DRAG':
+                    if abs(pt.x - self._lower_c1.x) < 0.05 and abs(pt.y - self._lower_c1.y) < 0.05:
+                        self.report({'WARNING'}, "Too small — drag further to define footprint")
+                        self._phase = 'LOWER_FIRST'
+                        return {'RUNNING_MODAL'}
                     self._lower_c2 = pt.copy()
-                    self._phase = 'UPPER_FIRST'
-                    self.report({'INFO'}, "Lower rectangle set — now draw upper rectangle")
-                elif self._phase == 'UPPER_DRAG':
-                    self._upper_c2 = pt.copy()
-                    # Finalise
+                    self._phase    = 'UPPER_CLICK'
+                    self.report({'INFO'},
+                                "Footprint set — click on the upper floor to place the opening")
+
+                elif self._phase == 'UPPER_CLICK':
+                    self._upper_click = pt.copy()
                     self._finalise(context)
                     self._remove_draw_handle()
                     context.scene.room_stair_edit_active = False
@@ -4908,8 +4871,6 @@ class ROOM_PT_stair_panel(bpy.types.Panel):
         col.separator()
 
         col = L.column(align=True)
-        col.prop(s, "stair_shape")
-        col.separator()
 
         # Floor selectors
         def _floor_items(scene, context_):
@@ -4934,6 +4895,7 @@ class ROOM_PT_stair_panel(bpy.types.Panel):
         col.separator()
         col.prop(s, "stair_rise")
         col.prop(s, "stair_depth")
+        col.prop(s, "stair_flip_dir")
         col.separator()
         col.prop(s, "stair_add_railing")
         if s.stair_add_railing:
