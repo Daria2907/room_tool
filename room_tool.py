@@ -4287,11 +4287,13 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
         ROOM_OT_draw._stair_list.append(sd)
 
-        # ── Cut hole only in the ceiling of the lower room ──────────────
-        lower_hole = {"x1": lx1, "y1": ly1, "x2": lx2, "y2": ly2,
+        # ── Cut holes: ceiling of lower room + floor of upper room ──────
+        stair_hole = {"x1": lx1, "y1": ly1, "x2": lx2, "y2": ly2,
                       "stair_obj": obj_name}
-        rooms[li].setdefault("stair_holes", []).append(lower_hole)
+        rooms[li].setdefault("stair_holes", []).append(stair_hole)
         _rebuild_room_mesh(rooms[li], s)
+        rooms[ui].setdefault("stair_holes", []).append(stair_hole)
+        _rebuild_room_mesh(rooms[ui], s)
 
         _sync_to_scene(context)
         self.report({'INFO'}, f"Created {obj_name}")
