@@ -833,19 +833,25 @@ def _build_stair_mesh(sd, s):
       - left / right solid stringer walls (fan-triangulated staircase profile)
       - optional railing panels on each side
 
-    sd keys: lx1,ly1,lx2,ly2 (footprint rectangle, identical on both floors)
+    sd keys: lx1,ly1,lx2,ly2 (lower hole footprint / rect width)
+             ux1,uy1,ux2,uy2 (upper hole footprint — may be offset along travel axis)
              z_bot, z_top
              step_rise, add_railing, railing_height, railing_thick
              flip_dir (True = stair ascends from the far end of the long axis)
     """
     lx1 = min(sd["lx1"], sd["lx2"]); lx2 = max(sd["lx1"], sd["lx2"])
     ly1 = min(sd["ly1"], sd["ly2"]); ly2 = max(sd["ly1"], sd["ly2"])
+    # Upper rect — fall back to lower rect if not stored (old/undo state)
+    ux1 = min(sd.get("ux1", lx1), sd.get("ux2", lx2))
+    ux2 = max(sd.get("ux1", lx1), sd.get("ux2", lx2))
+    uy1 = min(sd.get("uy1", ly1), sd.get("uy2", ly2))
+    uy2 = max(sd.get("uy1", ly1), sd.get("uy2", ly2))
     z_bot  = sd["z_bot"]
     z_top  = sd["z_top"]
     flip   = sd.get("flip_dir", False)
-    rise_t = max(sd.get("step_rise",      getattr(s, "stair_rise",           0.18)), 0.05)
-    add_r  = sd.get("add_railing",        getattr(s, "stair_add_railing",     True))
-    rh     = sd.get("railing_height",     getattr(s, "stair_railing_height",  0.9))
+    rise_t = max(sd.get("step_rise",  getattr(s, "stair_rise",          0.18)), 0.05)
+    add_r  = sd.get("add_railing",    getattr(s, "stair_add_railing",    True))
+    rh     = sd.get("railing_height", getattr(s, "stair_railing_height", 0.9))
 
     dz = z_top - z_bot
     if dz < 0.01:
@@ -854,9 +860,25 @@ def _build_stair_mesh(sd, s):
     n = max(2, round(dz / rise_t))
     actual_rise = dz / n
 
+    # Determine travel axis from the lower rect's long dimension
     rw = lx2 - lx1
     rl = ly2 - ly1
-    x_travel = rw >= rl     # True → steps travel along X; False → along Y
+    x_travel = rw >= rl
+
+    # Travel extent: from the bottom step edge to the top step edge.
+    # For x_travel, flip=False: bottom at lx1, top at ux2  (normal forward travel)
+    # For x_travel, flip=True:  bottom at lx2, top at ux1  (reversed)
+    if x_travel:
+        t_start = lx1 if not flip else lx2
+        t_end   = ux2 if not flip else ux1
+    else:
+        t_start = ly1 if not flip else ly2
+        t_end   = uy2 if not flip else uy1
+
+    total_travel = (t_end - t_start) if not flip else (t_start - t_end)
+    if total_travel < 0.05:
+        return [], [], []
+    step_d = total_travel / n   # horizontal depth per step
 
     verts_out, faces_out, cats_out = [], [], []
 
@@ -873,73 +895,64 @@ def _build_stair_mesh(sd, s):
         cats_out.append(cat)
 
     def _step_profile(t_lo, t_hi, n_steps, rise_per_step):
-        """Build sorted (t, z) list describing the staircase side profile.
-        Includes bottom-left corner, each riser top + tread end, and bottom-right corner.
-        Also returns steps_lr list of (t_left, t_right, z_top) sorted left-to-right."""
+        """Build (t,z) polygon profile for one stringer side."""
         d = (t_hi - t_lo) / n_steps
         steps_lr = []
         for i in range(n_steps):
-            if not flip:
-                t_f = t_lo + i * d
-                t_b = t_f + d
-            else:
-                t_f = t_hi - i * d
-                t_b = t_f - d
+            t_f = t_lo + i * d
+            t_b = t_f + d
             zh  = z_bot + (i + 1) * rise_per_step
-            tl  = min(t_f, t_b)
-            tr  = max(t_f, t_b)
-            steps_lr.append((tl, tr, zh))
+            steps_lr.append((min(t_f, t_b), max(t_f, t_b), zh))
         steps_lr.sort()
         profile = [(t_lo, z_bot)]
         for (tl, tr, zh) in steps_lr:
-            profile.append((tl, zh))    # top of riser (left edge)
-            profile.append((tr, zh))    # end of tread  (right edge)
-        profile.append((t_hi, z_bot))   # bottom-right corner
+            profile.append((tl, zh))
+            profile.append((tr, zh))
+        profile.append((t_hi, z_bot))
         return profile, steps_lr
 
     if x_travel:
-        d  = rw / n
-        ya = ly1;  yb = ly2         # width edges
-        ts = lx2 if flip else lx1   # travel start
-        td = -1  if flip else 1     # travel direction (+1 or -1)
+        ya = ly1;  yb = ly2
+        td = 1 if not flip else -1
+        ts = t_start
 
-        # ── Treads + Risers ────────────────────────────────────────────────
         for i in range(n):
-            xf = ts + td * i * d
-            xb = ts + td * (i + 1) * d
+            xf = ts + td * i * step_d
+            xb = ts + td * (i + 1) * step_d
             zl = z_bot + i * actual_rise
             zh = zl + actual_rise
             if td > 0:
-                _quad((xf, ya, zh), (xb, ya, zh), (xb, yb, zh), (xf, yb, zh))   # tread
-                _quad((xf, yb, zl), (xf, ya, zl), (xf, ya, zh), (xf, yb, zh))   # riser
+                _quad((xf, ya, zh), (xb, ya, zh), (xb, yb, zh), (xf, yb, zh))
+                _quad((xf, yb, zl), (xf, ya, zl), (xf, ya, zh), (xf, yb, zh))
             else:
-                _quad((xb, ya, zh), (xf, ya, zh), (xf, yb, zh), (xb, yb, zh))   # tread
-                _quad((xf, ya, zl), (xf, yb, zl), (xf, yb, zh), (xf, ya, zh))   # riser
+                _quad((xb, ya, zh), (xf, ya, zh), (xf, yb, zh), (xb, yb, zh))
+                _quad((xf, ya, zl), (xf, yb, zl), (xf, yb, zh), (xf, ya, zh))
 
-        # ── Soffit (bottom face, -Z normal) ───────────────────────────────
-        _quad((lx1, yb, z_bot), (lx2, yb, z_bot), (lx2, ya, z_bot), (lx1, ya, z_bot))
+        # Soffit spans full extent from t_start to t_end at z_bot
+        xs1, xs2 = min(t_start, t_end), max(t_start, t_end)
+        _quad((xs1, yb, z_bot), (xs2, yb, z_bot), (xs2, ya, z_bot), (xs1, ya, z_bot))
 
-        # ── Back wall (at the high end of the run) ─────────────────────────
-        xw = lx1 if flip else lx2
-        _quad((xw, ya, z_bot), (xw, yb, z_bot), (xw, yb, z_top), (xw, ya, z_top))
+        # Back wall at the high end
+        xw = t_end
+        if td > 0:
+            _quad((xw, ya, z_bot), (xw, yb, z_bot), (xw, yb, z_top), (xw, ya, z_top))
+        else:
+            _quad((xw, yb, z_bot), (xw, ya, z_bot), (xw, ya, z_top), (xw, yb, z_top))
 
-        # ── Stringers ─────────────────────────────────────────────────────
-        profile, steps_lr = _step_profile(lx1, lx2, n, actual_rise)
+        # Stringers
+        profile, steps_lr = _step_profile(min(t_start,t_end), max(t_start,t_end), n, actual_rise)
         p0 = profile[0]
-        # Left stringer at ya, facing -Y  (CCW from -Y = use reversed winding)
         for i in range(1, len(profile) - 1):
-            a = (p0[0],          ya, p0[1])
-            b = (profile[i][0],  ya, profile[i][1])
-            c = (profile[i+1][0],ya, profile[i+1][1])
+            a = (p0[0],           ya, p0[1])
+            b = (profile[i][0],   ya, profile[i][1])
+            c = (profile[i+1][0], ya, profile[i+1][1])
             _tri(a, c, b)
-        # Right stringer at yb, facing +Y
         for i in range(1, len(profile) - 1):
-            a = (p0[0],          yb, p0[1])
-            b = (profile[i][0],  yb, profile[i][1])
-            c = (profile[i+1][0],yb, profile[i+1][1])
+            a = (p0[0],           yb, p0[1])
+            b = (profile[i][0],   yb, profile[i][1])
+            c = (profile[i+1][0], yb, profile[i+1][1])
             _tri(a, b, c)
 
-        # ── Railings ──────────────────────────────────────────────────────
         if add_r:
             for (tl, tr, zh) in steps_lr:
                 zl = zh - actual_rise
@@ -952,48 +965,44 @@ def _build_stair_mesh(sd, s):
                         _quad(a, b, c, d_, _CAT_RAILING)
 
     else:   # Y travel
-        d  = rl / n
-        xa = lx1;  xb = lx2         # width edges
-        ts = ly2 if flip else ly1
-        td = -1  if flip else 1
+        xa = lx1;  xb = lx2
+        td = 1 if not flip else -1
+        ts = t_start
 
-        # ── Treads + Risers ────────────────────────────────────────────────
         for i in range(n):
-            yf = ts + td * i * d
-            yb_ = ts + td * (i + 1) * d
+            yf  = ts + td * i * step_d
+            yb_ = ts + td * (i + 1) * step_d
             zl  = z_bot + i * actual_rise
             zh  = zl + actual_rise
             if td > 0:
-                _quad((xa, yf, zh), (xa, yb_, zh), (xb, yb_, zh), (xb, yf, zh))   # tread
-                _quad((xb, yf, zl), (xa, yf, zl), (xa, yf, zh), (xb, yf, zh))     # riser
+                _quad((xa, yf, zh), (xa, yb_, zh), (xb, yb_, zh), (xb, yf, zh))
+                _quad((xb, yf, zl), (xa, yf, zl), (xa, yf, zh), (xb, yf, zh))
             else:
-                _quad((xa, yb_, zh), (xa, yf, zh), (xb, yf, zh), (xb, yb_, zh))   # tread
-                _quad((xa, yf, zl), (xb, yf, zl), (xb, yf, zh), (xa, yf, zh))     # riser
+                _quad((xa, yb_, zh), (xa, yf, zh), (xb, yf, zh), (xb, yb_, zh))
+                _quad((xa, yf, zl), (xb, yf, zl), (xb, yf, zh), (xa, yf, zh))
 
-        # ── Soffit ────────────────────────────────────────────────────────
-        _quad((xa, ly1, z_bot), (xa, ly2, z_bot), (xb, ly2, z_bot), (xb, ly1, z_bot))
+        ys1, ys2 = min(t_start, t_end), max(t_start, t_end)
+        _quad((xa, ys1, z_bot), (xa, ys2, z_bot), (xb, ys2, z_bot), (xb, ys1, z_bot))
 
-        # ── Back wall ─────────────────────────────────────────────────────
-        yw = ly1 if flip else ly2
-        _quad((xb, yw, z_bot), (xa, yw, z_bot), (xa, yw, z_top), (xb, yw, z_top))
+        yw = t_end
+        if td > 0:
+            _quad((xb, yw, z_bot), (xa, yw, z_bot), (xa, yw, z_top), (xb, yw, z_top))
+        else:
+            _quad((xa, yw, z_bot), (xb, yw, z_bot), (xb, yw, z_top), (xa, yw, z_top))
 
-        # ── Stringers ─────────────────────────────────────────────────────
-        profile, steps_lr = _step_profile(ly1, ly2, n, actual_rise)
+        profile, steps_lr = _step_profile(min(t_start,t_end), max(t_start,t_end), n, actual_rise)
         p0 = profile[0]
-        # Left stringer at xa, facing -X
         for i in range(1, len(profile) - 1):
             a = (xa, p0[0],           p0[1])
             b = (xa, profile[i][0],   profile[i][1])
             c = (xa, profile[i+1][0], profile[i+1][1])
             _tri(a, b, c)
-        # Right stringer at xb, facing +X
         for i in range(1, len(profile) - 1):
             a = (xb, p0[0],           p0[1])
             b = (xb, profile[i][0],   profile[i][1])
             c = (xb, profile[i+1][0], profile[i+1][1])
             _tri(a, c, b)
 
-        # ── Railings ──────────────────────────────────────────────────────
         if add_r:
             for (tl, tr, zh) in steps_lr:
                 zl = zh - actual_rise
@@ -4145,10 +4154,9 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
     bl_idname  = "room.stair_edit"
     bl_label   = "Stair Edit Mode"
     bl_description = ("Draw stairs between two floor levels.  "
-                      "Step 1: LMB-drag on lower floor to draw the stair footprint (green = valid).  "
-                      "Step 2: click anywhere on the upper floor to confirm "
-                      "(green preview shows where the stair arrives).  "
-                      "RMB/Esc = cancel")
+                      "Step 1: LMB-drag on lower floor to draw the stair footprint.  "
+                      "Step 2: slide mouse along the travel axis to offset upper opening "
+                      "(green = valid), LMB to confirm.  RMB/Esc = cancel")
     bl_options = {"REGISTER", "UNDO"}
 
     # ── GPU draw callback ──────────────────────────────────────────────────
@@ -4200,15 +4208,14 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             _rect_fill(lx1, ly1, lx2, ly2,
                        self._z_lower, (1.0, 0.55, 0.0, 0.12), COL_OK_DONE)
 
-            # ── Phase UPPER_CLICK: show opening at SAME XY, at upper Z ──────
-            # Straight stairs go straight up — the XY footprint is identical.
-            # User just clicks anywhere in the upper room to confirm.
-            if self._phase == 'UPPER_CLICK':
-                fits = _rect_fits_in_room(lx1, ly1, lx2, ly2,
+            # ── Phase UPPER_SLIDE: upper rect slides along travel axis ───────
+            if self._phase == 'UPPER_SLIDE' and self._upper_rect is not None:
+                ux1, uy1, ux2, uy2 = self._upper_rect
+                fits = _rect_fits_in_room(ux1, uy1, ux2, uy2,
                                           self._z_upper, rooms) is not None
                 cf = COL_GREEN_FILL if fits else COL_RED_FILL
                 cl = COL_GREEN_LINE if fits else COL_RED_LINE
-                _rect_fill(lx1, ly1, lx2, ly2, self._z_upper, cf, cl)
+                _rect_fill(ux1, uy1, ux2, uy2, self._z_upper, cf, cl)
 
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
@@ -4249,27 +4256,44 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         # Validate: lower rect must be fully inside a lower-floor room
         li = _rect_fits_in_room(lx1, ly1, lx2, ly2, self._z_lower, rooms)
         if li is None:
-            self.report({'WARNING'}, "Lower footprint is outside room bounds — "
-                                     "place it fully inside the lower room")
+            self.report({'WARNING'}, "Lower footprint is outside room bounds")
             return False
 
-        # Validate: same XY footprint must fit inside an upper-floor room
-        # (straight stairs go straight up — XY position is identical on both floors)
-        ui = _rect_fits_in_room(lx1, ly1, lx2, ly2, self._z_upper, rooms)
+        # Upper rect from the slide position
+        if self._upper_rect is None:
+            ux1, uy1, ux2, uy2 = lx1, ly1, lx2, ly2   # no offset (fallback)
+        else:
+            ux1, uy1, ux2, uy2 = self._upper_rect
+
+        ui = _rect_fits_in_room(ux1, uy1, ux2, uy2, self._z_upper, rooms)
         if ui is None:
-            self.report({'WARNING'}, "Stair footprint does not fit inside any upper-floor room — "
-                                     "make sure the rooms above are aligned, or adjust the footprint")
+            self.report({'WARNING'}, "Upper footprint is outside room bounds — "
+                                     "slide to align with the upper room (green = valid)")
+            return False
+
+        # Determine travel axis and validate total travel distance
+        rw = lx2 - lx1; rl = ly2 - ly1
+        x_travel = rw >= rl
+        flip = s.stair_flip_dir
+        if x_travel:
+            total_travel = (ux2 - lx1) if not flip else (lx2 - ux1)
+        else:
+            total_travel = (uy2 - ly1) if not flip else (ly2 - uy1)
+        if total_travel < 0.05:
+            self.report({'WARNING'}, "Total stair travel too short — "
+                                     "slide the upper opening further or toggle Flip Direction")
             return False
 
         sd = {
             "lx1": lx1, "ly1": ly1, "lx2": lx2, "ly2": ly2,
+            "ux1": ux1, "uy1": uy1, "ux2": ux2, "uy2": uy2,
             "z_bot":          self._z_lower,
             "z_top":          self._z_upper,
             "step_rise":      s.stair_rise,
             "add_railing":    s.stair_add_railing,
             "railing_height": s.stair_railing_height,
             "railing_thick":  s.stair_railing_thick,
-            "flip_dir":       s.stair_flip_dir,
+            "flip_dir":       flip,
         }
 
         # ── Create stair mesh ───────────────────────────────────────────
@@ -4288,12 +4312,15 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         ROOM_OT_draw._stair_list.append(sd)
 
         # ── Cut holes: ceiling of lower room + floor of upper room ──────
-        stair_hole = {"x1": lx1, "y1": ly1, "x2": lx2, "y2": ly2,
+        lower_hole = {"x1": lx1, "y1": ly1, "x2": lx2, "y2": ly2,
                       "stair_obj": obj_name}
-        rooms[li].setdefault("stair_holes", []).append(stair_hole)
+        upper_hole = {"x1": ux1, "y1": uy1, "x2": ux2, "y2": uy2,
+                      "stair_obj": obj_name}
+        rooms[li].setdefault("stair_holes", []).append(lower_hole)
         _rebuild_room_mesh(rooms[li], s)
-        rooms[ui].setdefault("stair_holes", []).append(stair_hole)
-        _rebuild_room_mesh(rooms[ui], s)
+        if ui != li:
+            rooms[ui].setdefault("stair_holes", []).append(upper_hole)
+            _rebuild_room_mesh(rooms[ui], s)
 
         _sync_to_scene(context)
         self.report({'INFO'}, f"Created {obj_name}")
@@ -4324,12 +4351,13 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         if self._z_lower >= self._z_upper:
             self._z_lower, self._z_upper = self._z_upper, self._z_lower
 
-        # Phases: LOWER_FIRST → LOWER_DRAG → UPPER_CLICK
-        self._phase    = 'LOWER_FIRST'
-        self._lower_c1 = None
-        self._lower_c2 = None
-        self._cursor   = Vector((0, 0, 0))
-        self._handle   = None
+        # Phases: LOWER_FIRST → LOWER_DRAG → UPPER_SLIDE
+        self._phase       = 'LOWER_FIRST'
+        self._lower_c1    = None
+        self._lower_c2    = None
+        self._upper_rect  = None   # (ux1, uy1, ux2, uy2) updated on mousemove
+        self._cursor      = Vector((0, 0, 0))
+        self._handle      = None
 
         context.scene.room_stair_edit_active = True
         self._add_draw_handle(context)
@@ -4345,11 +4373,24 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             context.scene.room_stair_edit_active = False
             return {'CANCELLED'}
 
-        z_plane = self._z_upper if self._phase == 'UPPER_CLICK' else self._z_lower
+        z_plane = self._z_upper if self._phase == 'UPPER_SLIDE' else self._z_lower
         if event.type == 'MOUSEMOVE':
             pt = _ray_to_z(context, event, z_plane)
             if pt is not None:
                 self._cursor = pt
+                # During UPPER_SLIDE constrain cursor to travel axis of lower rect
+                if self._phase == 'UPPER_SLIDE' and self._lower_c2 is not None:
+                    lx1 = min(self._lower_c1.x, self._lower_c2.x)
+                    ly1 = min(self._lower_c1.y, self._lower_c2.y)
+                    lx2 = max(self._lower_c1.x, self._lower_c2.x)
+                    ly2 = max(self._lower_c1.y, self._lower_c2.y)
+                    rw = lx2 - lx1; rl = ly2 - ly1
+                    if rw >= rl:   # travel axis = X
+                        offset = pt.x - (lx1 + lx2) * 0.5
+                        self._upper_rect = (lx1 + offset, ly1, lx2 + offset, ly2)
+                    else:          # travel axis = Y
+                        offset = pt.y - (ly1 + ly2) * 0.5
+                        self._upper_rect = (lx1, ly1 + offset, lx2, ly2 + offset)
 
         if event.type == 'LEFTMOUSE':
             pt = _ray_to_z(context, event, z_plane)
@@ -4375,19 +4416,20 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                         self._phase = 'LOWER_FIRST'
                         return {'RUNNING_MODAL'}
                     self._lower_c2 = pt.copy()
-                    self._phase    = 'UPPER_CLICK'
+                    # Initialise upper rect at same XY as lower (zero offset)
+                    lx1 = rx1; ly1 = ry1; lx2 = rx2; ly2 = ry2
+                    self._upper_rect = (lx1, ly1, lx2, ly2)
+                    self._phase = 'UPPER_SLIDE'
                     self.report({'INFO'},
-                                "Footprint set — click anywhere on the upper floor to confirm "
-                                "(green = stair fits, red = rooms not aligned at this position)")
+                                "Footprint set — slide along travel axis to position upper opening "
+                                "(green = valid), LMB to confirm")
 
-                elif self._phase == 'UPPER_CLICK':
-                    # Position doesn't matter — stairs go straight up at the
-                    # lower rect's XY. Any click on the upper floor confirms.
+                elif self._phase == 'UPPER_SLIDE':
                     if self._finalise(context):
                         self._remove_draw_handle()
                         context.scene.room_stair_edit_active = False
                         return {'FINISHED'}
-                    # Footprint doesn't overlap an upper room — keep running
+                    # Invalid — keep running so user can adjust
 
         return {'RUNNING_MODAL'}
 
