@@ -2776,6 +2776,46 @@ def _room_on_load(*args):
     ROOM_OT_draw._room_list.clear()
 
 
+def _resync_stair_holes(context):
+    """Re-read stair_holes from the scene registry for every room in _room_list.
+    Must be called on stair operator invoke so that Ctrl+Z state is properly
+    reflected before we start a new placement."""
+    entries = getattr(context.scene, "room_registry", None)
+    if not entries:
+        return
+    entry_map = {e.obj_name: e for e in entries}
+    for reg in ROOM_OT_draw._room_list:
+        e = entry_map.get(reg.get("obj_name", ""))
+        if e:
+            try:
+                reg["stair_holes"] = json.loads(getattr(e, "stairs_json", None) or "[]")
+            except Exception:
+                reg["stair_holes"] = []
+
+
+@bpy.app.handlers.persistent
+def _room_undo_post(*args):
+    """After any undo, resync stair_holes from the scene registry so the
+    Python _room_list stays consistent with Blender's undo state."""
+    try:
+        scene = bpy.context.scene
+        if not scene:
+            return
+        entries = getattr(scene, "room_registry", None)
+        if not entries:
+            return
+        entry_map = {e.obj_name: e for e in entries}
+        for reg in ROOM_OT_draw._room_list:
+            e = entry_map.get(reg.get("obj_name", ""))
+            if e:
+                try:
+                    reg["stair_holes"] = json.loads(getattr(e, "stairs_json", None) or "[]")
+                except Exception:
+                    reg["stair_holes"] = []
+    except Exception:
+        pass
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Utility operator – clear snap registry
 # ═════════════════════════════════════════════════════════════════════════════
@@ -4105,8 +4145,9 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
     bl_idname  = "room.stair_edit"
     bl_label   = "Stair Edit Mode"
     bl_description = ("Draw stairs between two floor levels.  "
-                      "Step 1: LMB-drag on lower floor to draw the stair footprint rectangle.  "
-                      "Step 2: single LMB click on upper floor to place the matching opening.  "
+                      "Step 1: LMB-drag on lower floor to draw the stair footprint (green = valid).  "
+                      "Step 2: click anywhere on the upper floor to confirm "
+                      "(green preview shows where the stair arrives).  "
                       "RMB/Esc = cancel")
     bl_options = {"REGISTER", "UNDO"}
 
@@ -4159,18 +4200,15 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             _rect_fill(lx1, ly1, lx2, ly2,
                        self._z_lower, (1.0, 0.55, 0.0, 0.12), COL_OK_DONE)
 
-            # ── Phase UPPER_CLICK: same-size rect centred on cursor ─────────
+            # ── Phase UPPER_CLICK: show opening at SAME XY, at upper Z ──────
+            # Straight stairs go straight up — the XY footprint is identical.
+            # User just clicks anywhere in the upper room to confirm.
             if self._phase == 'UPPER_CLICK':
-                hw = (lx2 - lx1) * 0.5
-                hh = (ly2 - ly1) * 0.5
-                cx, cy = self._cursor.x, self._cursor.y
-                ux1, uy1 = cx - hw, cy - hh
-                ux2, uy2 = cx + hw, cy + hh
-                fits = _rect_fits_in_room(ux1, uy1, ux2, uy2,
+                fits = _rect_fits_in_room(lx1, ly1, lx2, ly2,
                                           self._z_upper, rooms) is not None
                 cf = COL_GREEN_FILL if fits else COL_RED_FILL
                 cl = COL_GREEN_LINE if fits else COL_RED_LINE
-                _rect_fill(ux1, uy1, ux2, uy2, self._z_upper, cf, cl)
+                _rect_fill(lx1, ly1, lx2, ly2, self._z_upper, cf, cl)
 
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
@@ -4215,18 +4253,12 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                                      "place it fully inside the lower room")
             return False
 
-        # Upper rect: same dimensions, centred on the click point
-        hw = (lx2 - lx1) * 0.5
-        hh = (ly2 - ly1) * 0.5
-        cx, cy = self._upper_click.x, self._upper_click.y
-        ux1, uy1 = cx - hw, cy - hh
-        ux2, uy2 = cx + hw, cy + hh
-
-        # Validate: upper rect must be fully inside an upper-floor room
-        ui = _rect_fits_in_room(ux1, uy1, ux2, uy2, self._z_upper, rooms)
+        # Validate: same XY footprint must fit inside an upper-floor room
+        # (straight stairs go straight up — XY position is identical on both floors)
+        ui = _rect_fits_in_room(lx1, ly1, lx2, ly2, self._z_upper, rooms)
         if ui is None:
-            self.report({'WARNING'}, "Upper footprint is outside room bounds — "
-                                     "click inside the upper room")
+            self.report({'WARNING'}, "Stair footprint does not fit inside any upper-floor room — "
+                                     "make sure the rooms above are aligned, or adjust the footprint")
             return False
 
         sd = {
@@ -4267,6 +4299,10 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
     # ── Modal ──────────────────────────────────────────────────────────────
     def invoke(self, context, event):
+        # Resync runtime state from scene (handles post-undo stale data)
+        _sync_from_scene(context)
+        _resync_stair_holes(context)
+
         s      = context.scene.room_settings
         floors = context.scene.room_floors
         lo = s.stair_floor_lower
@@ -4287,12 +4323,11 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             self._z_lower, self._z_upper = self._z_upper, self._z_lower
 
         # Phases: LOWER_FIRST → LOWER_DRAG → UPPER_CLICK
-        self._phase       = 'LOWER_FIRST'
-        self._lower_c1    = None
-        self._lower_c2    = None
-        self._upper_click = None
-        self._cursor      = Vector((0, 0, 0))
-        self._handle      = None
+        self._phase    = 'LOWER_FIRST'
+        self._lower_c1 = None
+        self._lower_c2 = None
+        self._cursor   = Vector((0, 0, 0))
+        self._handle   = None
 
         context.scene.room_stair_edit_active = True
         self._add_draw_handle(context)
@@ -4340,15 +4375,17 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                     self._lower_c2 = pt.copy()
                     self._phase    = 'UPPER_CLICK'
                     self.report({'INFO'},
-                                "Footprint set — click on the upper floor to place the opening")
+                                "Footprint set — click anywhere on the upper floor to confirm "
+                                "(green = stair fits, red = rooms not aligned at this position)")
 
                 elif self._phase == 'UPPER_CLICK':
-                    self._upper_click = pt.copy()
+                    # Position doesn't matter — stairs go straight up at the
+                    # lower rect's XY. Any click on the upper floor confirms.
                     if self._finalise(context):
                         self._remove_draw_handle()
                         context.scene.room_stair_edit_active = False
                         return {'FINISHED'}
-                    # Invalid placement — keep modal running so user can click again
+                    # Footprint doesn't overlap an upper room — keep running
 
         return {'RUNNING_MODAL'}
 
@@ -5038,6 +5075,8 @@ def register():
         bpy.app.handlers.depsgraph_update_post.append(_room_registry_cleanup)
     if _room_on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_room_on_load)
+    if _room_undo_post not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(_room_undo_post)
 
 
 def unregister():
@@ -5053,6 +5092,8 @@ def unregister():
         bpy.app.handlers.depsgraph_update_post.remove(_room_registry_cleanup)
     if _room_on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_room_on_load)
+    if _room_undo_post in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(_room_undo_post)
 
     for km, kmi in ROOM_OT_draw._addon_kmaps:
         try: km.keymap_items.remove(kmi)
