@@ -599,16 +599,20 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
 
     # ── Ceiling & Floor ────────────────────────────────────────────────────────
     # Build augmented split lists that include stair hole boundaries so the
-    # grid subdivides exactly at hole edges (no T-junctions) and hole cells
+    # grid subdivides exactly at hole edges (no T-joints) and hole cells
     # can be skipped cleanly.
+    # Each hole dict may have a "cut" key: "ceiling", "floor", or absent/other = both.
     _sh_xs = sorted(set(_ex + [h["x1"] for h in stair_holes] + [h["x2"] for h in stair_holes]))
     _sh_ys = sorted(set(_ey + [h["y1"] for h in stair_holes] + [h["y2"] for h in stair_holes]))
 
-    def _in_stair_hole(cx, cy):
-        return any(
-            sh["x1"] <= cx <= sh["x2"] and sh["y1"] <= cy <= sh["y2"]
-            for sh in stair_holes
-        )
+    def _in_stair_hole(cx, cy, surface):
+        for sh in stair_holes:
+            cut = sh.get("cut", "both")
+            if cut != "both" and cut != surface:
+                continue
+            if sh["x1"] <= cx <= sh["x2"] and sh["y1"] <= cy <= sh["y2"]:
+                return True
+        return False
 
     if s.add_ceiling:
         _cur_cat[0] = _CAT_CEILING
@@ -618,7 +622,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
             ys = [y1] + [v for v in _sh_ys if y1 < v < y2] + [y2]
             for i in range(len(xs) - 1):
                 for j in range(len(ys) - 1):
-                    if _in_stair_hole((xs[i]+xs[i+1])*0.5, (ys[j]+ys[j+1])*0.5):
+                    if _in_stair_hole((xs[i]+xs[i+1])*0.5, (ys[j]+ys[j+1])*0.5, "ceiling"):
                         continue
                     _f4((xs[i],ys[j],zt),(xs[i],ys[j+1],zt),
                                (xs[i+1],ys[j+1],zt),(xs[i+1],ys[j],zt))
@@ -633,7 +637,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
             ys = [y1] + [v for v in _sh_ys if y1 < v < y2] + [y2]
             for i in range(len(xs) - 1):
                 for j in range(len(ys) - 1):
-                    if _in_stair_hole((xs[i]+xs[i+1])*0.5, (ys[j]+ys[j+1])*0.5):
+                    if _in_stair_hole((xs[i]+xs[i+1])*0.5, (ys[j]+ys[j+1])*0.5, "floor"):
                         continue
                     _f4((xs[i],ys[j],z),(xs[i+1],ys[j],z),
                                (xs[i+1],ys[j+1],z),(xs[i],ys[j+1],z))
@@ -4311,11 +4315,11 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
         ROOM_OT_draw._stair_list.append(sd)
 
-        # ── Cut holes: ceiling of lower room + floor of upper room ──────
+        # ── Cut holes: ceiling-only of lower room + floor-only of upper room ──
         lower_hole = {"x1": lx1, "y1": ly1, "x2": lx2, "y2": ly2,
-                      "stair_obj": obj_name}
+                      "cut": "ceiling", "stair_obj": obj_name}
         upper_hole = {"x1": ux1, "y1": uy1, "x2": ux2, "y2": uy2,
-                      "stair_obj": obj_name}
+                      "cut": "floor",   "stair_obj": obj_name}
         rooms[li].setdefault("stair_holes", []).append(lower_hole)
         _rebuild_room_mesh(rooms[li], s)
         if ui != li:
@@ -4425,6 +4429,19 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                                 "(green = valid), LMB to confirm")
 
                 elif self._phase == 'UPPER_SLIDE':
+                    # Re-compute upper_rect from the actual click XY so we
+                    # never rely on a stale MOUSEMOVE position.
+                    lx1 = min(self._lower_c1.x, self._lower_c2.x)
+                    ly1 = min(self._lower_c1.y, self._lower_c2.y)
+                    lx2 = max(self._lower_c1.x, self._lower_c2.x)
+                    ly2 = max(self._lower_c1.y, self._lower_c2.y)
+                    rw = lx2 - lx1; rl = ly2 - ly1
+                    if rw >= rl:
+                        offset = pt.x - (lx1 + lx2) * 0.5
+                        self._upper_rect = (lx1 + offset, ly1, lx2 + offset, ly2)
+                    else:
+                        offset = pt.y - (ly1 + ly2) * 0.5
+                        self._upper_rect = (lx1, ly1 + offset, lx2, ly2 + offset)
                     if self._finalise(context):
                         self._remove_draw_handle()
                         context.scene.room_stair_edit_active = False
