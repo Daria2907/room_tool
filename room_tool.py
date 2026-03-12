@@ -4432,15 +4432,19 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             pt = _ray_to_z(context, event, z_plane)
             if pt is not None:
                 self._cursor = pt
-                # During UPPER_SLIDE: same-size rect freely follows cursor in 2D
+                # During UPPER_SLIDE: constrain to travel axis (perpendicular is locked)
                 if self._phase == 'UPPER_SLIDE' and self._lower_c2 is not None:
                     lx1 = min(self._lower_c1.x, self._lower_c2.x)
                     ly1 = min(self._lower_c1.y, self._lower_c2.y)
                     lx2 = max(self._lower_c1.x, self._lower_c2.x)
                     ly2 = max(self._lower_c1.y, self._lower_c2.y)
                     rw = lx2 - lx1; rl = ly2 - ly1
-                    cx, cy = pt.x, pt.y
-                    self._upper_rect = (cx - rw/2, cy - rl/2, cx + rw/2, cy + rl/2)
+                    if rw >= rl:   # travel axis = X, perpendicular Y locked
+                        offset = pt.x - (lx1 + lx2) * 0.5
+                        self._upper_rect = (lx1 + offset, ly1, lx2 + offset, ly2)
+                    else:          # travel axis = Y, perpendicular X locked
+                        offset = pt.y - (ly1 + ly2) * 0.5
+                        self._upper_rect = (lx1, ly1 + offset, lx2, ly2 + offset)
 
         if event.type == 'LEFTMOUSE':
             pt = _ray_to_z(context, event, z_plane)
@@ -4471,18 +4475,22 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                     self._upper_rect = (lx1, ly1, lx2, ly2)
                     self._phase = 'UPPER_SLIDE'
                     self.report({'INFO'},
-                                "Footprint set — move cursor over the upper room to position "
-                                "the opening (green = valid), LMB to confirm")
+                                "Footprint set — slide along travel axis to position upper "
+                                "opening (green = valid, red = outside room), LMB to confirm")
 
                 elif self._phase == 'UPPER_SLIDE':
-                    # Re-compute upper_rect from click XY (free 2D, centered on cursor)
+                    # Re-compute upper_rect from click, travel axis only
                     lx1 = min(self._lower_c1.x, self._lower_c2.x)
                     ly1 = min(self._lower_c1.y, self._lower_c2.y)
                     lx2 = max(self._lower_c1.x, self._lower_c2.x)
                     ly2 = max(self._lower_c1.y, self._lower_c2.y)
                     rw = lx2 - lx1; rl = ly2 - ly1
-                    cx, cy = pt.x, pt.y
-                    self._upper_rect = (cx - rw/2, cy - rl/2, cx + rw/2, cy + rl/2)
+                    if rw >= rl:
+                        offset = pt.x - (lx1 + lx2) * 0.5
+                        self._upper_rect = (lx1 + offset, ly1, lx2 + offset, ly2)
+                    else:
+                        offset = pt.y - (ly1 + ly2) * 0.5
+                        self._upper_rect = (lx1, ly1 + offset, lx2, ly2 + offset)
                     if self._finalise(context):
                         self._remove_draw_handle()
                         context.scene.room_stair_edit_active = False
