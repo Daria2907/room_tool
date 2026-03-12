@@ -4860,16 +4860,14 @@ class ROOM_PT_panel(bpy.types.Panel):
             split = row.split(factor=0.65, align=True)
             split.prop(s, mat_attr, text=label)
             split.prop(s, tile_attr, text="")
-        if s.add_plinth_bottom:
-            row = col.row(align=True)
-            split = row.split(factor=0.65, align=True)
-            split.prop(s, "mat_plinth_bottom", text="Bot Plinth (∅=Walls)")
-            split.prop(s, "mat_plinth_bottom_tiling", text="")
-        if s.add_plinth_top:
-            row = col.row(align=True)
-            split = row.split(factor=0.65, align=True)
-            split.prop(s, "mat_plinth_top", text="Top Plinth (∅=Walls)")
-            split.prop(s, "mat_plinth_top_tiling", text="")
+        row = col.row(align=True)
+        split = row.split(factor=0.65, align=True)
+        split.prop(s, "mat_plinth_bottom", text="Bot Plinth (∅=Walls)")
+        split.prop(s, "mat_plinth_bottom_tiling", text="")
+        row = col.row(align=True)
+        split = row.split(factor=0.65, align=True)
+        split.prop(s, "mat_plinth_top", text="Top Plinth (∅=Walls)")
+        split.prop(s, "mat_plinth_top_tiling", text="")
 
         # ── Per-room plinth overrides (shown when a room object is selected) ──
         obj = context.active_object
