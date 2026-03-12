@@ -2076,13 +2076,41 @@ class ROOM_OT_draw(bpy.types.Operator):
 
     # ── GPU draw callback ──────────────────────────────────────────────────
     def _draw_cb(self, context):
+        s      = context.scene.room_settings
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('ALWAYS')
+
+        # ── Orange rectangle overlay while the user is dragging ────────────
+        if self._start is not None and self._end is not None:
+            z  = s.z_foundation
+            x1 = min(self._start.x, self._end.x)
+            y1 = min(self._start.y, self._end.y)
+            x2 = max(self._start.x, self._end.x)
+            y2 = max(self._start.y, self._end.y)
+            tris = [
+                (x1, y1, z), (x2, y1, z), (x2, y2, z),
+                (x1, y1, z), (x2, y2, z), (x1, y2, z),
+            ]
+            bf = batch_for_shader(shader, 'TRIS', {"pos": tris})
+            shader.uniform_float("color", (1.0, 0.55, 0.0, 0.12))
+            bf.draw(shader)
+            corners = [(x1,y1,z),(x2,y1,z),(x2,y2,z),(x1,y2,z)]
+            lines   = [corners[i] for pair in ((0,1),(1,2),(2,3),(3,0)) for i in pair]
+            bl = batch_for_shader(shader, 'LINES', {"pos": lines})
+            shader.uniform_float("color", (1.0, 0.65, 0.0, 1.0))
+            gpu.state.line_width_set(2.5)
+            bl.draw(shader)
+
+        gpu.state.blend_set('NONE')
+        gpu.state.depth_test_set('NONE')
+
         if not self._hovered:
             return
         sp, _normal, room_idx, wall_char = self._hovered
         rooms = ROOM_OT_draw._room_list
         if room_idx >= len(rooms):
             return
-        s     = context.scene.room_settings
         r     = rooms[room_idx]
         # Guard: clear hover if the room object was deleted or hidden
         _obj = bpy.data.objects.get(r.get("obj_name", ""))
@@ -2093,7 +2121,6 @@ class ROOM_OT_draw(bpy.types.Operator):
                                  s.wall_height, s.wall_thickness)
         idx_fill = [(0,1,2),(0,2,3)]
         idx_line = [(0,1),(1,2),(2,3),(3,0)]
-        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
         gpu.state.depth_test_set('ALWAYS')
 
