@@ -915,104 +915,127 @@ def _build_stair_mesh(sd, s):
         profile.append((t_hi, z_bot))
         return profile, steps_lr
 
+    # Helpers: interpolate perpendicular (width) bounds linearly from lower to upper rect.
+    # frac=0 → lower rect perpendicular; frac=1 → upper rect perpendicular.
+    _span = (t_end - t_start) if abs(t_end - t_start) > 1e-6 else 1.0
+    def _frac(t):
+        return max(0.0, min(1.0, (t - t_start) / _span))
+
     if x_travel:
-        ya = ly1;  yb = ly2
+        # Perpendicular axis is Y; interpolate between ly1/ly2 (lower) and uy1/uy2 (upper)
+        def _ya(t): return ly1 + (uy1 - ly1) * _frac(t)
+        def _yb(t): return ly2 + (uy2 - ly2) * _frac(t)
         td = 1 if not flip else -1
-        ts = t_start
 
         for i in range(n):
-            xf = ts + td * i * step_d
-            xb = ts + td * (i + 1) * step_d
+            xf = t_start + td * i * step_d
+            xb = t_start + td * (i + 1) * step_d
             zl = z_bot + i * actual_rise
             zh = zl + actual_rise
+            yaf = _ya(xf); ybf = _yb(xf)
+            yab = _ya(xb); ybb = _yb(xb)
             if td > 0:
-                _quad((xf, ya, zh), (xb, ya, zh), (xb, yb, zh), (xf, yb, zh))
-                _quad((xf, yb, zl), (xf, ya, zl), (xf, ya, zh), (xf, yb, zh))
+                _quad((xf, yaf, zh), (xb, yab, zh), (xb, ybb, zh), (xf, ybf, zh))  # tread
+                _quad((xf, ybf, zl), (xf, yaf, zl), (xf, yaf, zh), (xf, ybf, zh))  # riser
             else:
-                _quad((xb, ya, zh), (xf, ya, zh), (xf, yb, zh), (xb, yb, zh))
-                _quad((xf, ya, zl), (xf, yb, zl), (xf, yb, zh), (xf, ya, zh))
+                _quad((xb, yab, zh), (xf, yaf, zh), (xf, ybf, zh), (xb, ybb, zh))
+                _quad((xf, yaf, zl), (xf, ybf, zl), (xf, ybf, zh), (xf, yaf, zh))
 
-        # Soffit spans full extent from t_start to t_end at z_bot
-        xs1, xs2 = min(t_start, t_end), max(t_start, t_end)
-        _quad((xs1, yb, z_bot), (xs2, yb, z_bot), (xs2, ya, z_bot), (xs1, ya, z_bot))
+        # Soffit — skewed quad at z_bot connecting lower and upper perp bounds
+        _quad((t_start, _yb(t_start), z_bot), (t_end, _yb(t_end), z_bot),
+              (t_end,   _ya(t_end),   z_bot), (t_start, _ya(t_start), z_bot))
 
-        # Back wall at the high end
+        # Back wall at the high end (upper rect Y)
         xw = t_end
+        ya_w = _ya(xw); yb_w = _yb(xw)
         if td > 0:
-            _quad((xw, ya, z_bot), (xw, yb, z_bot), (xw, yb, z_top), (xw, ya, z_top))
+            _quad((xw, ya_w, z_bot), (xw, yb_w, z_bot), (xw, yb_w, z_top), (xw, ya_w, z_top))
         else:
-            _quad((xw, yb, z_bot), (xw, ya, z_bot), (xw, ya, z_top), (xw, yb, z_top))
+            _quad((xw, yb_w, z_bot), (xw, ya_w, z_bot), (xw, ya_w, z_top), (xw, yb_w, z_top))
 
-        # Stringers
-        profile, steps_lr = _step_profile(min(t_start,t_end), max(t_start,t_end), n, actual_rise)
-        p0 = profile[0]
-        for i in range(1, len(profile) - 1):
-            a = (p0[0],           ya, p0[1])
-            b = (profile[i][0],   ya, profile[i][1])
-            c = (profile[i+1][0], ya, profile[i+1][1])
-            _tri(a, c, b)
-        for i in range(1, len(profile) - 1):
-            a = (p0[0],           yb, p0[1])
-            b = (profile[i][0],   yb, profile[i][1])
-            c = (profile[i+1][0], yb, profile[i+1][1])
-            _tri(a, b, c)
+        # Stringers — 3D fan from first profile point; Y interpolated at each t
+        _, steps_lr = _step_profile(min(t_start,t_end), max(t_start,t_end), n, actual_rise)
+        def _stringer(side_fn, inward):
+            pts = [(t_start, side_fn(t_start), z_bot)]
+            for (tl, tr, zh) in steps_lr:
+                pts.append((tl, side_fn(tl), zh))
+                pts.append((tr, side_fn(tr), zh))
+            pts.append((t_end, side_fn(t_end), z_bot))
+            p0 = pts[0]
+            for i in range(1, len(pts) - 1):
+                if inward:
+                    _tri(p0, pts[i], pts[i+1])
+                else:
+                    _tri(p0, pts[i+1], pts[i])
+        _stringer(_ya, inward=False)   # left  stringer (−Y face)
+        _stringer(_yb, inward=True)    # right stringer (+Y face)
 
         if add_r:
             for (tl, tr, zh) in steps_lr:
                 zl = zh - actual_rise
-                for side_y, fwd in ((ya, +1), (yb, -1)):
-                    a = (tl, side_y, zl);       b = (tr, side_y, zh)
-                    c = (tr, side_y, zh + rh);  d_ = (tl, side_y, zl + rh)
+                tc = (tl + tr) / 2
+                for side_fn, fwd in ((_ya, +1), (_yb, -1)):
+                    sy = side_fn(tc)
+                    a = (tl, sy, zl); b = (tr, sy, zh)
+                    c = (tr, sy, zh + rh); d_ = (tl, sy, zl + rh)
                     if fwd > 0:
                         _quad(d_, c, b, a, _CAT_RAILING)
                     else:
                         _quad(a, b, c, d_, _CAT_RAILING)
 
-    else:   # Y travel
-        xa = lx1;  xb = lx2
+    else:   # Y travel — perpendicular axis is X; interpolate lx1/lx2 → ux1/ux2
+        def _xa(t): return lx1 + (ux1 - lx1) * _frac(t)
+        def _xb(t): return lx2 + (ux2 - lx2) * _frac(t)
         td = 1 if not flip else -1
-        ts = t_start
 
         for i in range(n):
-            yf  = ts + td * i * step_d
-            yb_ = ts + td * (i + 1) * step_d
+            yf  = t_start + td * i * step_d
+            yb_ = t_start + td * (i + 1) * step_d
             zl  = z_bot + i * actual_rise
             zh  = zl + actual_rise
+            xaf = _xa(yf); xbf = _xb(yf)
+            xab = _xa(yb_); xbb = _xb(yb_)
             if td > 0:
-                _quad((xa, yf, zh), (xa, yb_, zh), (xb, yb_, zh), (xb, yf, zh))
-                _quad((xb, yf, zl), (xa, yf, zl), (xa, yf, zh), (xb, yf, zh))
+                _quad((xaf, yf, zh), (xab, yb_, zh), (xbb, yb_, zh), (xbf, yf, zh))  # tread
+                _quad((xbf, yf, zl), (xaf, yf, zl), (xaf, yf, zh), (xbf, yf, zh))    # riser
             else:
-                _quad((xa, yb_, zh), (xa, yf, zh), (xb, yf, zh), (xb, yb_, zh))
-                _quad((xa, yf, zl), (xb, yf, zl), (xb, yf, zh), (xa, yf, zh))
+                _quad((xab, yb_, zh), (xaf, yf, zh), (xbf, yf, zh), (xbb, yb_, zh))
+                _quad((xaf, yf, zl), (xbf, yf, zl), (xbf, yf, zh), (xaf, yf, zh))
 
-        ys1, ys2 = min(t_start, t_end), max(t_start, t_end)
-        _quad((xa, ys1, z_bot), (xa, ys2, z_bot), (xb, ys2, z_bot), (xb, ys1, z_bot))
+        _quad((t_start, _xa(t_start), z_bot), (t_end, _xa(t_end), z_bot),
+              (t_end,   _xb(t_end),   z_bot), (t_start, _xb(t_start), z_bot))
 
         yw = t_end
+        xa_w = _xa(yw); xb_w = _xb(yw)
         if td > 0:
-            _quad((xb, yw, z_bot), (xa, yw, z_bot), (xa, yw, z_top), (xb, yw, z_top))
+            _quad((xb_w, yw, z_bot), (xa_w, yw, z_bot), (xa_w, yw, z_top), (xb_w, yw, z_top))
         else:
-            _quad((xa, yw, z_bot), (xb, yw, z_bot), (xb, yw, z_top), (xa, yw, z_top))
+            _quad((xa_w, yw, z_bot), (xb_w, yw, z_bot), (xb_w, yw, z_top), (xa_w, yw, z_top))
 
-        profile, steps_lr = _step_profile(min(t_start,t_end), max(t_start,t_end), n, actual_rise)
-        p0 = profile[0]
-        for i in range(1, len(profile) - 1):
-            a = (xa, p0[0],           p0[1])
-            b = (xa, profile[i][0],   profile[i][1])
-            c = (xa, profile[i+1][0], profile[i+1][1])
-            _tri(a, b, c)
-        for i in range(1, len(profile) - 1):
-            a = (xb, p0[0],           p0[1])
-            b = (xb, profile[i][0],   profile[i][1])
-            c = (xb, profile[i+1][0], profile[i+1][1])
-            _tri(a, c, b)
+        _, steps_lr = _step_profile(min(t_start,t_end), max(t_start,t_end), n, actual_rise)
+        def _stringer_y(side_fn, inward):
+            pts = [(side_fn(t_start), t_start, z_bot)]
+            for (tl, tr, zh) in steps_lr:
+                pts.append((side_fn(tl), tl, zh))
+                pts.append((side_fn(tr), tr, zh))
+            pts.append((side_fn(t_end), t_end, z_bot))
+            p0 = pts[0]
+            for i in range(1, len(pts) - 1):
+                if inward:
+                    _tri(p0, pts[i], pts[i+1])
+                else:
+                    _tri(p0, pts[i+1], pts[i])
+        _stringer_y(_xa, inward=True)
+        _stringer_y(_xb, inward=False)
 
         if add_r:
             for (tl, tr, zh) in steps_lr:
                 zl = zh - actual_rise
-                for side_x, fwd in ((xa, +1), (xb, -1)):
-                    a = (side_x, tl, zl);       b = (side_x, tr, zh)
-                    c = (side_x, tr, zh + rh);  d_ = (side_x, tl, zl + rh)
+                tc = (tl + tr) / 2
+                for side_fn, fwd in ((_xa, +1), (_xb, -1)):
+                    sx = side_fn(tc)
+                    a = (sx, tl, zl); b = (sx, tr, zh)
+                    c = (sx, tr, zh + rh); d_ = (sx, tl, zl + rh)
                     if fwd > 0:
                         _quad(d_, c, b, a, _CAT_RAILING)
                     else:
