@@ -4251,9 +4251,10 @@ def _find_room_at(pt2d, z, rooms):
     return None
 
 
-def _rect_fits_in_room(rx1, ry1, rx2, ry2, z, rooms):
+def _rect_fits_in_room(rx1, ry1, rx2, ry2, z, rooms, eps=1e-4):
     """Return the room index if the rectangle fits entirely inside the inner floor area
-    (inside the wall thickness) of any room at the given Z, else None."""
+    (inside the wall thickness) of any room at the given Z, else None.
+    eps: floating-point tolerance so a rect snapped exactly to a wall face is accepted."""
     for i, r in enumerate(rooms):
         if abs(r.get("z", 0.0) - z) > 0.01:
             continue
@@ -4262,7 +4263,7 @@ def _rect_fits_in_room(rx1, ry1, rx2, ry2, z, rooms):
         iy1 = r["y1"] + t
         ix2 = r["x2"] - t
         iy2 = r["y2"] - t
-        if rx1 >= ix1 and ry1 >= iy1 and rx2 <= ix2 and ry2 <= iy2:
+        if rx1 >= ix1 - eps and ry1 >= iy1 - eps and rx2 <= ix2 + eps and ry2 <= iy2 + eps:
             return i
     return None
 
@@ -5548,10 +5549,31 @@ class ROOM_OT_stair_move(bpy.types.Operator):
                     best_y_dist = dist
                     snap_dy = wall - edge
 
+        # ── Validate wall snap doesn't push the other rect outside its room ──
+        # e.g. snapping lower rect to lower room's left wall shifts upper rect
+        # left by the same amount — verify upper still fits before accepting.
         if snap_dx is not None:
-            dx = snap_dx
+            test_dy = snap_dy if snap_dy is not None else dy
+            lo_ok = _rect_fits_in_room(b["lx1"]+snap_dx, b["ly1"]+test_dy,
+                                       b["lx2"]+snap_dx, b["ly2"]+test_dy,
+                                       self._sd["z_bot"], self._rooms) is not None
+            hi_ok = _rect_fits_in_room(b["ux1"]+snap_dx, b["uy1"]+test_dy,
+                                       b["ux2"]+snap_dx, b["uy2"]+test_dy,
+                                       self._sd["z_top"], self._rooms) is not None
+            if lo_ok and hi_ok:
+                dx = snap_dx
+            # else: keep grid-snapped dx (wall snap would break the other rect)
+
         if snap_dy is not None:
-            dy = snap_dy
+            test_dx = dx   # use whatever dx was settled above
+            lo_ok = _rect_fits_in_room(b["lx1"]+test_dx, b["ly1"]+snap_dy,
+                                       b["lx2"]+test_dx, b["ly2"]+snap_dy,
+                                       self._sd["z_bot"], self._rooms) is not None
+            hi_ok = _rect_fits_in_room(b["ux1"]+test_dx, b["uy1"]+snap_dy,
+                                       b["ux2"]+test_dx, b["uy2"]+snap_dy,
+                                       self._sd["z_top"], self._rooms) is not None
+            if lo_ok and hi_ok:
+                dy = snap_dy
 
         # ── Apply translation ─────────────────────────────────────────────────
         self._preview = dict(
