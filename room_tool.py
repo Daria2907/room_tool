@@ -2929,8 +2929,10 @@ def _resync_stair_holes(context):
 
 @bpy.app.handlers.persistent
 def _room_undo_post(*args):
-    """After any undo, resync stair_holes from the scene registry so the
-    Python _room_list stays consistent with Blender's undo state."""
+    """After any undo, resync ALL room data (doors, windows, stair_holes) from
+    the scene registry so the Python _room_list stays consistent with Blender's
+    undo state.  Without this, undone doors/windows come back on the next mesh
+    rebuild and 'phantom' openings persist after Ctrl+Z."""
     try:
         scene = bpy.context.scene
         if not scene:
@@ -2943,9 +2945,11 @@ def _room_undo_post(*args):
             e = entry_map.get(reg.get("obj_name", ""))
             if e:
                 try:
-                    reg["stair_holes"] = json.loads(getattr(e, "stairs_json", None) or "[]")
+                    reg["doors"]       = json.loads(getattr(e, "doors_json",   None) or "[]")
+                    reg["windows"]     = json.loads(getattr(e, "windows_json", None) or "[]")
+                    reg["stair_holes"] = json.loads(getattr(e, "stairs_json",  None) or "[]")
                 except Exception:
-                    reg["stair_holes"] = []
+                    pass
     except Exception:
         pass
 
@@ -3396,6 +3400,7 @@ class ROOM_OT_door_edit(bpy.types.Operator):
                         self._active_partner  = _find_partner_door(rooms, ri, di, s.wall_thickness)
                         self._added_in_press  = True   # treat as "newly added" for removal
                         self._remove_active_door(context, rooms, s)
+                        bpy.ops.ed.undo_push(message="Remove Door")
                         self._last_press_time = 0.0
                         self._last_press_door = None
                         self._hovered_door    = None
@@ -3484,6 +3489,7 @@ class ROOM_OT_door_edit(bpy.types.Operator):
                 if self._phase in ('LMB_DOWN', 'SLIDING'):
                     self._preview_orig = None   # dims confirmed
                     _sync_to_scene(context)
+                    bpy.ops.ed.undo_push(message="Place Door")
                     self._go_hover(context)
                 return {'RUNNING_MODAL'}
 
@@ -4099,6 +4105,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                     if 0 <= active < len(presets):
                         # Preset defines v_offset — skip V_POSITION entirely
                         _sync_to_scene(context)
+                        bpy.ops.ed.undo_push(message="Place Window")
                         self._go_hover(context)
                     else:
                         self._phase = 'V_POSITION'
@@ -4109,6 +4116,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                 # ── V_POSITION: second click confirms vertical placement ────
                 if self._phase == 'V_POSITION':
                     _sync_to_scene(context)
+                    bpy.ops.ed.undo_push(message="Place Window")
                     self._go_hover(context)
                     return {'RUNNING_MODAL'}
 
@@ -4133,6 +4141,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                             undo_entry.append((p_ri_d, [w.copy() for w in rooms[p_ri_d].get("windows", [])]))
                         self._undo_stack.append(undo_entry)
                         self._remove_active_win(context, rooms, s)
+                        bpy.ops.ed.undo_push(message="Remove Window")
                         self._last_press_time = 0.0
                         self._last_press_win  = None
                         self._hovered_win     = None
@@ -4474,6 +4483,7 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             _rebuild_room_mesh(rooms[ui], s)
 
         _sync_to_scene(context)
+        bpy.ops.ed.undo_push(message="Place Stair")
         self.report({'INFO'}, f"Created {obj_name}")
         return True
 
