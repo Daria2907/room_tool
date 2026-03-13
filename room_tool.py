@@ -34,6 +34,11 @@ class ROOM_PG_door_preset(bpy.types.PropertyGroup):
         name="Width",  default=0.9, min=0.1, max=10.0, unit="LENGTH")
     door_height: bpy.props.FloatProperty(
         name="Height", default=2.0, min=0.1, max=15.0, unit="LENGTH")
+    mesh_object: bpy.props.PointerProperty(
+        type=bpy.types.Object, name="Mesh",
+        description="Optional mesh placed as a linked instance at each door opening. "
+                    "Origin should be at the bottom-centre of the door. "
+                    "Scaled on X (width) and Z (height) to fit the opening.")
 
 
 class ROOM_PG_window_preset(bpy.types.PropertyGroup):
@@ -44,6 +49,11 @@ class ROOM_PG_window_preset(bpy.types.PropertyGroup):
         name="Height",      default=1.2, min=0.1, max=15.0, unit="LENGTH")
     v_offset     : bpy.props.FloatProperty(
         name="Sill Height", default=0.9, min=0.0, max=10.0, unit="LENGTH")
+    mesh_object  : bpy.props.PointerProperty(
+        type=bpy.types.Object, name="Mesh",
+        description="Optional mesh placed as a linked instance at each window opening. "
+                    "Origin should be at the bottom-centre of the window sill. "
+                    "Scaled on X (width) and Z (height) to fit the opening.")
 
 
 class ROOM_PG_registry_entry(bpy.types.PropertyGroup):
@@ -182,6 +192,19 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
     mat_stair         : bpy.props.PointerProperty(type=bpy.types.Material, name="Stairs")
     mat_stair_tiling  : bpy.props.FloatProperty(
         name="Tiling", default=1.0, min=0.001, max=1000.0)
+    # ── Collection / hierarchy ────────────────────────────────────────────────
+    use_hierarchy  : bpy.props.BoolProperty(
+        name="Use Collections", default=True,
+        description="Organise room objects into Blender collections")
+    hierarchy_mode : bpy.props.EnumProperty(
+        name="Mode",
+        items=[
+            ('FLOORS_AND_ROOMS', "Floors + Rooms",
+             "One collection per floor, sub-collection per room"),
+            ('FLOORS_ONLY',      "Floors Only",
+             "One collection per floor; room objects sit directly inside it"),
+        ],
+        default='FLOORS_AND_ROOMS')
 
 
 
@@ -202,14 +225,23 @@ def _get_or_create_col(name, parent):
 
 
 def _room_target_collection(context, room_num):
+    s = context.scene.room_settings
+    if not s.use_hierarchy:
+        return context.scene.collection        # flat — everything in scene root
+
     floors = context.scene.room_floors
     active = context.scene.room_active_floor
-    if 0 <= active < len(floors):
-        fl        = floors[active]
-        floor_col = _get_or_create_col(fl.name, context.scene.collection)
-        room_col  = _get_or_create_col(f"Room.{room_num:03}", floor_col)
-        return room_col
-    return context.collection
+    if not (0 <= active < len(floors)):
+        return context.collection
+
+    fl        = floors[active]
+    floor_col = _get_or_create_col(fl.name, context.scene.collection)
+
+    if s.hierarchy_mode == 'FLOORS_ONLY':
+        return floor_col                       # rooms go directly into floor col
+
+    room_col = _get_or_create_col(f"Room.{room_num:03}", floor_col)
+    return room_col                            # full two-level hierarchy
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1222,6 +1254,91 @@ def _rebuild_room_mesh(reg, s):
     _setup_room_vertex_groups(obj, cat_vert_sets)
     _apply_room_pivot(obj, x1, y1, x2, y2, z, s.pivot_mode)
     _apply_cube_uv_to_mesh(me, s)
+    # Reposition any assigned door/window mesh instances
+    col = next(iter(obj.users_collection), None)
+    _sync_opening_meshes(reg, collection=col)
+
+
+# ── Opening mesh helpers ──────────────────────────────────────────────────────
+
+def _opening_world_pos(opening, reg, is_window=False):
+    """Return (cx, cy, cz, rot_z) for the bottom-centre of a door/window opening.
+    rot_z is the Z-Euler rotation so the mesh faces INTO the room."""
+    wc     = opening["wc"]
+    anchor = opening["anchor"]
+    x1, y1, x2, y2 = reg["x1"], reg["y1"], reg["x2"], reg["y2"]
+    z      = reg.get("z", 0.0)
+    cz     = z + (opening.get("v_offset", 0.9) if is_window else 0.0)
+    import math
+    if   wc == 'S': return anchor, y1, cz,  0.0
+    elif wc == 'N': return anchor, y2, cz,  math.pi
+    elif wc == 'W': return x1, anchor, cz,  math.pi * 0.5
+    else:           return x2, anchor, cz, -math.pi * 0.5   # 'E'
+
+
+def _place_opening_mesh(opening, source_name, w, h, reg, collection=None):
+    """Create (or update) a linked mesh instance for a door or window.
+    opening  – the door/window dict (modified in-place to store mesh_obj_name)
+    source_name – bpy.data.objects key of the source mesh
+    w, h     – opening width and height in metres
+    reg      – room registry dict (provides x1/y1/x2/y2/z)
+    collection – Blender collection to link the instance into"""
+    src = bpy.data.objects.get(source_name)
+    if src is None:
+        return
+
+    is_win = "v_offset" in opening
+    cx, cy, cz, rot_z = _opening_world_pos(opening, reg, is_window=is_win)
+
+    # Re-use existing instance if possible, else create a new one
+    inst_name = opening.get("mesh_obj_name", "")
+    inst = bpy.data.objects.get(inst_name)
+    if inst is None or inst.data != src.data:
+        # Remove stale instance if it exists under a different mesh
+        if inst is not None:
+            for col in list(inst.users_collection):
+                col.objects.unlink(inst)
+            bpy.data.objects.remove(inst)
+        inst = bpy.data.objects.new(f"Opening.{src.name}", src.data)
+        target_col = collection or bpy.context.collection
+        target_col.objects.link(inst)
+        opening["mesh_obj_name"] = inst.name
+        opening["mesh_source"]   = source_name
+
+    # Position / rotate
+    inst.location = (cx, cy, cz)
+    inst.rotation_euler = (0.0, 0.0, rot_z)
+
+    # Scale X = width, Z = height; leave Y (depth) unchanged
+    import mathutils
+    dims = src.dimensions
+    sx = w / max(dims.x, 1e-4) if dims.x > 1e-4 else 1.0
+    sz = h / max(dims.z, 1e-4) if dims.z > 1e-4 else 1.0
+    inst.scale = (sx, 1.0, sz)
+
+
+def _remove_opening_mesh(opening):
+    """Remove the mesh instance linked to a door/window dict (if any)."""
+    inst_name = opening.pop("mesh_obj_name", None)
+    opening.pop("mesh_source", None)
+    if inst_name:
+        inst = bpy.data.objects.get(inst_name)
+        if inst is not None:
+            for col in list(inst.users_collection):
+                col.objects.unlink(inst)
+            bpy.data.objects.remove(inst)
+
+
+def _sync_opening_meshes(reg, collection=None):
+    """Reposition / recreate all door and window mesh instances for a room.
+    Called after _rebuild_room_mesh so instances stay in sync with geometry."""
+    for opening in reg.get("doors", []) + reg.get("windows", []):
+        src_name = opening.get("mesh_source")
+        if not src_name:
+            continue
+        w = opening.get("w", opening.get("window_width", 1.0))
+        h = opening.get("h", opening.get("window_height", 1.0))
+        _place_opening_mesh(opening, src_name, w, h, reg, collection)
 
 
 def _apply_room_pivot(obj, x1, y1, x2, y2, z, mode):
@@ -3122,12 +3239,14 @@ class ROOM_OT_door_edit(bpy.types.Operator):
         partner = _find_partner_door(rooms, ri, di, s.wall_thickness)
         reg = rooms[ri]
         if di < len(reg.get("doors", [])):
+            _remove_opening_mesh(reg["doors"][di])
             reg["doors"].pop(di)
         _rebuild_room_mesh(reg, s)
         if partner is not None:
             p_ri, p_di = partner
             p_reg = rooms[p_ri]
             if p_di < len(p_reg.get("doors", [])):
+                _remove_opening_mesh(p_reg["doors"][p_di])
                 p_reg["doors"].pop(p_di)
             _rebuild_room_mesh(p_reg, s)
         _sync_to_scene(context)
@@ -3437,6 +3556,11 @@ class ROOM_OT_door_edit(bpy.types.Operator):
                             self._last_press_door = None
                             return {'RUNNING_MODAL'}
                         new_door = {"wc": wc, "anchor": anchor, "w": dw, "h": dh}
+                        # Attach mesh from active preset if one is assigned
+                        _dp = context.scene.room_door_presets
+                        _da = context.scene.room_active_door_preset
+                        if 0 <= _da < len(_dp) and _dp[_da].mesh_object:
+                            new_door["mesh_source"] = _dp[_da].mesh_object.name
                         reg.setdefault("doors", []).append(new_door)
                         new_di = len(reg["doors"]) - 1
                         _rebuild_room_mesh(reg, s)
@@ -3446,6 +3570,8 @@ class ROOM_OT_door_edit(bpy.types.Operator):
                             p_ri, p_wc = partner
                             p_reg = rooms[p_ri]
                             p_door = {"wc": p_wc, "anchor": anchor, "w": dw, "h": dh}
+                            if new_door.get("mesh_source"):
+                                p_door["mesh_source"] = new_door["mesh_source"]
                             p_reg.setdefault("doors", []).append(p_door)
                             partner_door_idx = len(p_reg["doors"]) - 1
                             _rebuild_room_mesh(p_reg, s)
@@ -3651,6 +3777,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
         wi    = wi - _cw.get("array_idx", 0)   # rewind to first window in array
         for k in reversed(range(count)):
             if wi + k < len(wins):
+                _remove_opening_mesh(wins[wi + k])
                 wins.pop(wi + k)
         _rebuild_room_mesh(reg, s)
         if self._active_partner is not None:
@@ -3662,6 +3789,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
             p_wi    = p_wi - _p_cw.get("array_idx", 0)   # rewind
             for k in reversed(range(p_count)):
                 if p_wi + k < len(p_wins):
+                    _remove_opening_mesh(p_wins[p_wi + k])
                     p_wins.pop(p_wi + k)
             _rebuild_room_mesh(p_reg, s)
         _sync_to_scene(context)
@@ -4182,11 +4310,20 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                             undo_entry.append((partner_pre[0],
                                                [w.copy() for w in rooms[partner_pre[0]].get("windows", [])]))
                         self._undo_stack.append(undo_entry)
+                        # Attach mesh from active window preset if one is assigned
+                        _wp  = context.scene.room_window_presets
+                        _wa  = context.scene.room_active_window_preset
+                        _win_src = (_wp[_wa].mesh_object.name
+                                    if 0 <= _wa < len(_wp) and _wp[_wa].mesh_object
+                                    else None)
                         first_wi     = len(reg.setdefault("windows", []))
                         for k, anch in enumerate(anchors):
-                            reg["windows"].append({"wc": wc, "anchor": anch,
-                                                   "v_offset": voff, "w": ww, "h": wh,
-                                                   "array_n": count, "array_idx": k})
+                            wd = {"wc": wc, "anchor": anch,
+                                  "v_offset": voff, "w": ww, "h": wh,
+                                  "array_n": count, "array_idx": k}
+                            if _win_src:
+                                wd["mesh_source"] = _win_src
+                            reg["windows"].append(wd)
                         _rebuild_room_mesh(reg, s)
                         # Mirror to partner wall
                         partner          = _find_partner_wall(rooms, ri, wc, s.wall_thickness)
@@ -4197,9 +4334,12 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                             p_wins     = p_reg.setdefault("windows", [])
                             partner_first_wi = len(p_wins)
                             for k, anch in enumerate(anchors):
-                                p_wins.append({"wc": p_wc, "anchor": anch,
-                                               "v_offset": voff, "w": ww, "h": wh,
-                                               "array_n": count, "array_idx": k})
+                                pd = {"wc": p_wc, "anchor": anch,
+                                      "v_offset": voff, "w": ww, "h": wh,
+                                      "array_n": count, "array_idx": k}
+                                if _win_src:
+                                    pd["mesh_source"] = _win_src
+                                p_wins.append(pd)
                             _rebuild_room_mesh(p_reg, s)
                         self._active_idx     = ri
                         self._active_wc      = wc
@@ -5066,6 +5206,15 @@ class ROOM_PT_panel(bpy.types.Panel):
         col.label(text="Object Pivot:")
         col.prop(s, "pivot_mode", text="")
 
+        # ── Organisation ─────────────────────────────────────────────────────
+        box = L.box()
+        col = box.column(align=True)
+        col.label(text="Organisation:", icon="OUTLINER_COLLECTION")
+        row = col.row(align=True)
+        row.prop(s, "use_hierarchy", toggle=True)
+        if s.use_hierarchy:
+            col.row().prop(s, "hierarchy_mode", expand=True)
+
         box = L.box()
         col = box.column(align=True)
         col.label(text="Materials  /  Tiling:", icon="MATERIAL")
@@ -5161,6 +5310,7 @@ class ROOM_PT_door_panel(bpy.types.Panel):
                 rem.preset_index = i
                 if is_active:
                     col.prop(dp, "name", text="Rename")
+                    col.prop(dp, "mesh_object", text="Mesh", icon="MESH_DATA")
 
 
 class ROOM_PT_window_panel(bpy.types.Panel):
@@ -5215,6 +5365,7 @@ class ROOM_PT_window_panel(bpy.types.Panel):
                     col.prop(wp, "window_width")
                     col.prop(wp, "window_height")
                     col.prop(wp, "v_offset")
+                    col.prop(wp, "mesh_object", text="Mesh", icon="MESH_DATA")
 
 
 class ROOM_PT_stair_panel(bpy.types.Panel):
