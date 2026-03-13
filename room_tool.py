@@ -87,6 +87,16 @@ def _cb_rebuild(self, context):
         _rebuild_room_mesh(reg, s)
 
 
+def _cb_rebuild_plinth(self, context):
+    """Update callback for add_plinth_bottom / add_plinth_top scene toggles.
+    Syncs the per-room flags to the new scene value then rebuilds all rooms."""
+    s = context.scene.room_settings
+    for reg in ROOM_OT_draw._room_list:
+        reg['plinth_bottom_enabled'] = s.add_plinth_bottom
+        reg['plinth_top_enabled']    = s.add_plinth_top
+        _rebuild_room_mesh(reg, s)
+
+
 class ROOM_PG_settings(bpy.types.PropertyGroup):
     z_foundation : bpy.props.FloatProperty(
         name="Foundation Z",
@@ -129,12 +139,12 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
     mat_window_frame_tiling : bpy.props.FloatProperty(name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
     add_plinth_bottom : bpy.props.BoolProperty(
         name="Bottom Plinth",
-        description="Default for new rooms: add a skirting board / baseboard along the bottom of the walls",
-        default=False)
+        description="Add a skirting board / baseboard along the bottom of the walls",
+        default=False, update=_cb_rebuild_plinth)
     add_plinth_top : bpy.props.BoolProperty(
         name="Top Plinth",
-        description="Default for new rooms: add a cornice / crown moulding along the top of the walls",
-        default=False)
+        description="Add a cornice / crown moulding along the top of the walls",
+        default=False, update=_cb_rebuild_plinth)
     plinth_bottom_height : bpy.props.FloatProperty(
         name="Height", default=0.1, min=0.005, max=2.0, unit="LENGTH",
         description="Height of the bottom plinth strip", update=_cb_rebuild)
@@ -4997,7 +5007,7 @@ class ROOM_OT_toggle_room_plinth(bpy.types.Operator):
         if reg is None:
             return {'CANCELLED'}
         key = 'plinth_bottom_enabled' if self.side == 'BOTTOM' else 'plinth_top_enabled'
-        reg[key] = not reg.get(key, True)
+        reg[key] = not reg.get(key, False)
         _rebuild_room_mesh(reg, s)
         _sync_to_scene(context)
         return {'FINISHED'}
