@@ -174,10 +174,6 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         name="Railing Thickness", default=0.05, min=0.01, max=0.3, unit="LENGTH")
     stair_floor_lower : bpy.props.IntProperty(name="From Floor", default=0, min=0)
     stair_floor_upper : bpy.props.IntProperty(name="To Floor",   default=1, min=0)
-    stair_flip_dir    : bpy.props.BoolProperty(
-        name="Flip Direction",
-        description="Reverse which end of the rectangle is the bottom of the stairs",
-        default=False)
     mat_stair         : bpy.props.PointerProperty(type=bpy.types.Material, name="Stairs")
     mat_stair_tiling  : bpy.props.FloatProperty(
         name="Tiling", default=1.0, min=0.001, max=1000.0)
@@ -644,6 +640,36 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
         else:
             _f4((x1,y1,z),(x2,y1,z),(x2,y2,z),(x1,y2,z))
 
+    # ── Stair hole shaft reveals ──────────────────────────────────────────────
+    # 4 vertical panels around each stair hole perimeter.
+    # Each room extends INTO the slab by half the slab thickness so the two
+    # panels snap at the midpoint — same technique as window jambs.
+    # "ceiling" cut: panels go UP   from zt into the slab (toward upper floor)
+    # "floor"   cut: panels go DOWN from z  into the slab (toward lower ceiling)
+    for sh in stair_holes:
+        sx1, sy1, sx2, sy2 = sh["x1"], sh["y1"], sh["x2"], sh["y2"]
+        cut = sh.get("cut", "both")
+        _cur_cat[0]    = _CAT_WALL
+        _cur_tiling[0] = s.mat_walls_tiling
+        if s.add_ceiling and cut in ("ceiling", "both"):
+            slab_top = sh.get("slab_z", zt)
+            d2 = max(0.0, slab_top - zt) / 2       # half slab thickness
+            if d2 > 1e-6:
+                # panels go UP from zt to zt+d2; inward normals (face tunnel centre)
+                _f4((sx2,sy1,zt+d2),(sx2,sy1,zt),(sx1,sy1,zt),(sx1,sy1,zt+d2))  # S (+Y)
+                _f4((sx1,sy2,zt),(sx2,sy2,zt),(sx2,sy2,zt+d2),(sx1,sy2,zt+d2))  # N (−Y)
+                _f4((sx1,sy1,zt),(sx1,sy2,zt),(sx1,sy2,zt+d2),(sx1,sy1,zt+d2))  # W (+X)
+                _f4((sx2,sy2,zt),(sx2,sy1,zt),(sx2,sy1,zt+d2),(sx2,sy2,zt+d2))  # E (−X)
+        if s.add_floor and cut in ("floor", "both"):
+            slab_bot = sh.get("slab_z", z)
+            d2 = max(0.0, z - slab_bot) / 2        # half slab thickness
+            if d2 > 1e-6:
+                # panels go DOWN from z to z-d2; inward normals (face tunnel centre)
+                _f4((sx1,sy1,z-d2),(sx1,sy1,z),(sx2,sy1,z),(sx2,sy1,z-d2))      # S (+Y)
+                _f4((sx2,sy2,z),(sx1,sy2,z),(sx1,sy2,z-d2),(sx2,sy2,z-d2))      # N (−Y)
+                _f4((sx1,sy2,z),(sx1,sy1,z),(sx1,sy1,z-d2),(sx1,sy2,z-d2))      # W (+X)
+                _f4((sx2,sy1,z),(sx2,sy2,z),(sx2,sy2,z-d2),(sx2,sy1,z-d2))      # E (−X)
+
     # ── Plinth / Skirting / Cornice ──────────────────────────────────────────
     _add_pb = add_plinth_bottom if add_plinth_bottom is not None else getattr(s, 'add_plinth_bottom', False)
     _add_pt = add_plinth_top    if add_plinth_top    is not None else getattr(s, 'add_plinth_top',    False)
@@ -841,7 +867,7 @@ def _build_stair_mesh(sd, s):
              ux1,uy1,ux2,uy2 (upper hole footprint — may be offset along travel axis)
              z_bot, z_top
              step_rise, add_railing, railing_height, railing_thick
-             flip_dir (True = stair ascends from the far end of the long axis)
+             x_travel (bool, travel along X axis vs Y axis)
     """
     lx1 = min(sd["lx1"], sd["lx2"]); lx2 = max(sd["lx1"], sd["lx2"])
     ly1 = min(sd["ly1"], sd["ly2"]); ly2 = max(sd["ly1"], sd["ly2"])
@@ -852,7 +878,6 @@ def _build_stair_mesh(sd, s):
     uy2 = max(sd.get("uy1", ly1), sd.get("uy2", ly2))
     z_bot  = sd["z_bot"]
     z_top  = sd["z_top"]
-    flip   = sd.get("flip_dir", False)
     rise_t = max(sd.get("step_rise",  getattr(s, "stair_rise",          0.18)), 0.05)
     add_r  = sd.get("add_railing",    getattr(s, "stair_add_railing",    True))
     rh     = sd.get("railing_height", getattr(s, "stair_railing_height", 0.9))
@@ -864,22 +889,26 @@ def _build_stair_mesh(sd, s):
     n = max(2, round(dz / rise_t))
     actual_rise = dz / n
 
-    # Determine travel axis from the lower rect's long dimension
+    # Determine travel axis: use offset direction if stored, else rect dimensions
     rw = lx2 - lx1
     rl = ly2 - ly1
-    x_travel = rw >= rl
+    x_travel = sd.get("x_travel", rw >= rl)
 
-    # Travel extent: from the bottom step edge to the top step edge.
-    # For x_travel, flip=False: bottom at lx1, top at ux2  (normal forward travel)
-    # For x_travel, flip=True:  bottom at lx2, top at ux1  (reversed)
+    # Travel extent: nearest edge of lower rect → nearest edge of upper rect.
+    # Upper rect center determines direction; stringer lines connect facing edges.
     if x_travel:
-        t_start = lx1 if not flip else lx2
-        t_end   = ux2 if not flip else ux1
+        if (ux1 + ux2) / 2 >= (lx1 + lx2) / 2:  # upper is to the right
+            t_start, t_end = lx2, ux2  # right edge of lower → right (far) edge of upper
+        else:                                       # upper is to the left
+            t_start, t_end = lx1, ux1  # left edge of lower → left (far) edge of upper
     else:
-        t_start = ly1 if not flip else ly2
-        t_end   = uy2 if not flip else uy1
+        if (uy1 + uy2) / 2 >= (ly1 + ly2) / 2:  # upper is above
+            t_start, t_end = ly2, uy2  # top edge of lower → top (far) edge of upper
+        else:                                      # upper is below
+            t_start, t_end = ly1, uy1  # bottom edge of lower → bottom (far) edge of upper
 
-    total_travel = (t_end - t_start) if not flip else (t_start - t_end)
+    td = 1 if t_end >= t_start else -1
+    total_travel = abs(t_end - t_start)
     if total_travel < 0.05:
         return [], [], []
     step_d = total_travel / n   # horizontal depth per step
@@ -925,7 +954,7 @@ def _build_stair_mesh(sd, s):
         # Perpendicular axis is Y; interpolate between ly1/ly2 (lower) and uy1/uy2 (upper)
         def _ya(t): return ly1 + (uy1 - ly1) * _frac(t)
         def _yb(t): return ly2 + (uy2 - ly2) * _frac(t)
-        td = 1 if not flip else -1
+        # td already set above from t_start/t_end direction
 
         for i in range(n):
             xf = t_start + td * i * step_d
@@ -953,22 +982,32 @@ def _build_stair_mesh(sd, s):
         else:
             _quad((xw, yb_w, z_bot), (xw, ya_w, z_bot), (xw, ya_w, z_top), (xw, yb_w, z_top))
 
-        # Stringers — 3D fan from first profile point; Y interpolated at each t
-        _, steps_lr = _step_profile(min(t_start,t_end), max(t_start,t_end), n, actual_rise)
-        def _stringer(side_fn, inward):
+        # Stringers — single N-gon per side (no internal fan edges)
+        # Pass t_start,t_end in travel order so step heights increase in the
+        # correct direction when td<0 (upper rect to the left/below).
+        _, steps_lr = _step_profile(t_start, t_end, n, actual_rise)
+        def _stringer_ngon(side_fn, outward_neg_y):
             pts = [(t_start, side_fn(t_start), z_bot)]
-            for (tl, tr, zh) in steps_lr:
-                pts.append((tl, side_fn(tl), zh))
-                pts.append((tr, side_fn(tr), zh))
+            if td > 0:
+                for (tl, tr, zh) in steps_lr:
+                    pts.append((tl, side_fn(tl), zh))
+                    pts.append((tr, side_fn(tr), zh))
+            else:
+                for (tl, tr, zh) in reversed(steps_lr):
+                    pts.append((tr, side_fn(tr), zh))
+                    pts.append((tl, side_fn(tl), zh))
             pts.append((t_end, side_fn(t_end), z_bot))
-            p0 = pts[0]
-            for i in range(1, len(pts) - 1):
-                if inward:
-                    _tri(p0, pts[i], pts[i+1])
-                else:
-                    _tri(p0, pts[i+1], pts[i])
-        _stringer(_ya, inward=False)   # left  stringer (−Y face)
-        _stringer(_yb, inward=True)    # right stringer (+Y face)
+            # Normal direction: outward_neg_y=True → face -Y, False → face +Y.
+            # When td>0 the unmodified polygon is CW from -Y (needs reversal for -Y normal).
+            # When td<0 the unmodified polygon is CCW from -Y (no reversal needed for -Y normal).
+            if outward_neg_y == (td > 0):
+                pts = pts[::-1]
+            base = len(verts_out)
+            verts_out.extend(pts)
+            faces_out.append(tuple(range(base, base + len(pts))))
+            cats_out.append(_CAT_STAIR)
+        _stringer_ngon(_ya, outward_neg_y=True)    # left  stringer (−Y face)
+        _stringer_ngon(_yb, outward_neg_y=False)   # right stringer (+Y face)
 
         if add_r:
             for (tl, tr, zh) in steps_lr:
@@ -986,7 +1025,7 @@ def _build_stair_mesh(sd, s):
     else:   # Y travel — perpendicular axis is X; interpolate lx1/lx2 → ux1/ux2
         def _xa(t): return lx1 + (ux1 - lx1) * _frac(t)
         def _xb(t): return lx2 + (ux2 - lx2) * _frac(t)
-        td = 1 if not flip else -1
+        # td already set above from t_start/t_end direction
 
         for i in range(n):
             yf  = t_start + td * i * step_d
@@ -1002,8 +1041,8 @@ def _build_stair_mesh(sd, s):
                 _quad((xab, yb_, zh), (xaf, yf, zh), (xbf, yf, zh), (xbb, yb_, zh))
                 _quad((xaf, yf, zl), (xbf, yf, zl), (xbf, yf, zh), (xaf, yf, zh))
 
-        _quad((t_start, _xa(t_start), z_bot), (t_end, _xa(t_end), z_bot),
-              (t_end,   _xb(t_end),   z_bot), (t_start, _xb(t_start), z_bot))
+        _quad((_xb(t_start), t_start, z_bot), (_xb(t_end), t_end, z_bot),
+              (_xa(t_end),   t_end,   z_bot), (_xa(t_start), t_start, z_bot))
 
         yw = t_end
         xa_w = _xa(yw); xb_w = _xb(yw)
@@ -1012,21 +1051,28 @@ def _build_stair_mesh(sd, s):
         else:
             _quad((xa_w, yw, z_bot), (xb_w, yw, z_bot), (xb_w, yw, z_top), (xa_w, yw, z_top))
 
-        _, steps_lr = _step_profile(min(t_start,t_end), max(t_start,t_end), n, actual_rise)
-        def _stringer_y(side_fn, inward):
+        _, steps_lr = _step_profile(t_start, t_end, n, actual_rise)
+        def _stringer_y_ngon(side_fn, outward_neg_x):
             pts = [(side_fn(t_start), t_start, z_bot)]
-            for (tl, tr, zh) in steps_lr:
-                pts.append((side_fn(tl), tl, zh))
-                pts.append((side_fn(tr), tr, zh))
+            if td > 0:
+                for (tl, tr, zh) in steps_lr:
+                    pts.append((side_fn(tl), tl, zh))
+                    pts.append((side_fn(tr), tr, zh))
+            else:
+                for (tl, tr, zh) in reversed(steps_lr):
+                    pts.append((side_fn(tr), tr, zh))
+                    pts.append((side_fn(tl), tl, zh))
             pts.append((side_fn(t_end), t_end, z_bot))
-            p0 = pts[0]
-            for i in range(1, len(pts) - 1):
-                if inward:
-                    _tri(p0, pts[i], pts[i+1])
-                else:
-                    _tri(p0, pts[i+1], pts[i])
-        _stringer_y(_xa, inward=True)
-        _stringer_y(_xb, inward=False)
+            # For y_travel the unmodified polygon (td>0) is already CCW from -X → -X normal.
+            # When td<0 the polygon flips to CW from -X → needs reversal for -X normal.
+            if outward_neg_x == (td < 0):
+                pts = pts[::-1]
+            base = len(verts_out)
+            verts_out.extend(pts)
+            faces_out.append(tuple(range(base, base + len(pts))))
+            cats_out.append(_CAT_STAIR)
+        _stringer_y_ngon(_xa, outward_neg_x=True)    # left  stringer (−X face)
+        _stringer_y_ngon(_xb, outward_neg_x=False)   # right stringer (+X face)
 
         if add_r:
             for (tl, tr, zh) in steps_lr:
@@ -1042,6 +1088,21 @@ def _build_stair_mesh(sd, s):
                         _quad(a, b, c, d_, _CAT_RAILING)
 
     return verts_out, faces_out, cats_out
+
+
+def _stair_pivot_xy(sd):
+    """Return (px, py) — the top-corner vertex used as the stair object's origin.
+    Mirrors _pivot_point() on ROOM_OT_stair_move but works on a raw sd dict."""
+    lmx = (sd["lx1"] + sd["lx2"]) / 2
+    umx = (sd.get("ux1", sd["lx1"]) + sd.get("ux2", sd["lx2"])) / 2
+    lmy = (sd["ly1"] + sd["ly2"]) / 2
+    umy = (sd.get("uy1", sd["ly1"]) + sd.get("uy2", sd["ly2"])) / 2
+    ux1 = sd.get("ux1", sd["lx1"]); ux2 = sd.get("ux2", sd["lx2"])
+    uy1 = sd.get("uy1", sd["ly1"]); uy2 = sd.get("uy2", sd["ly2"])
+    if sd.get("x_travel", True):
+        return (ux2, uy1) if umx >= lmx else (ux1, uy2)
+    else:
+        return (ux1, uy2) if umy >= lmy else (ux2, uy1)
 
 
 def _make_stair_obj(name, sd, s, collection=None):
@@ -1067,7 +1128,17 @@ def _make_stair_obj(name, sd, s, collection=None):
     obj = bpy.data.objects.new(name, me)
     (collection or bpy.context.collection).objects.link(obj)
     _setup_stair_materials(me, s)
-    _apply_stair_uv(me, s)
+    _apply_stair_uv(me, s)   # UV computed while verts are still in world space
+    # Move object origin to pivot corner (top corner vertex)
+    px, py = _stair_pivot_xy(sd)
+    pz = sd.get("z_top", 0.0)
+    pivot = Vector((px, py, pz))
+    for v in me.vertices:
+        v.co -= pivot
+    obj.location = pivot
+    me.update()
+    # Mark as stair so panels/operators can identify it
+    obj["room_stair"] = json.dumps({k: v for k, v in sd.items() if k != "obj_name"})
     return obj
 
 
@@ -4325,17 +4396,25 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                                      "slide to align with the upper room (green = valid)")
             return False
 
-        # Determine travel axis and validate total travel distance
+        # Determine travel axis from actual offset direction between rects
         rw = lx2 - lx1; rl = ly2 - ly1
-        x_travel = rw >= rl
-        flip = s.stair_flip_dir
+        x_off = abs((ux1 + ux2) / 2 - (lx1 + lx2) / 2)
+        y_off = abs((uy1 + uy2) / 2 - (ly1 + ly2) / 2)
+        x_travel = (x_off >= y_off) if (x_off > 1e-6 or y_off > 1e-6) else (rw >= rl)
+        # Travel = distance between nearest facing edges (same logic as _build_stair_mesh)
         if x_travel:
-            total_travel = (ux2 - lx1) if not flip else (lx2 - ux1)
+            if (ux1 + ux2) / 2 >= (lx1 + lx2) / 2:
+                total_travel = abs(ux1 - lx2)
+            else:
+                total_travel = abs(lx1 - ux2)
         else:
-            total_travel = (uy2 - ly1) if not flip else (ly2 - uy1)
+            if (uy1 + uy2) / 2 >= (ly1 + ly2) / 2:
+                total_travel = abs(uy1 - ly2)
+            else:
+                total_travel = abs(ly1 - uy2)
         if total_travel < 0.05:
             self.report({'WARNING'}, "Total stair travel too short — "
-                                     "slide the upper opening further or toggle Flip Direction")
+                                     "slide the upper opening further away")
             return False
 
         sd = {
@@ -4347,7 +4426,7 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             "add_railing":    s.stair_add_railing,
             "railing_height": s.stair_railing_height,
             "railing_thick":  s.stair_railing_thick,
-            "flip_dir":       flip,
+            "x_travel":       x_travel,
         }
 
         # ── Create stair mesh ───────────────────────────────────────────
@@ -4366,10 +4445,28 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         ROOM_OT_draw._stair_list.append(sd)
 
         # ── Cut holes: ceiling-only of lower room + floor-only of upper room ──
-        lower_hole = {"x1": lx1, "y1": ly1, "x2": lx2, "y2": ly2,
-                      "cut": "ceiling", "stair_obj": obj_name}
-        upper_hole = {"x1": ux1, "y1": uy1, "x2": ux2, "y2": uy2,
-                      "cut": "floor",   "stair_obj": obj_name}
+        # Hole spans from near edge of lower rect (where stair begins to rise)
+        # to far edge of upper rect (end of upper landing) so the full stair
+        # body + upper landing are open — not just the upper rect alone.
+        if x_travel:
+            if (ux1 + ux2) / 2 >= (lx1 + lx2) / 2:  # upper to the right
+                hx1, hx2 = lx2, ux2
+            else:                                       # upper to the left
+                hx1, hx2 = ux1, lx1
+            hy1, hy2 = min(ly1, uy1), max(ly2, uy2)
+        else:
+            if (uy1 + uy2) / 2 >= (ly1 + ly2) / 2:  # upper above
+                hy1, hy2 = ly2, uy2
+            else:                                      # upper below
+                hy1, hy2 = uy1, ly1
+            hx1, hx2 = min(lx1, ux1), max(lx2, ux2)
+        zt_lower = self._z_lower + s.wall_height   # lower room ceiling = bottom of slab
+        lower_hole = {"x1": hx1, "y1": hy1, "x2": hx2, "y2": hy2,
+                      "cut": "ceiling", "stair_obj": obj_name,
+                      "slab_z": self._z_upper}   # top of slab = upper room floor
+        upper_hole = {"x1": hx1, "y1": hy1, "x2": hx2, "y2": hy2,
+                      "cut": "floor",   "stair_obj": obj_name,
+                      "slab_z": zt_lower}         # bottom of slab = lower room ceiling
         rooms[li].setdefault("stair_holes", []).append(lower_hole)
         _rebuild_room_mesh(rooms[li], s)
         if ui != li:
@@ -4432,19 +4529,20 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             pt = _ray_to_z(context, event, z_plane)
             if pt is not None:
                 self._cursor = pt
-                # During UPPER_SLIDE: constrain to travel axis (perpendicular is locked)
+                # During UPPER_SLIDE: dominant-axis detection —
+                # whichever axis the cursor has moved further from the lower
+                # rect centre, that axis slides; the other stays locked.
                 if self._phase == 'UPPER_SLIDE' and self._lower_c2 is not None:
                     lx1 = min(self._lower_c1.x, self._lower_c2.x)
                     ly1 = min(self._lower_c1.y, self._lower_c2.y)
                     lx2 = max(self._lower_c1.x, self._lower_c2.x)
                     ly2 = max(self._lower_c1.y, self._lower_c2.y)
-                    rw = lx2 - lx1; rl = ly2 - ly1
-                    if rw >= rl:   # travel axis = X, perpendicular Y locked
-                        offset = pt.x - (lx1 + lx2) * 0.5
-                        self._upper_rect = (lx1 + offset, ly1, lx2 + offset, ly2)
-                    else:          # travel axis = Y, perpendicular X locked
-                        offset = pt.y - (ly1 + ly2) * 0.5
-                        self._upper_rect = (lx1, ly1 + offset, lx2, ly2 + offset)
+                    dx = pt.x - (lx1 + lx2) * 0.5
+                    dy = pt.y - (ly1 + ly2) * 0.5
+                    if abs(dx) >= abs(dy):   # X dominant → slide X, lock Y
+                        self._upper_rect = (lx1 + dx, ly1, lx2 + dx, ly2)
+                    else:                    # Y dominant → slide Y, lock X
+                        self._upper_rect = (lx1, ly1 + dy, lx2, ly2 + dy)
 
         if event.type == 'LEFTMOUSE':
             pt = _ray_to_z(context, event, z_plane)
@@ -4479,18 +4577,17 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                                 "opening (green = valid, red = outside room), LMB to confirm")
 
                 elif self._phase == 'UPPER_SLIDE':
-                    # Re-compute upper_rect from click, travel axis only
+                    # Re-compute upper_rect from click, dominant-axis detection
                     lx1 = min(self._lower_c1.x, self._lower_c2.x)
                     ly1 = min(self._lower_c1.y, self._lower_c2.y)
                     lx2 = max(self._lower_c1.x, self._lower_c2.x)
                     ly2 = max(self._lower_c1.y, self._lower_c2.y)
-                    rw = lx2 - lx1; rl = ly2 - ly1
-                    if rw >= rl:
-                        offset = pt.x - (lx1 + lx2) * 0.5
-                        self._upper_rect = (lx1 + offset, ly1, lx2 + offset, ly2)
-                    else:
-                        offset = pt.y - (ly1 + ly2) * 0.5
-                        self._upper_rect = (lx1, ly1 + offset, lx2, ly2 + offset)
+                    dx = pt.x - (lx1 + lx2) * 0.5
+                    dy = pt.y - (ly1 + ly2) * 0.5
+                    if abs(dx) >= abs(dy):  # X dominant → slide X, lock Y
+                        self._upper_rect = (lx1 + dx, ly1, lx2 + dx, ly2)
+                    else:                   # Y dominant → slide Y, lock X
+                        self._upper_rect = (lx1, ly1 + dy, lx2, ly2 + dy)
                     if self._finalise(context):
                         self._remove_draw_handle()
                         context.scene.room_stair_edit_active = False
@@ -5092,8 +5189,6 @@ class ROOM_PT_stair_panel(bpy.types.Panel):
         col.separator()
         col.prop(s, "stair_rise")
         col.prop(s, "stair_depth")
-        col.prop(s, "stair_flip_dir")
-        col.separator()
         col.prop(s, "stair_add_railing")
         if s.stair_add_railing:
             sub = col.column(align=True)
@@ -5111,6 +5206,576 @@ class ROOM_PT_stair_panel(bpy.types.Panel):
         split.prop(s, "mat_railing",        text="Railing")
         split.prop(s, "mat_railing_tiling", text="")
 
+        # ── Per-stair step editing ─────────────────────────────────────────
+        obj = context.active_object
+        if obj:
+            sd = next((d for d in ROOM_OT_draw._stair_list
+                       if d.get("obj_name") == obj.name), None)
+            if sd is not None:
+                box = L.box()
+                col2 = box.column(align=True)
+                col2.label(text=f"Edit: {obj.name}", icon="OUTLINER_OB_MESH")
+                # Compute current step stats for display
+                dz    = sd.get("z_top", 0) - sd.get("z_bot", 0)
+                x_t   = sd.get("x_travel", True)
+                lx1_  = min(sd.get("lx1",0), sd.get("lx2",0))
+                lx2_  = max(sd.get("lx1",0), sd.get("lx2",0))
+                ly1_  = min(sd.get("ly1",0), sd.get("ly2",0))
+                ly2_  = max(sd.get("ly1",0), sd.get("ly2",0))
+                ux1_  = min(sd.get("ux1",lx1_), sd.get("ux2",lx2_))
+                ux2_  = max(sd.get("ux1",lx1_), sd.get("ux2",lx2_))
+                uy1_  = min(sd.get("uy1",ly1_), sd.get("uy2",ly2_))
+                uy2_  = max(sd.get("uy1",ly1_), sd.get("uy2",ly2_))
+                if x_t:
+                    if (ux1_+ux2_)/2 >= (lx1_+lx2_)/2:
+                        tt = abs(ux2_ - lx2_)
+                    else:
+                        tt = abs(lx1_ - ux1_)
+                else:
+                    if (uy1_+uy2_)/2 >= (ly1_+ly2_)/2:
+                        tt = abs(uy2_ - ly2_)
+                    else:
+                        tt = abs(ly1_ - uy1_)
+                cur_rise = sd.get("step_rise", s.stair_rise)
+                n_cur    = max(2, round(dz / cur_rise))
+                col2.label(text=f"Steps: {n_cur}  |  Depth: {tt/n_cur:.3f} m",
+                           icon="INFO")
+                col2.separator()
+                col2.prop(s, "stair_rise",  text="New Rise")
+                col2.prop(s, "stair_depth", text="New Depth")
+                row2 = col2.row(align=True)
+                op_r = row2.operator("room.stair_rebuild", text="Apply Rise")
+                op_r.use_depth = False
+                op_d = row2.operator("room.stair_rebuild", text="Apply Depth")
+                op_d.use_depth = True
+                col2.separator()
+                col2.operator("room.stair_move", text="Move / Rotate",
+                              icon="OBJECT_ORIGIN")
+
+
+class ROOM_OT_stair_rebuild(bpy.types.Operator):
+    """Rebuild the selected stair with a new step rise or depth,
+    keeping the total run and height unchanged."""
+    bl_idname = "room.stair_rebuild"
+    bl_label  = "Rebuild Stair Steps"
+    bl_options = {"REGISTER", "UNDO"}
+
+    use_depth: bpy.props.BoolProperty(
+        name="Use Depth as Driver",
+        default=False,
+        description="Derive step count from depth instead of rise",
+    )
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or "room_stair" not in obj:
+            self.report({"WARNING"}, "No stair object selected")
+            return {"CANCELLED"}
+
+        sd = next((d for d in ROOM_OT_draw._stair_list
+                   if d.get("obj_name") == obj.name), None)
+        if sd is None:
+            self.report({"WARNING"}, f"Stair data not found for {obj.name}")
+            return {"CANCELLED"}
+
+        s    = context.scene.room_settings
+        dz   = sd.get("z_top", 0) - sd.get("z_bot", 0)
+        x_t  = sd.get("x_travel", True)
+        lx1_ = min(sd.get("lx1",0), sd.get("lx2",0))
+        lx2_ = max(sd.get("lx1",0), sd.get("lx2",0))
+        ly1_ = min(sd.get("ly1",0), sd.get("ly2",0))
+        ly2_ = max(sd.get("ly1",0), sd.get("ly2",0))
+        ux1_ = min(sd.get("ux1",lx1_), sd.get("ux2",lx2_))
+        ux2_ = max(sd.get("ux1",lx1_), sd.get("ux2",lx2_))
+        uy1_ = min(sd.get("uy1",ly1_), sd.get("uy2",ly2_))
+        uy2_ = max(sd.get("uy1",ly1_), sd.get("uy2",ly2_))
+        if x_t:
+            if (ux1_+ux2_)/2 >= (lx1_+lx2_)/2:
+                total_travel = abs(ux2_ - lx2_)
+            else:
+                total_travel = abs(lx1_ - ux1_)
+        else:
+            if (uy1_+uy2_)/2 >= (ly1_+ly2_)/2:
+                total_travel = abs(uy2_ - ly2_)
+            else:
+                total_travel = abs(ly1_ - uy1_)
+
+        if self.use_depth:
+            new_depth = max(0.05, s.stair_depth)
+            n = max(2, round(total_travel / new_depth))
+        else:
+            new_rise = max(0.05, s.stair_rise)
+            n = max(2, round(dz / new_rise))
+
+        # Store the effective rise (height / n) so the mesh is exact
+        sd["step_rise"] = dz / n
+
+        # Rebuild mesh in-place
+        col = obj.users_collection[0] if obj.users_collection else None
+        old_me = obj.data
+        verts, faces, cats = _build_stair_mesh(sd, s)
+        if not verts:
+            self.report({"WARNING"}, "Rebuild produced no geometry")
+            return {"CANCELLED"}
+
+        me = bpy.data.meshes.new(obj.name + "_rebuilt")
+        bm = bmesh.new()
+        cat_layer = bm.faces.layers.int.new("stair_cat")
+        for v in verts:
+            bm.verts.new(v)
+        bm.verts.ensure_lookup_table()
+        for fi, fidx in enumerate(faces):
+            try:
+                face = bm.faces.new([bm.verts[i] for i in fidx])
+                face[cat_layer] = cats[fi]
+            except Exception:
+                pass
+        bm.to_mesh(me)
+        bm.free()
+        me.update()
+        obj.data = me
+        bpy.data.meshes.remove(old_me)
+        _setup_stair_materials(me, s)
+        _apply_stair_uv(me, s)
+        # Update the stored JSON marker
+        obj["room_stair"] = json.dumps({k: v for k, v in sd.items() if k != "obj_name"})
+
+        step_d = total_travel / n
+        self.report({"INFO"},
+                    f"{obj.name}: {n} steps, rise={sd['step_rise']:.3f} m, depth={step_d:.3f} m")
+        return {"FINISHED"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Stair move / rotate operator
+# ═════════════════════════════════════════════════════════════════════════════
+class ROOM_OT_stair_move(bpy.types.Operator):
+    """Move or rotate the selected stair together with its ceiling/floor holes.
+    Mouse → translate  |  R → rotate 90°  |  LMB → confirm (green)  |  RMB/Esc → cancel"""
+    bl_idname  = "room.stair_move"
+    bl_label   = "Move / Rotate Stair"
+    bl_options = {"REGISTER", "UNDO"}
+
+    # ── constants ─────────────────────────────────────────────────────────────
+    _COL_GREEN_FILL = (0.05, 0.85, 0.2,  0.15)
+    _COL_GREEN_LINE = (0.1,  1.0,  0.3,  1.0)
+    _COL_RED_FILL   = (1.0,  0.08, 0.05, 0.20)
+    _COL_RED_LINE   = (1.0,  0.12, 0.05, 1.0)
+    _COL_ROOM_LINE  = (0.3,  0.8,  1.0,  0.55)   # cyan room bounds hint
+
+    # ── invoke ────────────────────────────────────────────────────────────────
+    def invoke(self, context, event):
+        obj = context.active_object
+        if obj is None or "room_stair" not in obj:
+            # Pass through so double-click doesn't swallow other interactions
+            return {'PASS_THROUGH'}
+
+        sd = next((d for d in ROOM_OT_draw._stair_list
+                   if d.get("obj_name") == obj.name), None)
+        if sd is None:
+            self.report({'WARNING'}, "Stair data not found in runtime list")
+            return {'CANCELLED'}
+
+        s     = context.scene.room_settings
+        rooms = ROOM_OT_draw._room_list
+
+        # Find lower / upper room indices using the existing helper
+        lx1 = min(sd["lx1"], sd["lx2"]); lx2 = max(sd["lx1"], sd["lx2"])
+        ly1 = min(sd["ly1"], sd["ly2"]); ly2 = max(sd["ly1"], sd["ly2"])
+        ux1 = min(sd.get("ux1", lx1), sd.get("ux2", lx2))
+        ux2 = max(sd.get("ux1", lx1), sd.get("ux2", lx2))
+        uy1 = min(sd.get("uy1", ly1), sd.get("uy2", ly2))
+        uy2 = max(sd.get("uy1", ly1), sd.get("uy2", ly2))
+        li = _rect_fits_in_room(lx1, ly1, lx2, ly2, sd["z_bot"], rooms)
+        ui = _rect_fits_in_room(ux1, uy1, ux2, uy2, sd["z_top"], rooms)
+        if li is None or ui is None:
+            # Fall back to z-only match
+            li = next((i for i, r in enumerate(rooms)
+                       if abs(r.get("z", s.z_foundation) - sd["z_bot"]) < 0.05), None)
+            ui = next((i for i, r in enumerate(rooms)
+                       if abs(r.get("z", s.z_foundation) - sd["z_top"]) < 0.05), None)
+        if li is None or ui is None:
+            self.report({'WARNING'}, "Could not find rooms for this stair")
+            return {'CANCELLED'}
+
+        self._sd       = sd
+        self._obj_name = obj.name
+        self._rooms    = rooms
+        self._s        = s
+        self._li       = li
+        self._ui       = ui
+        self._handle   = None
+
+        # Base rect positions (updated each time R is pressed)
+        self._base = dict(lx1=lx1, ly1=ly1, lx2=lx2, ly2=ly2,
+                          ux1=ux1, uy1=uy1, ux2=ux2, uy2=uy2,
+                          x_travel=sd.get("x_travel", True))
+        self._preview = dict(self._base)
+        self._valid   = True   # starts valid (currently placed)
+
+        # LMB drag-rotation state
+        self._lmb_down       = False
+        self._lmb_press_xy   = None   # screen (x, y) where LMB was pressed
+        self._rot_base       = None   # snapshot of _preview at LMB press
+        self._is_drag_rotate = False  # True once drag threshold exceeded
+        self._cur_rot_n      = 0      # last snapped rotation index (0–3)
+
+        # Warp cursor to pivot point so movement starts relative to the stair
+        _px, _py = self._pivot_point(self._base)
+        _vp_region = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
+        _rv3d      = context.area.spaces.active.region_3d
+        if _vp_region and _rv3d:
+            from mathutils import Vector as _V
+            _piv2d = view3d_utils.location_3d_to_region_2d(
+                _vp_region, _rv3d, _V((_px, _py, sd["z_top"])))
+            if _piv2d:
+                context.window.cursor_warp(
+                    int(_piv2d.x) + _vp_region.x,
+                    int(_piv2d.y) + _vp_region.y)
+        # Set mouse_start = pivot 3D so delta is zero on first move
+        self._mouse_start = (_px, _py)
+        self._base_pivot  = (_px, _py)   # pivot of the base state for grid snap
+
+        self._add_draw_handle(context)
+        context.window_manager.modal_handler_add(self)
+        context.window.cursor_set('MOVE_X')
+        return {'RUNNING_MODAL'}
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _update_preview(self, raw_dx, raw_dy):
+        b    = self._base
+        grid = 0.1   # snap resolution in metres
+        # Snap the PIVOT point to nearest grid (more natural visual anchor)
+        px, py = self._pivot_point(b)
+        spx = round((px + raw_dx) / grid) * grid
+        spy = round((py + raw_dy) / grid) * grid
+        dx  = spx - px
+        dy  = spy - py
+        self._preview = dict(
+            lx1=b["lx1"]+dx, ly1=b["ly1"]+dy,
+            lx2=b["lx2"]+dx, ly2=b["ly2"]+dy,
+            ux1=b["ux1"]+dx, uy1=b["uy1"]+dy,
+            ux2=b["ux2"]+dx, uy2=b["uy2"]+dy,
+            x_travel=b["x_travel"])
+        p = self._preview
+        self._valid = (
+            _rect_fits_in_room(p["lx1"],p["ly1"],p["lx2"],p["ly2"],
+                               self._sd["z_bot"], self._rooms) is not None and
+            _rect_fits_in_room(p["ux1"],p["uy1"],p["ux2"],p["uy2"],
+                               self._sd["z_top"], self._rooms) is not None)
+
+    def _pivot_point(self, p):
+        """Return (px, py) — far corner of the upper rect at the travel-axis end.
+        This is the 'top corner vertex' shown at the top of the stair structure."""
+        lmx = (p["lx1"] + p["lx2"]) / 2
+        umx = (p["ux1"] + p["ux2"]) / 2
+        lmy = (p["ly1"] + p["ly2"]) / 2
+        umy = (p["uy1"] + p["uy2"]) / 2
+        if p["x_travel"]:
+            if umx >= lmx:   # upper to the right → far corner = (ux2, uy1)
+                return p["ux2"], p["uy1"]
+            else:            # upper to the left  → far corner = (ux1, uy2)
+                return p["ux1"], p["uy2"]
+        else:
+            if umy >= lmy:   # upper above        → far corner = (ux1, uy2)
+                return p["ux1"], p["uy2"]
+            else:            # upper below        → far corner = (ux2, uy1)
+                return p["ux2"], p["uy1"]
+
+    def _rotate_90(self, cur_xy):
+        """Rotate preview 90° CW around the pivot (far corner of upper rect)."""
+        p  = self._preview
+        cx, cy = self._pivot_point(p)
+
+        def rot(x, y):           # 90° CW
+            return cx + (y - cy), cy - (x - cx)
+
+        ll1 = rot(p["lx1"], p["ly1"]); ll2 = rot(p["lx2"], p["ly2"])
+        ul1 = rot(p["ux1"], p["uy1"]); ul2 = rot(p["ux2"], p["uy2"])
+
+        nb = dict(
+            lx1=min(ll1[0],ll2[0]), ly1=min(ll1[1],ll2[1]),
+            lx2=max(ll1[0],ll2[0]), ly2=max(ll1[1],ll2[1]),
+            ux1=min(ul1[0],ul2[0]), uy1=min(ul1[1],ul2[1]),
+            ux2=max(ul1[0],ul2[0]), uy2=max(ul1[1],ul2[1]),
+            x_travel=not p["x_travel"])
+
+        self._base        = nb
+        self._preview     = dict(nb)
+        self._base_pivot  = self._pivot_point(nb)  # keep snap anchor on new pivot
+        self._mouse_start = cur_xy   # reset delta to zero
+        self._valid = (
+            _rect_fits_in_room(nb["lx1"],nb["ly1"],nb["lx2"],nb["ly2"],
+                               self._sd["z_bot"], self._rooms) is not None and
+            _rect_fits_in_room(nb["ux1"],nb["uy1"],nb["ux2"],nb["uy2"],
+                               self._sd["z_top"], self._rooms) is not None)
+
+    def _apply(self):
+        sd   = self._sd
+        p    = self._preview
+        name = self._obj_name
+        rooms = self._rooms
+        s     = self._s
+        li, ui = self._li, self._ui
+
+        # Update sd in-place
+        sd.update(lx1=p["lx1"], ly1=p["ly1"], lx2=p["lx2"], ly2=p["ly2"],
+                  ux1=p["ux1"], uy1=p["uy1"], ux2=p["ux2"], uy2=p["uy2"],
+                  x_travel=p["x_travel"])
+
+        # Remove old holes for this stair from every room
+        for r in rooms:
+            r["stair_holes"] = [h for h in r.get("stair_holes", [])
+                                if h.get("stair_obj") != name]
+
+        # Recompute hole bounds (same logic as _finalise)
+        lx1 = min(sd["lx1"],sd["lx2"]); lx2 = max(sd["lx1"],sd["lx2"])
+        ly1 = min(sd["ly1"],sd["ly2"]); ly2 = max(sd["ly1"],sd["ly2"])
+        ux1 = min(sd["ux1"],sd["ux2"]); ux2 = max(sd["ux1"],sd["ux2"])
+        uy1 = min(sd["uy1"],sd["uy2"]); uy2 = max(sd["uy1"],sd["uy2"])
+        x_t = sd["x_travel"]
+        if x_t:
+            if (ux1+ux2)/2 >= (lx1+lx2)/2:
+                hx1, hx2 = lx2, ux2
+            else:
+                hx1, hx2 = ux1, lx1
+            hy1, hy2 = min(ly1,uy1), max(ly2,uy2)
+        else:
+            if (uy1+uy2)/2 >= (ly1+ly2)/2:
+                hy1, hy2 = ly2, uy2
+            else:
+                hy1, hy2 = uy1, ly1
+            hx1, hx2 = min(lx1,ux1), max(lx2,ux2)
+
+        z_upper  = rooms[ui].get("z", s.z_foundation)
+        zt_lower = rooms[li].get("z", s.z_foundation) + s.wall_height
+        lower_hole = {"x1":hx1,"y1":hy1,"x2":hx2,"y2":hy2,
+                      "cut":"ceiling","stair_obj":name,"slab_z":z_upper}
+        upper_hole = {"x1":hx1,"y1":hy1,"x2":hx2,"y2":hy2,
+                      "cut":"floor","stair_obj":name,"slab_z":zt_lower}
+
+        rooms[li].setdefault("stair_holes", []).append(lower_hole)
+        _rebuild_room_mesh(rooms[li], s)
+        if ui != li:
+            rooms[ui].setdefault("stair_holes", []).append(upper_hole)
+            _rebuild_room_mesh(rooms[ui], s)
+
+        # Rebuild stair mesh in-place
+        obj = bpy.data.objects.get(name)
+        if obj:
+            old_me = obj.data
+            verts, faces, cats = _build_stair_mesh(sd, s)
+            if verts:
+                me  = bpy.data.meshes.new(name)
+                bm2 = bmesh.new()
+                cl  = bm2.faces.layers.int.new("stair_cat")
+                for v in verts: bm2.verts.new(v)
+                bm2.verts.ensure_lookup_table()
+                for fi, fidx in enumerate(faces):
+                    try:
+                        face = bm2.faces.new([bm2.verts[i] for i in fidx])
+                        face[cl] = cats[fi]
+                    except Exception: pass
+                bm2.to_mesh(me); bm2.free(); me.update()
+                obj.data = me
+                bpy.data.meshes.remove(old_me)
+                _setup_stair_materials(me, s)
+                _apply_stair_uv(me, s)   # UV while verts still in world space
+                # Re-apply pivot origin
+                px, py = _stair_pivot_xy(sd)
+                pz = sd.get("z_top", 0.0)
+                pivot = Vector((px, py, pz))
+                for v in me.vertices:
+                    v.co -= pivot
+                obj.location = pivot
+                me.update()
+                obj["room_stair"] = json.dumps(
+                    {k: v for k, v in sd.items() if k != "obj_name"})
+
+    # ── GPU draw callback ─────────────────────────────────────────────────────
+    def _draw_cb(self, context):
+        p = getattr(self, "_preview", None)
+        if p is None:
+            return
+
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('ALWAYS')
+        shader.bind()
+
+        valid = getattr(self, "_valid", False)
+        cf = self._COL_GREEN_FILL if valid else self._COL_RED_FILL
+        cl = self._COL_GREEN_LINE if valid else self._COL_RED_LINE
+
+        def draw_rect(x1, y1, x2, y2, z, fc, lc):
+            tris = [(x1,y1,z),(x2,y1,z),(x2,y2,z),
+                    (x1,y1,z),(x2,y2,z),(x1,y2,z)]
+            bf = batch_for_shader(shader, 'TRIS', {"pos": tris})
+            shader.uniform_float("color", fc)
+            bf.draw(shader)
+            corners = [(x1,y1,z),(x2,y1,z),(x2,y2,z),(x1,y2,z)]
+            lines   = [corners[i] for pair in ((0,1),(1,2),(2,3),(3,0)) for i in pair]
+            bl = batch_for_shader(shader, 'LINES', {"pos": lines})
+            shader.uniform_float("color", lc)
+            gpu.state.line_width_set(2.5)
+            bl.draw(shader)
+
+        z_lo = self._sd["z_bot"]
+        z_hi = self._sd["z_top"]
+
+        # Lower footprint rect (at lower floor level)
+        draw_rect(p["lx1"],p["ly1"],p["lx2"],p["ly2"], z_lo, cf, cl)
+        # Upper footprint rect (at upper floor level)
+        draw_rect(p["ux1"],p["uy1"],p["ux2"],p["uy2"], z_hi, cf, cl)
+
+        # Room interior bounds — cyan outline to show placement constraints
+        rooms = self._rooms
+        s = context.scene.room_settings
+        for ri, z in ((self._li, z_lo), (self._ui, z_hi)):
+            if 0 <= ri < len(rooms):
+                r  = rooms[ri]
+                t_ = r.get("t", s.wall_thickness)
+                draw_rect(r["x1"]+t_, r["y1"]+t_,
+                          r["x2"]-t_, r["y2"]-t_,
+                          z, (0,0,0,0), self._COL_ROOM_LINE)
+
+        # ── Gizmo at pivot point ──────────────────────────────────────────
+        px, py = self._pivot_point(p)
+        gz  = self._sd["z_top"]   # draw gizmo at upper floor level
+        AL  = 0.40                # arrow shaft length
+        AH  = 0.07                # arrowhead size
+        CR  = 0.18                # rotation arc radius
+        N   = 20                  # arc segments
+
+        # White cross — exact pivot marker
+        gpu.state.line_width_set(2.0)
+        cs = 0.05
+        cross_pts = [(px-cs,py,gz),(px+cs,py,gz),
+                     (px,py-cs,gz),(px,py+cs,gz)]
+        bc = batch_for_shader(shader,'LINES',{"pos":cross_pts})
+        shader.uniform_float("color",(1,1,1,1)); bc.draw(shader)
+
+        # Red +X arrow
+        gpu.state.line_width_set(3.0)
+        x_ln = [(px,py,gz),(px+AL,py,gz)]
+        bx = batch_for_shader(shader,'LINES',{"pos":x_ln})
+        shader.uniform_float("color",(1,0.15,0.15,1)); bx.draw(shader)
+        x_hd = [(px+AL,py,gz),(px+AL-AH,py+AH*0.5,gz),
+                (px+AL,py,gz),(px+AL-AH,py-AH*0.5,gz)]
+        bxh = batch_for_shader(shader,'LINES',{"pos":x_hd})
+        shader.uniform_float("color",(1,0.15,0.15,1)); bxh.draw(shader)
+
+        # Green +Y arrow
+        y_ln = [(px,py,gz),(px,py+AL,gz)]
+        by_ = batch_for_shader(shader,'LINES',{"pos":y_ln})
+        shader.uniform_float("color",(0.15,1,0.15,1)); by_.draw(shader)
+        y_hd = [(px,py+AL,gz),(px+AH*0.5,py+AL-AH,gz),
+                (px,py+AL,gz),(px-AH*0.5,py+AL-AH,gz)]
+        byh = batch_for_shader(shader,'LINES',{"pos":y_hd})
+        shader.uniform_float("color",(0.15,1,0.15,1)); byh.draw(shader)
+
+        # Blue rotation arc (270° = 3/4 circle, suggests R key rotates)
+        arc_pts = [
+            (px + CR*math.cos(math.pi*0.5 + math.pi*2*(i/N)*0.75),
+             py + CR*math.sin(math.pi*0.5 + math.pi*2*(i/N)*0.75), gz)
+            for i in range(N+1)]
+        arc_segs = [pt for i in range(len(arc_pts)-1)
+                    for pt in (arc_pts[i], arc_pts[i+1])]
+        barc = batch_for_shader(shader,'LINES',{"pos":arc_segs})
+        shader.uniform_float("color",(0.3,0.6,1.0,1)); barc.draw(shader)
+
+        gpu.state.blend_set('NONE')
+        gpu.state.depth_test_set('NONE')
+
+    def _add_draw_handle(self, context):
+        self._handle = bpy.types.SpaceView3D.draw_handler_add(
+            self._draw_cb, (context,), 'WINDOW', 'POST_VIEW')
+        _DRAW_HANDLES.add(self._handle)
+
+    def _remove_draw_handle(self):
+        if self._handle:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(self._handle, 'WINDOW')
+            except Exception: pass
+            _DRAW_HANDLES.discard(self._handle)
+            self._handle = None
+
+    # ── modal ─────────────────────────────────────────────────────────────────
+    def modal(self, context, event):
+        if context.area:
+            context.area.tag_redraw()
+
+        if event.type == 'MOUSEMOVE':
+            if self._lmb_down:
+                # ── LMB held: drag-to-rotate ──────────────────────────────
+                dxs  = event.mouse_x - self._lmb_press_xy[0]
+                dys  = event.mouse_y - self._lmb_press_xy[1]
+                dist = math.sqrt(dxs * dxs + dys * dys)
+                if dist > 15:            # threshold to enter rotation mode
+                    self._is_drag_rotate = True
+                if self._is_drag_rotate:
+                    # Map drag angle → nearest 90° increment (0/1/2/3)
+                    angle = math.atan2(dys, dxs)
+                    deg   = math.degrees(angle) % 360
+                    n     = int((deg + 45) / 90) % 4
+                    if n != self._cur_rot_n:
+                        # Restore pre-drag snapshot then apply n × 90° CW
+                        self._base    = dict(self._rot_base)
+                        self._preview = dict(self._rot_base)
+                        for _ in range(n):
+                            self._rotate_90(self._mouse_start)
+                        self._cur_rot_n = n
+            else:
+                # ── Normal translate mode ─────────────────────────────────
+                pt = _ray_to_z(context, event, self._sd["z_bot"])
+                if pt and self._mouse_start:
+                    self._update_preview(pt.x - self._mouse_start[0],
+                                         pt.y - self._mouse_start[1])
+
+        elif event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            # Start drag-rotation tracking (confirm happens on RELEASE)
+            self._lmb_down       = True
+            self._lmb_press_xy   = (event.mouse_x, event.mouse_y)
+            self._rot_base       = dict(self._preview)   # snapshot
+            self._is_drag_rotate = False
+            self._cur_rot_n      = 0
+            context.window.cursor_set('SCROLL_XY')
+
+        elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            if self._is_drag_rotate:
+                # Rotation drag ended — lock rotated state, stay in move mode
+                self._base       = dict(self._preview)
+                self._base_pivot = self._pivot_point(self._preview)  # new pivot
+                pt = _ray_to_z(context, event, self._sd["z_bot"])
+                if pt:
+                    self._mouse_start = (pt.x, pt.y)   # reset delta to zero
+                self._is_drag_rotate = False
+                self._lmb_down = False
+                context.window.cursor_set('MOVE_X')
+            elif self._lmb_down:
+                # Short click (no drag) → confirm placement if valid
+                self._lmb_down = False
+                if self._valid:
+                    self._apply()
+                    self._remove_draw_handle()
+                    context.window.cursor_set('DEFAULT')
+                    return {'FINISHED'}
+                # Invalid position — stay running, show red feedback
+                context.window.cursor_set('MOVE_X')
+
+        elif event.type == 'R' and event.value == 'PRESS':
+            # R key still works as a single-step 90° rotation fallback
+            pt = _ray_to_z(context, event, self._sd["z_bot"])
+            cur_xy = (pt.x, pt.y) if pt else self._mouse_start
+            self._rotate_90(cur_xy)
+
+        elif event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+            self._remove_draw_handle()
+            context.window.cursor_set('DEFAULT')
+            return {'CANCELLED'}
+
+        return {'RUNNING_MODAL'}
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Register / Unregister
@@ -5127,6 +5792,8 @@ _classes = (
     ROOM_OT_door_edit,
     ROOM_OT_window_edit,
     ROOM_OT_stair_edit,
+    ROOM_OT_stair_rebuild,
+    ROOM_OT_stair_move,
     ROOM_OT_add_floor,
     ROOM_OT_select_floor,
     ROOM_OT_remove_floor,
@@ -5178,6 +5845,9 @@ def register():
         ROOM_OT_draw._addon_kmaps.append((km, kmi3))
         kmi4 = km.keymap_items.new("room.stair_edit", "S", "PRESS", shift=True, ctrl=True)
         ROOM_OT_draw._addon_kmaps.append((km, kmi4))
+        # Double-click on a stair object → open Move / Rotate immediately
+        kmi5 = km.keymap_items.new("room.stair_move", "LEFTMOUSE", "DOUBLE_CLICK")
+        ROOM_OT_draw._addon_kmaps.append((km, kmi5))
 
     if _room_registry_cleanup not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_room_registry_cleanup)
