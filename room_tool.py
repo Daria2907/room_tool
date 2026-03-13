@@ -4519,6 +4519,14 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
     def modal(self, context, event):
         context.area.tag_redraw()
 
+        # Let viewport navigation (pan/orbit/zoom/numpad) pass through
+        if event.type in {'MIDDLEMOUSE',
+                'NUMPAD_0','NUMPAD_1','NUMPAD_2','NUMPAD_3',
+                'NUMPAD_4','NUMPAD_5','NUMPAD_6','NUMPAD_7',
+                'NUMPAD_8','NUMPAD_9','NUMPAD_DECIMAL','NUMPAD_PERIOD',
+                'F','TILDE'}:
+            return {'PASS_THROUGH'}
+
         if event.type in ('ESC', 'RIGHTMOUSE') and event.value == 'PRESS':
             self._remove_draw_handle()
             context.scene.room_stair_edit_active = False
@@ -5829,6 +5837,14 @@ class ROOM_OT_stair_move(bpy.types.Operator):
     def modal(self, context, event):
         if context.area:
             context.area.tag_redraw()
+
+        # Let viewport navigation (pan/orbit/zoom/numpad) pass through
+        if event.type in {'MIDDLEMOUSE',
+                'NUMPAD_0','NUMPAD_1','NUMPAD_2','NUMPAD_3',
+                'NUMPAD_4','NUMPAD_5','NUMPAD_6','NUMPAD_7',
+                'NUMPAD_8','NUMPAD_9','NUMPAD_DECIMAL','NUMPAD_PERIOD',
+                'F','TILDE'}:
+            return {'PASS_THROUGH'}
 
         if event.type == 'MOUSEMOVE':
             if self._lmb_down:
