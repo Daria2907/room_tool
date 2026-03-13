@@ -4501,6 +4501,15 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         self._handle      = None
 
         context.scene.room_stair_edit_active = True
+
+        # Auto X-ray: stairs span two floors so X-ray makes placement easier.
+        # Save previous state and enable; restored on finish/cancel.
+        spc = context.space_data
+        self._xray_was_on = getattr(getattr(spc, 'shading', None), 'show_xray', False)
+        if hasattr(spc, 'shading'):
+            spc.shading.show_xray = True
+
+        self.report({'INFO'}, "X-Ray enabled for stair placement — disabled on confirm/cancel")
         self._add_draw_handle(context)
         context.window_manager.modal_handler_add(self)
         context.area.tag_redraw()
@@ -4512,6 +4521,7 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         if event.type in ('ESC', 'RIGHTMOUSE') and event.value == 'PRESS':
             self._remove_draw_handle()
             context.scene.room_stair_edit_active = False
+            self._restore_xray(context)
             return {'CANCELLED'}
 
         z_plane = self._z_upper if self._phase == 'UPPER_SLIDE' else self._z_lower
@@ -4639,14 +4649,21 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                     if self._finalise(context):
                         self._remove_draw_handle()
                         context.scene.room_stair_edit_active = False
+                        self._restore_xray(context)
                         return {'FINISHED'}
                     # Invalid — keep running so user can adjust
 
         return {'RUNNING_MODAL'}
 
+    def _restore_xray(self, context):
+        spc = context.space_data
+        if hasattr(spc, 'shading'):
+            spc.shading.show_xray = getattr(self, '_xray_was_on', False)
+
     def cancel(self, context):
         self._remove_draw_handle()
         context.scene.room_stair_edit_active = False
+        self._restore_xray(context)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -5458,6 +5475,9 @@ class ROOM_OT_stair_move(bpy.types.Operator):
         self._is_drag_rotate = False  # True once drag threshold exceeded
         self._cur_rot_n      = 0      # last snapped rotation index (0–3)
 
+        # Axis lock: None = free XY,  'X' = X only,  'Y' = Y only
+        self._axis_lock = None
+
         # Warp cursor to pivot point so movement starts relative to the stair
         _px, _py = self._pivot_point(self._base)
         _vp_region = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
@@ -5484,6 +5504,12 @@ class ROOM_OT_stair_move(bpy.types.Operator):
         b    = self._base
         GRID      = 0.1    # base snap resolution in metres
         WALL_SNAP = 0.30   # within this distance of a wall face, snap to it
+
+        # Axis lock: zero out the locked-out axis
+        if self._axis_lock == 'X':
+            raw_dy = 0.0
+        elif self._axis_lock == 'Y':
+            raw_dx = 0.0
 
         # ── Step 1: pivot-based grid snap ────────────────────────────────────
         px0, py0 = self._base_pivot
@@ -5828,6 +5854,7 @@ class ROOM_OT_stair_move(bpy.types.Operator):
                     self._mouse_start = (pt.x, pt.y)   # reset delta to zero
                 self._is_drag_rotate = False
                 self._lmb_down = False
+                self._axis_lock = None
                 context.window.cursor_set('MOVE_X')
             elif self._lmb_down:
                 # Short click (no drag) → confirm placement if valid
@@ -5841,10 +5868,20 @@ class ROOM_OT_stair_move(bpy.types.Operator):
                 context.window.cursor_set('MOVE_X')
 
         elif event.type == 'R' and event.value == 'PRESS':
-            # R key still works as a single-step 90° rotation fallback
+            # R key: single-step 90° rotation
             pt = _ray_to_z(context, event, self._sd["z_bot"])
             cur_xy = (pt.x, pt.y) if pt else self._mouse_start
             self._rotate_90(cur_xy)
+
+        elif event.type == 'X' and event.value == 'PRESS':
+            # Toggle X-axis lock (press again to free)
+            self._axis_lock = None if self._axis_lock == 'X' else 'X'
+            context.window.cursor_set('MOVE_X' if self._axis_lock == 'X' else 'MOVE_X')
+
+        elif event.type == 'Y' and event.value == 'PRESS':
+            # Toggle Y-axis lock (press again to free)
+            self._axis_lock = None if self._axis_lock == 'Y' else 'Y'
+            context.window.cursor_set('MOVE_Y' if self._axis_lock == 'Y' else 'MOVE_X')
 
         elif event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
             self._remove_draw_handle()
