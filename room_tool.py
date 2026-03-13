@@ -1105,6 +1105,20 @@ def _stair_pivot_xy(sd):
         return (ux1, uy2) if umy >= lmy else (ux2, uy1)
 
 
+def _snap_stair_pt(x, y, room, grid=0.1, wall_snap=0.25):
+    """Snap (x, y) to the nearest grid point, then to an inner wall face if close enough."""
+    t   = room.get("t", 0.125)
+    x   = round(x / grid) * grid
+    y   = round(y / grid) * grid
+    wx1 = room["x1"] + t;  wx2 = room["x2"] - t
+    wy1 = room["y1"] + t;  wy2 = room["y2"] - t
+    if   abs(x - wx1) < wall_snap: x = wx1
+    elif abs(x - wx2) < wall_snap: x = wx2
+    if   abs(y - wy1) < wall_snap: y = wy1
+    elif abs(y - wy2) < wall_snap: y = wy2
+    return x, y
+
+
 def _make_stair_obj(name, sd, s, collection=None):
     """Create a Blender object for a staircase from a stair dict."""
     verts, faces, cats = _build_stair_mesh(sd, s)
@@ -4538,6 +4552,13 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         if event.type == 'MOUSEMOVE':
             pt = _ray_to_z(context, event, z_plane)
             if pt is not None:
+                # Snap cursor to grid + walls during lower rect drag
+                if self._phase == 'LOWER_DRAG':
+                    ri = _rect_fits_in_room(pt.x, pt.y, pt.x, pt.y,
+                                            self._z_lower, ROOM_OT_draw._room_list)
+                    if ri is not None:
+                        pt.x, pt.y = _snap_stair_pt(
+                            pt.x, pt.y, ROOM_OT_draw._room_list[ri])
                 self._cursor = pt
                 # During UPPER_SLIDE: dominant-axis detection —
                 # whichever axis the cursor has moved further from the lower
@@ -4549,10 +4570,33 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                     ly2 = max(self._lower_c1.y, self._lower_c2.y)
                     dx = pt.x - (lx1 + lx2) * 0.5
                     dy = pt.y - (ly1 + ly2) * 0.5
+                    rooms = ROOM_OT_draw._room_list
                     if abs(dx) >= abs(dy):   # X dominant → slide X, lock Y
-                        self._upper_rect = (lx1 + dx, ly1, lx2 + dx, ly2)
+                        ux1t = lx1 + dx;  ux2t = lx2 + dx
+                        ri = _rect_fits_in_room(ux1t, ly1, ux2t, ly2,
+                                                self._z_upper, rooms)
+                        if ri is not None:
+                            r = rooms[ri]; tw = r.get("t", 0.125)
+                            wx1 = r["x1"] + tw;  wx2 = r["x2"] - tw
+                            for edge, wall in ((ux1t, wx1), (ux2t, wx2)):
+                                if abs(edge - wall) < 0.25:
+                                    ux1t += wall - edge
+                                    ux2t += wall - edge
+                                    break
+                        self._upper_rect = (ux1t, ly1, ux2t, ly2)
                     else:                    # Y dominant → slide Y, lock X
-                        self._upper_rect = (lx1, ly1 + dy, lx2, ly2 + dy)
+                        uy1t = ly1 + dy;  uy2t = ly2 + dy
+                        ri = _rect_fits_in_room(lx1, uy1t, lx2, uy2t,
+                                                self._z_upper, rooms)
+                        if ri is not None:
+                            r = rooms[ri]; tw = r.get("t", 0.125)
+                            wy1 = r["y1"] + tw;  wy2 = r["y2"] - tw
+                            for edge, wall in ((uy1t, wy1), (uy2t, wy2)):
+                                if abs(edge - wall) < 0.25:
+                                    uy1t += wall - edge
+                                    uy2t += wall - edge
+                                    break
+                        self._upper_rect = (lx1, uy1t, lx2, uy2t)
 
         if event.type == 'LEFTMOUSE':
             pt = _ray_to_z(context, event, z_plane)
@@ -4561,11 +4605,22 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
             if event.value == 'PRESS':
                 if self._phase == 'LOWER_FIRST':
+                    ri = _rect_fits_in_room(pt.x, pt.y, pt.x, pt.y,
+                                            self._z_lower, ROOM_OT_draw._room_list)
+                    if ri is not None:
+                        pt.x, pt.y = _snap_stair_pt(
+                            pt.x, pt.y, ROOM_OT_draw._room_list[ri])
                     self._lower_c1 = pt.copy()
                     self._phase    = 'LOWER_DRAG'
 
             elif event.value == 'RELEASE':
                 if self._phase == 'LOWER_DRAG':
+                    # Apply snap to the release point before size check
+                    ri = _rect_fits_in_room(pt.x, pt.y, pt.x, pt.y,
+                                            self._z_lower, ROOM_OT_draw._room_list)
+                    if ri is not None:
+                        pt.x, pt.y = _snap_stair_pt(
+                            pt.x, pt.y, ROOM_OT_draw._room_list[ri])
                     if abs(pt.x - self._lower_c1.x) < 0.05 and abs(pt.y - self._lower_c1.y) < 0.05:
                         self.report({'WARNING'}, "Too small — drag further to define footprint")
                         self._phase = 'LOWER_FIRST'
@@ -4587,17 +4642,34 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                                 "opening (green = valid, red = outside room), LMB to confirm")
 
                 elif self._phase == 'UPPER_SLIDE':
-                    # Re-compute upper_rect from click, dominant-axis detection
+                    # Re-compute upper_rect from click with wall snap on leading edge
                     lx1 = min(self._lower_c1.x, self._lower_c2.x)
                     ly1 = min(self._lower_c1.y, self._lower_c2.y)
                     lx2 = max(self._lower_c1.x, self._lower_c2.x)
                     ly2 = max(self._lower_c1.y, self._lower_c2.y)
                     dx = pt.x - (lx1 + lx2) * 0.5
                     dy = pt.y - (ly1 + ly2) * 0.5
+                    rooms = ROOM_OT_draw._room_list
                     if abs(dx) >= abs(dy):  # X dominant → slide X, lock Y
-                        self._upper_rect = (lx1 + dx, ly1, lx2 + dx, ly2)
+                        ux1t = lx1 + dx;  ux2t = lx2 + dx
+                        ri = _rect_fits_in_room(ux1t, ly1, ux2t, ly2, self._z_upper, rooms)
+                        if ri is not None:
+                            r = rooms[ri]; tw = r.get("t", 0.125)
+                            wx1 = r["x1"] + tw;  wx2 = r["x2"] - tw
+                            for edge, wall in ((ux1t, wx1), (ux2t, wx2)):
+                                if abs(edge - wall) < 0.25:
+                                    ux1t += wall - edge;  ux2t += wall - edge;  break
+                        self._upper_rect = (ux1t, ly1, ux2t, ly2)
                     else:                   # Y dominant → slide Y, lock X
-                        self._upper_rect = (lx1, ly1 + dy, lx2, ly2 + dy)
+                        uy1t = ly1 + dy;  uy2t = ly2 + dy
+                        ri = _rect_fits_in_room(lx1, uy1t, lx2, uy2t, self._z_upper, rooms)
+                        if ri is not None:
+                            r = rooms[ri]; tw = r.get("t", 0.125)
+                            wy1 = r["y1"] + tw;  wy2 = r["y2"] - tw
+                            for edge, wall in ((uy1t, wy1), (uy2t, wy2)):
+                                if abs(edge - wall) < 0.25:
+                                    uy1t += wall - edge;  uy2t += wall - edge;  break
+                        self._upper_rect = (lx1, uy1t, lx2, uy2t)
                     if self._finalise(context):
                         self._remove_draw_handle()
                         context.scene.room_stair_edit_active = False
@@ -5454,13 +5526,52 @@ class ROOM_OT_stair_move(bpy.types.Operator):
     # ── helpers ───────────────────────────────────────────────────────────────
     def _update_preview(self, raw_dx, raw_dy):
         b    = self._base
-        grid = 0.1   # snap resolution in metres
-        # Snap the PIVOT point to nearest grid (more natural visual anchor)
-        px, py = self._pivot_point(b)
-        spx = round((px + raw_dx) / grid) * grid
-        spy = round((py + raw_dy) / grid) * grid
-        dx  = spx - px
-        dy  = spy - py
+        GRID      = 0.1    # base snap resolution in metres
+        WALL_SNAP = 0.30   # within this distance of a wall face, snap to it
+
+        # ── Step 1: pivot-based grid snap ────────────────────────────────────
+        px0, py0 = self._base_pivot
+        dx = round((px0 + raw_dx) / GRID) * GRID - px0
+        dy = round((py0 + raw_dy) / GRID) * GRID - py0
+
+        # ── Step 2: wall-snap override ────────────────────────────────────────
+        # For each room (lower and upper), check all four inner wall faces.
+        # If a stair edge moves within WALL_SNAP of a wall, snap to that wall
+        # instead of the grid — overrides only if closer to wall than to grid.
+        best_x_dist = WALL_SNAP
+        best_y_dist = WALL_SNAP
+        snap_dx = None
+        snap_dy = None
+
+        for room_idx, ex1, ex2, ey1, ey2 in (
+            (self._li, b["lx1"], b["lx2"], b["ly1"], b["ly2"]),
+            (self._ui, b["ux1"], b["ux2"], b["uy1"], b["uy2"]),
+        ):
+            if not (0 <= room_idx < len(self._rooms)):
+                continue
+            r  = self._rooms[room_idx]
+            t  = r.get("t", 0.125)
+            wx1, wx2 = r["x1"] + t, r["x2"] - t   # inner wall faces in X
+            wy1, wy2 = r["y1"] + t, r["y2"] - t   # inner wall faces in Y
+
+            for edge, wall in ((ex1, wx1), (ex2, wx2)):
+                dist = abs((edge + raw_dx) - wall)
+                if dist < best_x_dist:
+                    best_x_dist = dist
+                    snap_dx = wall - edge   # delta to touch this wall exactly
+
+            for edge, wall in ((ey1, wy1), (ey2, wy2)):
+                dist = abs((edge + raw_dy) - wall)
+                if dist < best_y_dist:
+                    best_y_dist = dist
+                    snap_dy = wall - edge
+
+        if snap_dx is not None:
+            dx = snap_dx
+        if snap_dy is not None:
+            dy = snap_dy
+
+        # ── Apply translation ─────────────────────────────────────────────────
         self._preview = dict(
             lx1=b["lx1"]+dx, ly1=b["ly1"]+dy,
             lx2=b["lx2"]+dx, ly2=b["ly2"]+dy,
