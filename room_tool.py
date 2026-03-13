@@ -4520,7 +4520,7 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         context.area.tag_redraw()
 
         # Let viewport navigation (pan/orbit/zoom/numpad) pass through
-        if event.type in {'MIDDLEMOUSE',
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
                 'NUMPAD_0','NUMPAD_1','NUMPAD_2','NUMPAD_3',
                 'NUMPAD_4','NUMPAD_5','NUMPAD_6','NUMPAD_7',
                 'NUMPAD_8','NUMPAD_9','NUMPAD_DECIMAL','NUMPAD_PERIOD',
@@ -5510,15 +5510,39 @@ class ROOM_OT_stair_move(bpy.types.Operator):
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _update_preview(self, raw_dx, raw_dy):
-        b    = self._base
+        b         = self._base
         GRID      = 0.1    # base snap resolution in metres
-        WALL_SNAP = 0.30   # within this distance of a wall face, snap to it
+        WALL_SNAP = 0.35   # pull toward a wall face when this close
+        EPS       = 1e-4   # float tolerance
 
-        # Axis lock: zero out the locked-out axis
+        # Axis lock
         if self._axis_lock == 'X':
             raw_dy = 0.0
         elif self._axis_lock == 'Y':
             raw_dx = 0.0
+
+        # ── Gather inner bounds for both rooms ────────────────────────────────
+        rooms = self._rooms
+        INF = 1e9
+        if 0 <= self._li < len(rooms):
+            rl = rooms[self._li]; tl = rl.get("t", 0.125)
+            l_x1, l_x2 = rl["x1"] + tl, rl["x2"] - tl
+            l_y1, l_y2 = rl["y1"] + tl, rl["y2"] - tl
+        else:
+            l_x1, l_x2, l_y1, l_y2 = -INF, INF, -INF, INF
+
+        if 0 <= self._ui < len(rooms):
+            ru = rooms[self._ui]; tu = ru.get("t", 0.125)
+            u_x1, u_x2 = ru["x1"] + tu, ru["x2"] - tu
+            u_y1, u_y2 = ru["y1"] + tu, ru["y2"] - tu
+        else:
+            u_x1, u_x2, u_y1, u_y2 = -INF, INF, -INF, INF
+
+        # Valid translation range that keeps BOTH rects inside their rooms
+        dx_min = max(l_x1 - b["lx1"], u_x1 - b["ux1"]) - EPS
+        dx_max = min(l_x2 - b["lx2"], u_x2 - b["ux2"]) + EPS
+        dy_min = max(l_y1 - b["ly1"], u_y1 - b["uy1"]) - EPS
+        dy_max = min(l_y2 - b["ly2"], u_y2 - b["uy2"]) + EPS
 
         # ── Step 1: pivot-based grid snap ────────────────────────────────────
         px0, py0 = self._base_pivot
@@ -5526,62 +5550,43 @@ class ROOM_OT_stair_move(bpy.types.Operator):
         dy = round((py0 + raw_dy) / GRID) * GRID - py0
 
         # ── Step 2: wall-snap override ────────────────────────────────────────
-        # For each room (lower and upper), check all four inner wall faces.
-        # If a stair edge moves within WALL_SNAP of a wall, snap to that wall
-        # instead of the grid — overrides only if closer to wall than to grid.
-        best_x_dist = WALL_SNAP
-        best_y_dist = WALL_SNAP
+        # Check every edge of both rects against every wall of both rooms.
+        # If the raw-mouse position would place an edge within WALL_SNAP of a
+        # wall, override the grid snap for that axis.
+        best_x = WALL_SNAP
+        best_y = WALL_SNAP
         snap_dx = None
         snap_dy = None
 
-        for room_idx, ex1, ex2, ey1, ey2 in (
-            (self._li, b["lx1"], b["lx2"], b["ly1"], b["ly2"]),
-            (self._ui, b["ux1"], b["ux2"], b["uy1"], b["uy2"]),
+        for edge_x, edge_y in (
+            (b["lx1"], b["ly1"]), (b["lx2"], b["ly1"]),
+            (b["lx1"], b["ly2"]), (b["lx2"], b["ly2"]),
+            (b["ux1"], b["uy1"]), (b["ux2"], b["uy1"]),
+            (b["ux1"], b["uy2"]), (b["ux2"], b["uy2"]),
         ):
-            if not (0 <= room_idx < len(self._rooms)):
-                continue
-            r  = self._rooms[room_idx]
-            t  = r.get("t", 0.125)
-            wx1, wx2 = r["x1"] + t, r["x2"] - t   # inner wall faces in X
-            wy1, wy2 = r["y1"] + t, r["y2"] - t   # inner wall faces in Y
+            for wall_x in (l_x1, l_x2, u_x1, u_x2):
+                d = abs((edge_x + raw_dx) - wall_x)
+                if d < best_x:
+                    best_x = d
+                    snap_dx = wall_x - edge_x
 
-            for edge, wall in ((ex1, wx1), (ex2, wx2)):
-                dist = abs((edge + raw_dx) - wall)
-                if dist < best_x_dist:
-                    best_x_dist = dist
-                    snap_dx = wall - edge   # delta to touch this wall exactly
+            for wall_y in (l_y1, l_y2, u_y1, u_y2):
+                d = abs((edge_y + raw_dy) - wall_y)
+                if d < best_y:
+                    best_y = d
+                    snap_dy = wall_y - edge_y
 
-            for edge, wall in ((ey1, wy1), (ey2, wy2)):
-                dist = abs((edge + raw_dy) - wall)
-                if dist < best_y_dist:
-                    best_y_dist = dist
-                    snap_dy = wall - edge
-
-        # ── Validate wall snap doesn't push the other rect outside its room ──
-        # e.g. snapping lower rect to lower room's left wall shifts upper rect
-        # left by the same amount — verify upper still fits before accepting.
         if snap_dx is not None:
-            test_dy = snap_dy if snap_dy is not None else dy
-            lo_ok = _rect_fits_in_room(b["lx1"]+snap_dx, b["ly1"]+test_dy,
-                                       b["lx2"]+snap_dx, b["ly2"]+test_dy,
-                                       self._sd["z_bot"], self._rooms) is not None
-            hi_ok = _rect_fits_in_room(b["ux1"]+snap_dx, b["uy1"]+test_dy,
-                                       b["ux2"]+snap_dx, b["uy2"]+test_dy,
-                                       self._sd["z_top"], self._rooms) is not None
-            if lo_ok and hi_ok:
-                dx = snap_dx
-            # else: keep grid-snapped dx (wall snap would break the other rect)
-
+            dx = snap_dx
         if snap_dy is not None:
-            test_dx = dx   # use whatever dx was settled above
-            lo_ok = _rect_fits_in_room(b["lx1"]+test_dx, b["ly1"]+snap_dy,
-                                       b["lx2"]+test_dx, b["ly2"]+snap_dy,
-                                       self._sd["z_bot"], self._rooms) is not None
-            hi_ok = _rect_fits_in_room(b["ux1"]+test_dx, b["uy1"]+snap_dy,
-                                       b["ux2"]+test_dx, b["uy2"]+snap_dy,
-                                       self._sd["z_top"], self._rooms) is not None
-            if lo_ok and hi_ok:
-                dy = snap_dy
+            dy = snap_dy
+
+        # ── Step 3: clamp to valid range so neither rect leaves its room ──────
+        # This replaces the old validate-then-reject logic: instead of refusing
+        # a wall snap that would push the other rect out, we clamp as far as
+        # both rooms permit — so the stair always reaches the limiting wall.
+        dx = max(dx_min, min(dx_max, dx))
+        dy = max(dy_min, min(dy_max, dy))
 
         # ── Apply translation ─────────────────────────────────────────────────
         self._preview = dict(
@@ -5839,7 +5844,7 @@ class ROOM_OT_stair_move(bpy.types.Operator):
             context.area.tag_redraw()
 
         # Let viewport navigation (pan/orbit/zoom/numpad) pass through
-        if event.type in {'MIDDLEMOUSE',
+        if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
                 'NUMPAD_0','NUMPAD_1','NUMPAD_2','NUMPAD_3',
                 'NUMPAD_4','NUMPAD_5','NUMPAD_6','NUMPAD_7',
                 'NUMPAD_8','NUMPAD_9','NUMPAD_DECIMAL','NUMPAD_PERIOD',
