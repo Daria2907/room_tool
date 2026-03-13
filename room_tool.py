@@ -177,19 +177,12 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
     stair_depth : bpy.props.FloatProperty(
         name="Step Depth",  default=0.28, min=0.05, max=1.0,  unit="LENGTH",
         description="Horizontal depth (run) of each tread")
-    stair_add_railing    : bpy.props.BoolProperty(name="Add Railing", default=True)
-    stair_railing_height : bpy.props.FloatProperty(
-        name="Railing Height",    default=0.9,  min=0.1, max=2.0,  unit="LENGTH")
-    stair_railing_thick  : bpy.props.FloatProperty(
-        name="Railing Thickness", default=0.05, min=0.01, max=0.3, unit="LENGTH")
     stair_floor_lower : bpy.props.IntProperty(name="From Floor", default=0, min=0)
     stair_floor_upper : bpy.props.IntProperty(name="To Floor",   default=1, min=0)
     mat_stair         : bpy.props.PointerProperty(type=bpy.types.Material, name="Stairs")
     mat_stair_tiling  : bpy.props.FloatProperty(
         name="Tiling", default=1.0, min=0.001, max=1000.0)
-    mat_railing       : bpy.props.PointerProperty(type=bpy.types.Material, name="Railing")
-    mat_railing_tiling: bpy.props.FloatProperty(
-        name="Tiling", default=1.0, min=0.001, max=1000.0)
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -230,8 +223,7 @@ _CAT_WIN_FRAME  = 4
 _CAT_PLINTH_BOTTOM = 5
 _CAT_PLINTH_TOP    = 6
 _CAT_STAIR         = 7
-_CAT_RAILING       = 8
-_CAT_NAMES = ('walls', 'floor', 'ceiling', 'door_frames', 'window_frames', 'plinth_bottom', 'plinth_top', 'stair', 'railing')
+_CAT_NAMES = ('walls', 'floor', 'ceiling', 'door_frames', 'window_frames', 'plinth_bottom', 'plinth_top', 'stair')
 
 def _face4(bm, v0, v1, v2, v3):
     bm.faces.new([bm.verts.new(co) for co in (v0, v1, v2, v3)])
@@ -888,9 +880,7 @@ def _build_stair_mesh(sd, s):
     uy2 = max(sd.get("uy1", ly1), sd.get("uy2", ly2))
     z_bot  = sd["z_bot"]
     z_top  = sd["z_top"]
-    rise_t = max(sd.get("step_rise",  getattr(s, "stair_rise",          0.18)), 0.05)
-    add_r  = sd.get("add_railing",    getattr(s, "stair_add_railing",    True))
-    rh     = sd.get("railing_height", getattr(s, "stair_railing_height", 0.9))
+    rise_t = max(sd.get("step_rise",  getattr(s, "stair_rise", 0.18)), 0.05)
 
     dz = z_top - z_bot
     if dz < 0.01:
@@ -1019,19 +1009,6 @@ def _build_stair_mesh(sd, s):
         _stringer_ngon(_ya, outward_neg_y=True)    # left  stringer (−Y face)
         _stringer_ngon(_yb, outward_neg_y=False)   # right stringer (+Y face)
 
-        if add_r:
-            for (tl, tr, zh) in steps_lr:
-                zl = zh - actual_rise
-                tc = (tl + tr) / 2
-                for side_fn, fwd in ((_ya, +1), (_yb, -1)):
-                    sy = side_fn(tc)
-                    a = (tl, sy, zl); b = (tr, sy, zh)
-                    c = (tr, sy, zh + rh); d_ = (tl, sy, zl + rh)
-                    if fwd > 0:
-                        _quad(d_, c, b, a, _CAT_RAILING)
-                    else:
-                        _quad(a, b, c, d_, _CAT_RAILING)
-
     else:   # Y travel — perpendicular axis is X; interpolate lx1/lx2 → ux1/ux2
         def _xa(t): return lx1 + (ux1 - lx1) * _frac(t)
         def _xb(t): return lx2 + (ux2 - lx2) * _frac(t)
@@ -1083,19 +1060,6 @@ def _build_stair_mesh(sd, s):
             cats_out.append(_CAT_STAIR)
         _stringer_y_ngon(_xa, outward_neg_x=True)    # left  stringer (−X face)
         _stringer_y_ngon(_xb, outward_neg_x=False)   # right stringer (+X face)
-
-        if add_r:
-            for (tl, tr, zh) in steps_lr:
-                zl = zh - actual_rise
-                tc = (tl + tr) / 2
-                for side_fn, fwd in ((_xa, +1), (_xb, -1)):
-                    sx = side_fn(tc)
-                    a = (sx, tl, zl); b = (sx, tr, zh)
-                    c = (sx, tr, zh + rh); d_ = (sx, tl, zl + rh)
-                    if fwd > 0:
-                        _quad(d_, c, b, a, _CAT_RAILING)
-                    else:
-                        _quad(a, b, c, d_, _CAT_RAILING)
 
     return verts_out, faces_out, cats_out
 
@@ -1170,10 +1134,9 @@ def _setup_stair_materials(me, s):
     """Assign stair/railing materials to a stair mesh."""
     while me.materials:
         me.materials.pop(index=0)
-    mat_s = getattr(s, 'mat_stair',   None)
-    mat_r = getattr(s, 'mat_railing', None) or mat_s
+    mat_s = getattr(s, 'mat_stair', None)
     mat_list, slot_map = [], {}
-    for cat, mat in ((_CAT_STAIR, mat_s), (_CAT_RAILING, mat_r)):
+    for cat, mat in ((_CAT_STAIR, mat_s),):
         if mat is None:
             slot_map[cat] = None
         elif mat in mat_list:
@@ -1193,16 +1156,12 @@ def _setup_stair_materials(me, s):
 
 
 def _apply_stair_uv(me, s):
-    """Cube-project UV for stair mesh using stair/railing tiling."""
+    """Cube-project UV for stair mesh."""
     uv_layer = me.uv_layers.new(name="UVMap")
-    ts = getattr(s, 'mat_stair_tiling',   1.0)
-    tr = getattr(s, 'mat_railing_tiling', 1.0)
-    cat_attr = me.attributes.get("stair_cat") if hasattr(me, 'attributes') else None
+    sc = getattr(s, 'mat_stair_tiling', 1.0)
     verts = me.vertices
     loops = me.loops
     for poly in me.polygons:
-        cat = cat_attr.data[poly.index].value if cat_attr else _CAT_STAIR
-        sc = ts if cat == _CAT_STAIR else tr
         n = poly.normal
         ax, ay, az = abs(n.x), abs(n.y), abs(n.z)
         for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
@@ -4456,9 +4415,6 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             "z_bot":          self._z_lower,
             "z_top":          self._z_upper,
             "step_rise":      s.stair_rise,
-            "add_railing":    s.stair_add_railing,
-            "railing_height": s.stair_railing_height,
-            "railing_thick":  s.stair_railing_thick,
             "x_travel":       x_travel,
         }
 
@@ -5281,22 +5237,12 @@ class ROOM_PT_stair_panel(bpy.types.Panel):
         col.separator()
         col.prop(s, "stair_rise")
         col.prop(s, "stair_depth")
-        col.prop(s, "stair_add_railing")
-        if s.stair_add_railing:
-            sub = col.column(align=True)
-            sub.prop(s, "stair_railing_height")
-            sub.prop(s, "stair_railing_thick")
-
         col.separator()
         col.label(text="Materials / Tiling:", icon="MATERIAL")
         row = col.row(align=True)
         split = row.split(factor=0.65, align=True)
-        split.prop(s, "mat_stair",  text="Stairs")
+        split.prop(s, "mat_stair",        text="Stairs")
         split.prop(s, "mat_stair_tiling", text="")
-        row = col.row(align=True)
-        split = row.split(factor=0.65, align=True)
-        split.prop(s, "mat_railing",        text="Railing")
-        split.prop(s, "mat_railing_tiling", text="")
 
         # ── Per-stair step editing ─────────────────────────────────────────
         obj = context.active_object
