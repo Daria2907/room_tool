@@ -1314,7 +1314,7 @@ def _opening_world_pos(opening, reg, is_window=False, src=None):
     # Adjacent rooms are placed with a 2t gap; their outer wall faces meet at
     # y1-t / y2+t / x1-t / x2+t — centering the door there makes it straddle
     # both rooms' frame reveals equally.
-    t = reg.get("t", s.wall_thickness if hasattr(s, "wall_thickness") else 0.2)
+    t = reg.get("t", 0.2)
     wall_face_outer = {'S': (anchor, y1 - t),
                        'N': (anchor, y2 + t),
                        'W': (x1 - t, anchor),
