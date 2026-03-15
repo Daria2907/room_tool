@@ -1261,19 +1261,75 @@ def _rebuild_room_mesh(reg, s):
 
 # ── Opening mesh helpers ──────────────────────────────────────────────────────
 
-def _opening_world_pos(opening, reg, is_window=False):
-    """Return (cx, cy, cz, rot_z) for the bottom-centre of a door/window opening.
-    rot_z is the Z-Euler rotation so the mesh faces INTO the room."""
+def _opening_world_pos(opening, reg, is_window=False, src=None):
+    """Return (cx, cy, cz, rot_z) — the object-origin world position for a door/window mesh.
+
+    When *src* is supplied the bounding box is used to place the mesh so that:
+      • It is centred horizontally inside the opening (anchor ± w/2)
+      • Its front face (bb_min_y) is flush with the wall face — door/window
+        extends fully into the room from the shared wall boundary
+      • Its bottom sits on the floor     (z or z+v_offset for windows)
+    This works regardless of where the mesh origin sits relative to the geometry.
+
+    When *src* is None the legacy behaviour is used (origin assumed at bottom-centre
+    of the mesh at the wall face).
+    """
     wc     = opening["wc"]
     anchor = opening["anchor"]
     x1, y1, x2, y2 = reg["x1"], reg["y1"], reg["x2"], reg["y2"]
     z      = reg.get("z", 0.0)
-    cz     = z + (opening.get("v_offset", 0.9) if is_window else 0.0)
+    cz_base = z + (opening.get("v_offset", 0.0) if is_window else 0.0)
+
     import math
-    if   wc == 'S': return anchor, y1, cz,  0.0
-    elif wc == 'N': return anchor, y2, cz,  math.pi
-    elif wc == 'W': return x1, anchor, cz,  math.pi * 0.5
-    else:           return x2, anchor, cz, -math.pi * 0.5   # 'E'
+    rot_map = {'S': 0.0, 'N': math.pi, 'W': math.pi * 0.5, 'E': -math.pi * 0.5}
+    rot_z   = rot_map[wc]
+
+    if src is None:
+        # Legacy: origin at bottom-centre of mesh, placed flush with the wall face.
+        wall_xy = {'S': (anchor, y1), 'N': (anchor, y2),
+                   'W': (x1, anchor), 'E': (x2, anchor)}
+        wx, wy = wall_xy[wc]
+        return wx, wy, cz_base, rot_z
+
+    # ── Bounding-box-aware placement ─────────────────────────────────────────
+    # Work in source-object local space (scaled by the object's own scale).
+    bb     = src.bound_box          # 8 corners in local (pre-scale) space
+    os     = src.scale
+    xs_w   = [v[0] * os[0] for v in bb]
+    ys_w   = [v[1] for v in bb]             # raw local Y — instance uses scale.y = 1.0
+    zs_w   = [v[2] * os[2] for v in bb]
+
+    bb_mid_x = (min(xs_w) + max(xs_w)) / 2.0   # local X centre (along-opening axis)
+    bb_min_z = min(zs_w)                        # local Z bottom
+
+    # Instance scale: X→opening width, Y unchanged, Z→opening height.
+    src_dx = max(xs_w) - min(xs_w)
+    src_dz = max(zs_w) - min(zs_w)
+    sx = (opening.get("w", opening.get("window_width",  1.0)) /
+          max(src_dx, 1e-4)) if src_dx > 1e-4 else 1.0
+    sz = (opening.get("h", opening.get("window_height", 1.0)) /
+          max(src_dz, 1e-4)) if src_dz > 1e-4 else 1.0
+
+    # Target world position: align bb_mid_y to the shared inner wall boundary.
+    # Adjacent rooms touch at their inner faces (y1_A = y2_B). Each wall extends
+    # OUTWARD by t, so the combined wall is 2t wide and its midpoint is exactly
+    # the shared inner face. Centering the door there makes it straddle both
+    # rooms' reveals equally — B = E in the user's diagram.
+    wall_face = {'S': (anchor, y1),
+                 'N': (anchor, y2),
+                 'W': (x1, anchor),
+                 'E': (x2, anchor)}
+    target_wx, target_wy = wall_face[wc]
+
+    # Place the depth-CENTRE (bb_mid_y) at the shared wall boundary.
+    cr, sr = math.cos(rot_z), math.sin(rot_z)
+    bb_mid_y = (min(ys_w) + max(ys_w)) / 2.0
+    lx, ly, lz = bb_mid_x * sx, bb_mid_y, bb_min_z * sz
+    cx = target_wx - lx * cr + ly * sr
+    cy = target_wy - lx * sr - ly * cr
+    cz = cz_base   - lz
+
+    return cx, cy, cz, rot_z
 
 
 def _place_opening_mesh(opening, source_name, w, h, reg, collection=None):
@@ -1288,7 +1344,7 @@ def _place_opening_mesh(opening, source_name, w, h, reg, collection=None):
         return
 
     is_win = "v_offset" in opening
-    cx, cy, cz, rot_z = _opening_world_pos(opening, reg, is_window=is_win)
+    cx, cy, cz, rot_z = _opening_world_pos(opening, reg, is_window=is_win, src=src)
 
     # Re-use existing instance if possible, else create a new one
     inst_name = opening.get("mesh_obj_name", "")
@@ -1309,11 +1365,14 @@ def _place_opening_mesh(opening, source_name, w, h, reg, collection=None):
     inst.location = (cx, cy, cz)
     inst.rotation_euler = (0.0, 0.0, rot_z)
 
-    # Scale X = width, Z = height; leave Y (depth) unchanged
-    import mathutils
-    dims = src.dimensions
-    sx = w / max(dims.x, 1e-4) if dims.x > 1e-4 else 1.0
-    sz = h / max(dims.z, 1e-4) if dims.z > 1e-4 else 1.0
+    # Scale X = opening width, Z = opening height; Y (depth) unchanged.
+    # Measure source in its own scaled local space so any origin works.
+    os     = src.scale
+    bb     = src.bound_box
+    src_dx = max(v[0] * os[0] for v in bb) - min(v[0] * os[0] for v in bb)
+    src_dz = max(v[2] * os[2] for v in bb) - min(v[2] * os[2] for v in bb)
+    sx = w / max(src_dx, 1e-4) if src_dx > 1e-4 else 1.0
+    sz = h / max(src_dz, 1e-4) if src_dz > 1e-4 else 1.0
     inst.scale = (sx, 1.0, sz)
 
 
@@ -4392,18 +4451,15 @@ def _find_room_at(pt2d, z, rooms):
 
 
 def _rect_fits_in_room(rx1, ry1, rx2, ry2, z, rooms, eps=1e-4):
-    """Return the room index if the rectangle fits entirely inside the inner floor area
-    (inside the wall thickness) of any room at the given Z, else None.
-    eps: floating-point tolerance so a rect snapped exactly to a wall face is accepted."""
+    """Return the room index if the rectangle fits within the room's inner floor area
+    at the given Z, else None.  x1/y1/x2/y2 are the INNER wall faces (walls extend
+    outward), so the valid floor area is exactly x1..x2, y1..y2.
+    eps: tolerance so a rect snapped flush to the inner wall face is accepted."""
     for i, r in enumerate(rooms):
         if abs(r.get("z", 0.0) - z) > 0.01:
             continue
-        t = r.get("t", 0.125)
-        ix1 = r["x1"] + t
-        iy1 = r["y1"] + t
-        ix2 = r["x2"] - t
-        iy2 = r["y2"] - t
-        if rx1 >= ix1 - eps and ry1 >= iy1 - eps and rx2 <= ix2 + eps and ry2 <= iy2 + eps:
+        if (rx1 >= r["x1"] - eps and ry1 >= r["y1"] - eps and
+                rx2 <= r["x2"] + eps and ry2 <= r["y2"] + eps):
             return i
     return None
 
@@ -5004,6 +5060,7 @@ class ROOM_OT_sample_dims_apply(bpy.types.Operator):
     sampled_width:    bpy.props.FloatProperty()
     sampled_height:   bpy.props.FloatProperty()
     sampled_z_bottom: bpy.props.FloatProperty()
+    sampled_obj_name: bpy.props.StringProperty()
 
     def invoke(self, context, event):
         return context.window_manager.invoke_props_dialog(self, width=280)
@@ -5019,15 +5076,43 @@ class ROOM_OT_sample_dims_apply(bpy.types.Operator):
             col.label(text=f"Sill:   {max(0.0, v_off):.3f} m")
 
     def execute(self, context):
-        s = context.scene.room_settings
+        s   = context.scene.room_settings
+        src = bpy.data.objects.get(self.sampled_obj_name)
         if self.apply_as == 'DOOR':
             s.door_width  = self.sampled_width
             s.door_height = self.sampled_height
+            if src is not None:
+                presets = context.scene.room_door_presets
+                idx     = context.scene.room_active_door_preset
+                if 0 <= idx < len(presets):
+                    presets[idx].mesh_object = src
+                else:
+                    # No active preset — create one automatically
+                    dp = presets.add()
+                    dp.name        = src.name
+                    dp.door_width  = self.sampled_width
+                    dp.door_height = self.sampled_height
+                    dp.mesh_object = src
+                    context.scene.room_active_door_preset = len(presets) - 1
         else:
             s.window_width    = self.sampled_width
             s.window_height   = self.sampled_height
             v_off = self.sampled_z_bottom - s.z_foundation
             s.window_v_offset = max(0.0, v_off)
+            if src is not None:
+                presets = context.scene.room_window_presets
+                idx     = context.scene.room_active_window_preset
+                if 0 <= idx < len(presets):
+                    presets[idx].mesh_object = src
+                else:
+                    # No active preset — create one automatically
+                    wp = presets.add()
+                    wp.name          = src.name
+                    wp.window_width  = self.sampled_width
+                    wp.window_height = self.sampled_height
+                    wp.v_offset      = max(0.0, v_off)
+                    wp.mesh_object   = src
+                    context.scene.room_active_window_preset = len(presets) - 1
         return {'FINISHED'}
 
 
@@ -5093,7 +5178,8 @@ class ROOM_OT_sample_dims(bpy.types.Operator):
             bpy.ops.room.sample_dims_apply('INVOKE_DEFAULT',
                 sampled_width=round(width, 4),
                 sampled_height=round(height, 4),
-                sampled_z_bottom=round(z_bot, 4))
+                sampled_z_bottom=round(z_bot, 4),
+                sampled_obj_name=obj.name)
             return {'FINISHED'}
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
@@ -5152,6 +5238,22 @@ class ROOM_PT_panel(bpy.types.Panel):
         row.scale_y = 1.5
         row.operator("room.draw", icon="MESH_CUBE", text="Draw Room  (Shift+R)")
 
+        # ── Pivot ─────────────────────────────────────────────────────────────
+        box = L.box()
+        col = box.column(align=True)
+        col.label(text="Object Pivot:", icon="OBJECT_ORIGIN")
+        col.prop(s, "pivot_mode", text="")
+
+        # ── Organisation ─────────────────────────────────────────────────────
+        box = L.box()
+        col = box.column(align=True)
+        col.label(text="Organisation:", icon="OUTLINER_COLLECTION")
+        row = col.row(align=True)
+        row.prop(s, "use_hierarchy", toggle=True)
+        if s.use_hierarchy:
+            col.row().prop(s, "hierarchy_mode", expand=True)
+
+        # ── Foundation Alignment ──────────────────────────────────────────────
         box = L.box()
         col = box.column(align=True)
         col.label(text="Foundation Alignment:", icon="OBJECT_ORIGIN")
@@ -5175,12 +5277,14 @@ class ROOM_PT_panel(bpy.types.Panel):
                 rem = row.operator("room.remove_floor", text="", icon="X")
                 rem.floor_index = i
 
+        # ── Wall Dimensions ───────────────────────────────────────────────────
         box = L.box()
         col = box.column(align=True)
         col.label(text="Wall Dimensions:", icon="MOD_BUILD")
         col.prop(s, "wall_height")
         col.prop(s, "wall_thickness")
 
+        # ── Features ─────────────────────────────────────────────────────────
         box = L.box()
         col = box.column(align=True)
         col.label(text="Features:", icon="MODIFIER")
@@ -5202,18 +5306,6 @@ class ROOM_PT_panel(bpy.types.Panel):
             sub.label(text="Top:")
             sub.prop(s, "plinth_top_height")
             sub.prop(s, "plinth_top_thickness")
-        col.separator()
-        col.label(text="Object Pivot:")
-        col.prop(s, "pivot_mode", text="")
-
-        # ── Organisation ─────────────────────────────────────────────────────
-        box = L.box()
-        col = box.column(align=True)
-        col.label(text="Organisation:", icon="OUTLINER_COLLECTION")
-        row = col.row(align=True)
-        row.prop(s, "use_hierarchy", toggle=True)
-        if s.use_hierarchy:
-            col.row().prop(s, "hierarchy_mode", expand=True)
 
         box = L.box()
         col = box.column(align=True)
@@ -5289,7 +5381,7 @@ class ROOM_PT_door_panel(bpy.types.Panel):
         col.prop(s, "door_width")
         col.prop(s, "door_height")
         col.prop(s, "door_margin")
-        col.operator("room.sample_dims", icon="EYEDROPPER", text="Sample from Object")
+        col.operator("room.sample_dims", icon="EYEDROPPER", text="Sample from Object  (Ctrl+Shift+E)")
         col.operator("room.save_door_preset", icon="ADD", text="Save Door Preset")
 
         presets = context.scene.room_door_presets
@@ -5341,7 +5433,7 @@ class ROOM_PT_window_panel(bpy.types.Panel):
         row = col.row(align=True)
         row.prop(s, "window_array_count")
         row.prop(s, "window_array_gap")
-        col.operator("room.sample_dims", icon="EYEDROPPER", text="Sample from Object")
+        col.operator("room.sample_dims", icon="EYEDROPPER", text="Sample from Object  (Ctrl+Shift+E)")
         col.operator("room.save_window_preset", icon="ADD", text="Save Window Preset")
 
         presets = context.scene.room_window_presets
@@ -6156,6 +6248,9 @@ def register():
         # Double-click on a stair object → open Move / Rotate immediately
         kmi5 = km.keymap_items.new("room.stair_move", "LEFTMOUSE", "DOUBLE_CLICK")
         ROOM_OT_draw._addon_kmaps.append((km, kmi5))
+        # Ctrl+Shift+E → sample object dimensions (doors & windows)
+        kmi6 = km.keymap_items.new("room.sample_dims", "E", "PRESS", shift=True, ctrl=True)
+        ROOM_OT_draw._addon_kmaps.append((km, kmi6))
 
     if _room_registry_cleanup not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_room_registry_cleanup)
