@@ -1310,18 +1310,17 @@ def _opening_world_pos(opening, reg, is_window=False, src=None):
     sz = (opening.get("h", opening.get("window_height", 1.0)) /
           max(src_dz, 1e-4)) if src_dz > 1e-4 else 1.0
 
-    # Target world position: align bb_mid_y to the shared inner wall boundary.
-    # Adjacent rooms touch at their inner faces (y1_A = y2_B). Each wall extends
-    # OUTWARD by t, so the combined wall is 2t wide and its midpoint is exactly
-    # the shared inner face. Centering the door there makes it straddle both
-    # rooms' reveals equally — B = E in the user's diagram.
-    wall_face = {'S': (anchor, y1),
-                 'N': (anchor, y2),
-                 'W': (x1, anchor),
-                 'E': (x2, anchor)}
-    target_wx, target_wy = wall_face[wc]
+    # Align bb_mid_y to the OUTER wall face (B = E in user's diagram).
+    # Adjacent rooms are placed with a 2t gap; their outer wall faces meet at
+    # y1-t / y2+t / x1-t / x2+t — centering the door there makes it straddle
+    # both rooms' frame reveals equally.
+    t = reg.get("t", s.wall_thickness if hasattr(s, "wall_thickness") else 0.2)
+    wall_face_outer = {'S': (anchor, y1 - t),
+                       'N': (anchor, y2 + t),
+                       'W': (x1 - t, anchor),
+                       'E': (x2 + t, anchor)}
+    target_wx, target_wy = wall_face_outer[wc]
 
-    # Place the depth-CENTRE (bb_mid_y) at the shared wall boundary.
     cr, sr = math.cos(rot_z), math.sin(rot_z)
     bb_mid_y = (min(ys_w) + max(ys_w)) / 2.0
     lx, ly, lz = bb_mid_x * sx, bb_mid_y, bb_min_z * sz
