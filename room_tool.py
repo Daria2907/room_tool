@@ -1310,16 +1310,17 @@ def _opening_world_pos(opening, reg, is_window=False, src=None):
     sz = (opening.get("h", opening.get("window_height", 1.0)) /
           max(src_dz, 1e-4)) if src_dz > 1e-4 else 1.0
 
-    # Align bb_mid_y to the OUTER wall face (B = E in user's diagram).
-    # Adjacent rooms are placed with a 2t gap; their outer wall faces meet at
-    # y1-t / y2+t / x1-t / x2+t — centering the door there makes it straddle
-    # both rooms' frame reveals equally.
-    t = reg.get("t", 0.2)
-    wall_face_outer = {'S': (anchor, y1 - t),
-                       'N': (anchor, y2 + t),
-                       'W': (x1 - t, anchor),
-                       'E': (x2 + t, anchor)}
-    target_wx, target_wy = wall_face_outer[wc]
+    # Align bb_mid_y to the external doorframe edge (E in user's diagram).
+    # Reveals go t/2 deep from the inner face, so the frame's external edge is
+    # at y1-fd / y2+fd / x1-fd / x2+fd where fd = t/2.  Two adjacent rooms'
+    # frames meet exactly here, making it the correct centre for the door mesh.
+    t  = reg.get("t", 0.2)
+    fd = t * 0.5
+    frame_outer = {'S': (anchor, y1 - fd),
+                   'N': (anchor, y2 + fd),
+                   'W': (x1 - fd, anchor),
+                   'E': (x2 + fd, anchor)}
+    target_wx, target_wy = frame_outer[wc]
 
     cr, sr = math.cos(rot_z), math.sin(rot_z)
     bb_mid_y = (min(ys_w) + max(ys_w)) / 2.0
