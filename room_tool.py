@@ -5230,7 +5230,7 @@ class ROOM_OT_door_edit(bpy.types.Operator):
                         if _valid_anchor(anchor, rooms[ri], wc, dw, s.door_margin,
                                          zones=_zones_hv, wall_span=_span_hv) is None:
                             context.area.header_text_set("Cannot place door here — blocked")
-                    self._hint_text = "Cannot place door here — blocked"
+                            self._hint_text = "Cannot place door here — blocked"
                         else:
                             self._header(context)
                     else:
