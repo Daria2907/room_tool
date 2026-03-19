@@ -7550,7 +7550,6 @@ def _recalculate_plinth_for_obj(reg, obj, s):
         p7_w = p4_w + inward * thickness; p7_w.z = z1_w
         pts_l = [mw_inv @ p for p in [p0_w, p1_w, p2_w, p3_w, p4_w, p5_w, p6_w, p7_w]]
         v = [bm.verts.new(co) for co in pts_l]
-        bm.faces.new([v[0], v[1], v[5], v[4]])
         bm.faces.new([v[4], v[5], v[6], v[7]])
         bm.faces.new([v[0], v[3], v[7], v[4]])
         bm.faces.new([v[1], v[5], v[6], v[2]])
