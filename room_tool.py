@@ -7537,7 +7537,7 @@ def _recalculate_plinth_for_obj(reg, obj, s):
 
     # ── Emit plinth quads ─────────────────────────────────────────────────────
     def add_plinth_quad(va, vb, fn, height, thickness, z_base, top=False):
-        inward = -fn.copy(); inward.z = 0; inward.normalize()
+        inward = fn.copy(); inward.z = 0; inward.normalize()
         z0_w = z_base + (wall_h - height if top else 0.0)
         z1_w = z0_w + height
         p0_w = va.copy(); p0_w.z = z0_w
