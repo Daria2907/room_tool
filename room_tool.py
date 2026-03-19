@@ -485,11 +485,12 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         description="Material applied to all threshold strip objects",
         update=_cb_threshold)
     # ── Panel section collapse state ──────────────────────────────────────────
-    show_wall_dims : bpy.props.BoolProperty(name="Wall Dimensions", default=True)
-    show_geometry  : bpy.props.BoolProperty(name="Geometry",        default=True)
-    show_trims     : bpy.props.BoolProperty(name="Trims",           default=True)
-    show_materials : bpy.props.BoolProperty(name="Materials / Tiling", default=False)
-    show_floors    : bpy.props.BoolProperty(name="Floors",          default=False)
+    show_wall_dims  : bpy.props.BoolProperty(name="Wall Dimensions",  default=True)
+    show_geometry   : bpy.props.BoolProperty(name="Geometry",         default=True)
+    show_trims      : bpy.props.BoolProperty(name="Trims",            default=True)
+    show_materials  : bpy.props.BoolProperty(name="Materials / Tiling", default=False)
+    show_floors     : bpy.props.BoolProperty(name="Floors",           default=False)
+    show_utilities  : bpy.props.BoolProperty(name="Utilities",        default=False)
     # ── Collection / hierarchy ────────────────────────────────────────────────
     use_hierarchy  : bpy.props.BoolProperty(
         name="Use Collections", default=True,
@@ -2226,6 +2227,16 @@ def _sync_all_thresholds(s):
         return
     rooms = ROOM_OT_draw._room_list
     t_default = getattr(s, 'wall_thickness', 0.125)
+    # Auto-enable threshold when any two connected rooms share a door pair
+    if not getattr(s, 'add_threshold', False):
+        for ri_c, reg_c in enumerate(rooms):
+            t_c = reg_c.get("t", t_default)
+            for di_c in range(len(reg_c.get("doors", []))):
+                if _find_partner_door(rooms, ri_c, di_c, t_c) is not None:
+                    s['add_threshold'] = True   # bypass update cb, avoid recursion
+                    break
+            if getattr(s, 'add_threshold', False):
+                break
     for ri, reg in enumerate(rooms):
         obj = bpy.data.objects.get(reg.get("obj_name", ""))
         col = next(iter(obj.users_collection), None) if obj else None
@@ -3678,6 +3689,75 @@ def _wall_face_verts(r, wall_char, z, h, t_fallback):
         return [(x2+rt,y1-rt,z0),(x1-rt,y1-rt,z0),(x1-rt,y1-rt,z1),(x2+rt,y1-rt,z1)]
 
 
+def _door_swing_arc(wc, anchor, dw, z, wall_pos, flip_lr=False, flip_io=False, n=16):
+    """Return (hinge_pt, closed_tip, arc_pts) for a door-swing arc at floor height z.
+    All points are (x, y, z) tuples.  The arc sweeps 90° from the closed door
+    position (along the wall) to the open position (into/out of the room)."""
+    import math as _math
+    from mathutils import Vector as _V
+    hw = dw * 0.5
+    if wc in ('N', 'S'):
+        along  = _V((1, 0, 0))
+        inward = _V((0, -1 if wc == 'N' else 1, 0))
+        hinge_base = _V((anchor, wall_pos, z))
+    else:
+        along  = _V((0, 1, 0))
+        inward = _V((-1 if wc == 'E' else 1, 0, 0))
+        hinge_base = _V((wall_pos, anchor, z))
+    if flip_lr:
+        hinge  = hinge_base + along * hw
+        c_tip  = hinge_base - along * hw
+    else:
+        hinge  = hinge_base - along * hw
+        c_tip  = hinge_base + along * hw
+    if flip_io:
+        inward = -inward
+    close_dir = (c_tip - hinge).normalized()
+    cross_z   = close_dir.x * inward.y - close_dir.y * inward.x
+    sweep     = _math.pi * 0.5 * (1 if cross_z >= 0 else -1)
+    base_a    = _math.atan2(close_dir.y, close_dir.x)
+    arc = []
+    for i in range(n + 1):
+        a = base_a + sweep * (i / n)
+        arc.append((hinge.x + dw * _math.cos(a),
+                    hinge.y + dw * _math.sin(a), z))
+    return (hinge.x, hinge.y, z), (c_tip.x, c_tip.y, z), arc
+
+
+def _draw_hint_bar(context, text, color=(0.88, 0.88, 0.88, 1.0)):
+    """Draw a small one-line key hint at the bottom centre of the 3D viewport.
+    Call this from any modal draw callback (POST_VIEW or POST_PIXEL)."""
+    try:
+        if context.region is None:
+            return
+        font_id = 0
+        blf.size(font_id, 12)
+        w, h = blf.dimensions(font_id, text)
+        x = (context.region.width - w) * 0.5
+        y = 8
+        # dark background pill
+        gpu.state.blend_set('ALPHA')
+        pad_x, pad_y = 10, 5
+        bx1, bx2 = x - pad_x, x + w + pad_x
+        by1, by2 = y - pad_y, y + h + pad_y
+        bg_verts = [(bx1,by1),(bx2,by1),(bx2,by2),(bx1,by2)]
+        bg_tris  = [(0,1,2),(0,2,3)]
+        _sh = gpu.shader.from_builtin('UNIFORM_COLOR')
+        _b  = batch_for_shader(_sh, 'TRIS', {"pos": bg_verts}, indices=bg_tris)
+        _sh.uniform_float("color", (0.0, 0.0, 0.0, 0.55))
+        _b.draw(_sh)
+        gpu.state.blend_set('NONE')
+        blf.enable(font_id, blf.SHADOW)
+        blf.shadow(font_id, 3, 0, 0, 0, 0.8)
+        blf.shadow_offset(font_id, 0, -1)
+        blf.color(font_id, *color)
+        blf.position(font_id, x, y, 0)
+        blf.draw(font_id, text)
+        blf.disable(font_id, blf.SHADOW)
+    except Exception:
+        pass
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Modal draw operator
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3790,6 +3870,7 @@ class ROOM_OT_draw(bpy.types.Operator):
 
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
+        _draw_hint_bar(context, getattr(self, '_hint_text', ''))
 
     def _add_draw_handle(self, context):
         self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
@@ -3847,6 +3928,7 @@ class ROOM_OT_draw(bpy.types.Operator):
     def _msg(self, context, text):
         if context.area:
             context.area.header_text_set(text)
+        self._hint_text = text
 
     def _idle_msg(self, context):
         s = context.scene.room_settings
@@ -3901,6 +3983,7 @@ class ROOM_OT_draw(bpy.types.Operator):
         self._ds_room_idx  = None
         self._ds_wall_char = None
         self._ds_door_idx  = None
+        self._hint_text    = "LMB – click to start drawing  ·  hover a wall to snap-connect  ·  Enter/RMB – exit"
         self._add_draw_handle(context)
         context.window_manager.modal_handler_add(self)
         self._idle_msg(context)
@@ -4454,15 +4537,38 @@ def _snap_no_walls(snap_info):
     return ()
 
 
+_hint_cb_state = {"prev_mode": None, "prev_obj": None}   # module-level state
+
+
 def _draw_room_hint_cb():
     """Persistent POST_PIXEL handler: draws hint text at the bottom of the 3D
-    viewport when the user is in Edit Mode on a room mesh, and after they exit
-    automatically triggers a plinth recalculation if the room has plinth enabled."""
+    viewport when the user is in Edit Mode on a room mesh.  Also detects
+    edit-mode exit and auto-recalculates plinth if the room has plinth enabled."""
     try:
         ctx = bpy.context
         if ctx.area is None or ctx.region is None:
             return
         active = ctx.active_object
+        # ── Detect edit-mode exit and auto-recalculate plinth ─────────────
+        cur_mode = ctx.mode
+        prev_mode = _hint_cb_state["prev_mode"]
+        prev_obj  = _hint_cb_state["prev_obj"]
+        _hint_cb_state["prev_mode"] = cur_mode
+        _hint_cb_state["prev_obj"]  = active.name if active else None
+        if (prev_mode == 'EDIT_MESH' and cur_mode != 'EDIT_MESH' and
+                prev_obj is not None):
+            exited_reg = next((r for r in ROOM_OT_draw._room_list
+                               if r.get('obj_name') == prev_obj), None)
+            if exited_reg is not None:
+                ex_obj = bpy.data.objects.get(prev_obj)
+                s_ec   = getattr(ctx.scene, 'room_settings', None)
+                if ex_obj and s_ec and (
+                        exited_reg.get('plinth_bottom_enabled', False) or
+                        exited_reg.get('plinth_top_enabled', False)):
+                    try:
+                        _recalculate_plinth_for_obj(exited_reg, ex_obj, s_ec)
+                    except Exception:
+                        pass
         if active is None:
             return
         reg = next((r for r in ROOM_OT_draw._room_list
@@ -4815,9 +4921,46 @@ class ROOM_OT_door_edit(bpy.types.Operator):
                 else:
                     shader.uniform_float("color", (0.1, 1.0, 0.3, 0.9))
                 b2.draw(shader)
+                # ── Swing arc ────────────────────────────────────────────
+                if not is_blocked:
+                    try:
+                        z_arc = r.get("z", s.z_foundation) + 0.02
+                        wp = (snap_ew["wall_coord"] if snap_ew else
+                              {"S": r["y1"], "N": r["y2"],
+                               "W": r["x1"], "E": r["x2"]}[wc])
+                        _h, _ct, _arc = _door_swing_arc(wc, anchor, dw, z_arc, wp)
+                        arc_lines = []
+                        for i in range(len(_arc) - 1):
+                            arc_lines.extend([_arc[i], _arc[i + 1]])
+                        arc_lines.extend([_h, _ct])
+                        ba = batch_for_shader(shader, 'LINES', {"pos": arc_lines})
+                        shader.uniform_float("color", (0.1, 1.0, 0.3, 0.5))
+                        gpu.state.line_width_set(1.5)
+                        ba.draw(shader)
+                    except Exception:
+                        pass
 
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
+        # ── W×H cursor readout ───────────────────────────────────────────
+        if self._hover_snap is not None:
+            try:
+                dw = s.door_width;  dh = s.door_height
+                active  = context.scene.room_active_door_preset
+                presets = context.scene.room_door_presets
+                if 0 <= active < len(presets):
+                    dw, dh = presets[active].door_width, presets[active].door_height
+                label = f"W {dw*100:.0f}  ×  H {dh*100:.0f} cm"
+                font_id = 0
+                blf.size(font_id, 12)
+                blf.color(font_id, 1.0, 1.0, 1.0, 0.9)
+                mx = getattr(self, '_mouse_rx', 0) + 14
+                my = getattr(self, '_mouse_ry', 0) + 14
+                blf.position(font_id, mx, my, 0)
+                blf.draw(font_id, label)
+            except Exception:
+                pass
+        _draw_hint_bar(context, getattr(self, '_hint_text', ''))
 
     def _add_draw_handle(self, context):
         self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
@@ -4834,10 +4977,12 @@ class ROOM_OT_door_edit(bpy.types.Operator):
             self._draw_handle = None
 
     # ── helpers ───────────────────────────────────────────────────────────
-    def _header(self, context):
-        context.area.header_text_set(
-            "LMB=add  ·  LMB+drag=slide  ·  Tab/Shift+Tab=preset  ·  "
-            "Double-click=flip/remove  |  RMB/Esc=exit")
+    def _header(self, context, text=None):
+        if text is None:
+            text = ("LMB – add  ·  LMB+drag – slide  ·  Tab/Shift+Tab – preset  ·  "
+                    "Double-click – flip/remove  ·  RMB/Esc – exit")
+        context.area.header_text_set(text)
+        self._hint_text = text
 
     def _restore_preview(self, context, rooms, s):
         """Revert preset dims saved in _preview_orig back to the doors."""
@@ -4927,6 +5072,9 @@ class ROOM_OT_door_edit(bpy.types.Operator):
         self._added_in_press  = False
         self._preview_orig    = None
         self._draw_handle     = None
+        self._hint_text       = ""
+        self._mouse_rx        = 0
+        self._mouse_ry        = 0
         self._add_draw_handle(context)
         context.window_manager.modal_handler_add(self)
         context.scene.room_door_edit_active = True
@@ -5053,6 +5201,8 @@ class ROOM_OT_door_edit(bpy.types.Operator):
 
         # ── Mouse move ────────────────────────────────────────────────────
         if event.type == "MOUSEMOVE":
+            self._mouse_rx = event.mouse_region_x
+            self._mouse_ry = event.mouse_region_y
             pt = _ray_to_z(context, event, s.z_foundation)
 
             if self._phase == 'HOVER':
@@ -5080,6 +5230,7 @@ class ROOM_OT_door_edit(bpy.types.Operator):
                         if _valid_anchor(anchor, rooms[ri], wc, dw, s.door_margin,
                                          zones=_zones_hv, wall_span=_span_hv) is None:
                             context.area.header_text_set("Cannot place door here — blocked")
+                    self._hint_text = "Cannot place door here — blocked"
                         else:
                             self._header(context)
                     else:
@@ -5094,9 +5245,10 @@ class ROOM_OT_door_edit(bpy.types.Operator):
                         (abs(event.mouse_region_x - self._press_screen[0]) > self._DRAG_PX or
                          abs(event.mouse_region_y - self._press_screen[1]) > self._DRAG_PX)):
                     self._phase = 'SLIDING'
-                    context.area.header_text_set(
-                        "Sliding door  ·  Tab/Shift+Tab=preset  |  "
-                        "Release to confirm  ·  RMB=cancel")
+                    _sl_txt = ("Sliding door  ·  Tab/Shift+Tab – preset  ·  "
+                               "Release to confirm  ·  RMB – cancel")
+                    context.area.header_text_set(_sl_txt)
+                    self._hint_text = _sl_txt
                 else:
                     return {'RUNNING_MODAL'}
 
@@ -5512,6 +5664,21 @@ class ROOM_OT_window_edit(bpy.types.Operator):
 
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
+        # ── W×H cursor readout ───────────────────────────────────────────
+        if self._hover_snap is not None:
+            try:
+                s_r = context.scene.room_settings
+                ww, wh, _ = self._resolve_dims(s_r)
+                label = f"W {ww*100:.0f}  ×  H {wh*100:.0f} cm"
+                font_id = 0
+                blf.size(font_id, 12)
+                blf.color(font_id, 1.0, 1.0, 1.0, 0.9)
+                blf.position(font_id, getattr(self, '_mouse_rx', 0) + 14,
+                             getattr(self, '_mouse_ry', 0) + 14, 0)
+                blf.draw(font_id, label)
+            except Exception:
+                pass
+        _draw_hint_bar(context, getattr(self, '_hint_text', ''))
 
     def _add_draw_handle(self, context):
         self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
@@ -5528,10 +5695,12 @@ class ROOM_OT_window_edit(bpy.types.Operator):
             self._draw_handle = None
 
     # ── helpers ───────────────────────────────────────────────────────────
-    def _header(self, context):
-        context.area.header_text_set(
-            "LMB=place (click H · click V)  ·  LMB+drag=slide  ·  "
-            "Tab/Shift+Tab=preset  ·  Scroll=count  ·  Double-click=remove  |  RMB/Esc=exit")
+    def _header(self, context, text=None):
+        if text is None:
+            text = ("LMB – place  ·  LMB+drag – slide  ·  Tab/Shift+Tab – preset  ·  "
+                    "Scroll – count  ·  Double-click – remove  ·  RMB/Esc – exit")
+        context.area.header_text_set(text)
+        self._hint_text = text
 
     def _remove_active_win(self, context, rooms, s):
         ri, wi = self._active_idx, self._active_win_idx
@@ -5676,6 +5845,9 @@ class ROOM_OT_window_edit(bpy.types.Operator):
         self._array_count     = 1
         self._undo_stack      = []   # list of [(ri, [win_dicts, ...]), ...]
         self._draw_handle     = None
+        self._hint_text       = ""
+        self._mouse_rx        = 0
+        self._mouse_ry        = 0
         self._add_draw_handle(context)
         context.window_manager.modal_handler_add(self)
         context.scene.room_window_edit_active = True
@@ -5830,6 +6002,8 @@ class ROOM_OT_window_edit(bpy.types.Operator):
 
         # ── Mouse move ────────────────────────────────────────────────────
         if event.type == "MOUSEMOVE":
+            self._mouse_rx = event.mouse_region_x
+            self._mouse_ry = event.mouse_region_y
             pt = _ray_to_z(context, event, s.z_foundation)
 
             if self._phase == 'HOVER':
@@ -6295,6 +6469,7 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
 
         gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
+        _draw_hint_bar(context, getattr(self, '_hint_text', ''))
 
     def _add_draw_handle(self, context):
         self._handle = bpy.types.SpaceView3D.draw_handler_add(
@@ -6436,6 +6611,7 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
         self._cursor          = Vector((0, 0, 0))
         self._handle          = None
         self._last_lmb_time   = 0.0    # for double-click-to-exit detection
+        self._hint_text       = "LMB – set lower rect corner  ·  RMB/Esc – cancel"
 
         context.scene.room_stair_edit_active = True
 
@@ -6585,8 +6761,9 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                         pt.x, pt.y = _snap_stair_pt(
                             pt.x, pt.y, ROOM_OT_draw._room_list[ri],
                             grid=_stair_grid)
-                    self._lower_c1 = pt.copy()
-                    self._phase    = 'LOWER_DRAG'
+                    self._lower_c1  = pt.copy()
+                    self._phase     = 'LOWER_DRAG'
+                    self._hint_text = "LMB release – set opposite corner of lower footprint  ·  RMB – cancel"
 
             elif event.value == 'RELEASE':
                 if self._phase == 'LOWER_DRAG':
@@ -6618,7 +6795,8 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
                     # Initialise upper rect at same XY as lower (zero offset)
                     lx1 = rx1; ly1 = ry1; lx2 = rx2; ly2 = ry2
                     self._upper_rect = (lx1, ly1, lx2, ly2)
-                    self._phase = 'UPPER_SLIDE'
+                    self._phase     = 'UPPER_SLIDE'
+                    self._hint_text = "Move to position upper rect  ·  LMB – confirm  ·  RMB – cancel"
                     self.report({'INFO'},
                                 "Footprint set — slide along travel axis to position upper "
                                 "opening (green = valid, red = outside room), LMB to confirm")
@@ -7524,6 +7702,14 @@ class ROOM_PT_panel(bpy.types.Panel):
         row.scale_y = 1.5
         row.operator("room.draw", icon="MESH_CUBE", text="Draw Room  (Shift+R)")
 
+        # ── Quick Start hint (shown only when no rooms exist) ─────────────────
+        if not ROOM_OT_draw._room_list:
+            box = L.box()
+            col = box.column(align=True)
+            col.label(text="Getting started:", icon="INFO")
+            col.label(text="Press Shift+R or click above")
+            col.label(text="then click + drag to draw a room.")
+
         # ── Selected Room ─────────────────────────────────────────────────────
         _sel_obj = context.active_object
         if _sel_obj:
@@ -7533,6 +7719,13 @@ class ROOM_PT_panel(bpy.types.Panel):
                 box = L.box()
                 col = box.column(align=True)
                 col.label(text=f"Selected: {_sel_obj.name}", icon="MESH_CUBE")
+                # Room dimensions
+                _rx1 = _sel_reg.get('x1', 0.0); _rx2 = _sel_reg.get('x2', 0.0)
+                _ry1 = _sel_reg.get('y1', 0.0); _ry2 = _sel_reg.get('y2', 0.0)
+                _rw  = abs(_rx2 - _rx1);        _rd  = abs(_ry2 - _ry1)
+                _rh  = _sel_reg.get('h', s.wall_height)
+                col.label(text=f"{_rw*100:.0f} cm \u00d7 {_rd*100:.0f} cm \u00d7 {_rh*100:.0f} cm  (W\u00d7D\u00d7H)",
+                          icon="NONE")
                 col.separator()
                 _locked = _sel_reg.get('mesh_locked', False)
                 _save_row = col.row(align=True)
@@ -7549,9 +7742,8 @@ class ROOM_PT_panel(bpy.types.Panel):
                 op.lock    = False
                 op.rebuild = True
                 col.separator()
-                col.operator("room.recalculate_uv",
-                             text="Recalculate UV",
-                             icon="UV")
+                col.operator("room.recalculate_uv",    text="Recalculate UV",    icon="UV")
+                col.operator("room.recalculate_plinth", text="Recalculate Plinth", icon="MOD_SOLIDIFY")
 
         # ── Pivot + Organisation ──────────────────────────────────────────────
         L.prop(s, "pivot_mode", text="Pivot")
@@ -7562,172 +7754,200 @@ class ROOM_PT_panel(bpy.types.Panel):
 
         # ── Floors ────────────────────────────────────────────────────────────
         box = L.box()
-        col = box.column(align=True)
-        col.label(text="Floors:", icon="RENDERLAYERS")
-        col.prop(s, "z_foundation", text="Z Offset")
-        col.operator("room.add_floor", icon="ADD", text="Add Floor")
-        floors = context.scene.room_floors
-        active = context.scene.room_active_floor
-        if floors:
-            col.separator()
-            for i, fl in enumerate(floors):
-                row = col.row(align=True)
-                is_active = (i == active)
-                op = row.operator(
-                    "room.select_floor",
-                    text=f"{fl.name}  (z={fl.z_offset:.3f})",
-                    icon="LAYER_ACTIVE" if is_active else "LAYER_USED",
-                    depress=is_active,
-                )
-                op.floor_index = i
-                rem = row.operator("room.remove_floor", text="", icon="X")
-                rem.floor_index = i
-
-        # ── Wall Dimensions ───────────────────────────────────────────────────
-        box = L.box()
-        col = box.column(align=True)
-        col.label(text="Wall Dimensions:", icon="MOD_BUILD")
-        col.prop(s, "wall_height")
-        col.prop(s, "wall_thickness")
-        col.separator()
-        row = col.row(align=True)
-        row.prop(s, "snap_to_grid", toggle=True, icon="SNAP_GRID")
-        if s.snap_to_grid:
-            row.prop(s, "grid_snap_size", text="")
-
-        # ── Geometry ──────────────────────────────────────────────────────────
-        box = L.box()
-        col = box.column(align=True)
-        col.label(text="Geometry:", icon="MESH_GRID")
-        col.prop(s, "add_ceiling")
-        col.prop(s, "add_floor")
-        col.prop(s, "add_door")
-        col.prop(s, "add_architrave")
-        col.prop(s, "add_threshold")
-
-        # ── Trims ─────────────────────────────────────────────────────────────
-        box = L.box()
-        col = box.column(align=True)
-        col.label(text="Trims:", icon="MOD_SOLIDIFY")
-
-        col.label(text="Plinth:")
-        row = col.row(align=True)
-        row.prop(s, "add_plinth_bottom", toggle=True, icon="TRIA_UP_BAR")
-        row.prop(s, "add_plinth_top",    toggle=True, icon="TRIA_DOWN_BAR")
-        if s.add_plinth_bottom:
-            sub = col.column(align=True)
-            sub.label(text="Bottom:")
-            sub.prop(s, "plinth_bottom_height")
-            sub.prop(s, "plinth_bottom_thickness")
-        if s.add_plinth_top:
-            sub = col.column(align=True)
-            sub.label(text="Top:")
-            sub.prop(s, "plinth_top_height")
-            sub.prop(s, "plinth_top_thickness")
-
-        col.separator()
-        col.label(text="Architrave:")
-        row = col.row(align=True)
-        row.prop(s, "add_architrave", toggle=True, icon="MOD_SOLIDIFY")
-        if s.add_architrave:
-            sub = col.column(align=True)
-            sub.prop(s, "architrave_preset")
-            sub = col.column(align=True)
-            sub.enabled = (s.architrave_preset == 'custom')
-            sub.prop(s, "architrave_width")
-            sub.prop(s, "architrave_depth")
-            col.operator("room.save_arch_preset", icon="ADD", text="Save as Preset")
-            arch_presets = context.scene.room_arch_presets
-            arch_active  = context.scene.room_active_arch_preset
-            if arch_presets:
+        row = box.row()
+        row.prop(s, "show_floors",
+                 icon='TRIA_DOWN' if s.show_floors else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.label(text="Floors", icon="RENDERLAYERS")
+        if s.show_floors:
+            col = box.column(align=True)
+            col.prop(s, "z_foundation", text="Z Offset")
+            col.operator("room.add_floor", icon="ADD", text="Add Floor")
+            floors = context.scene.room_floors
+            active = context.scene.room_active_floor
+            if floors:
                 col.separator()
-                for i, ap in enumerate(arch_presets):
-                    is_active = (i == arch_active)
+                for i, fl in enumerate(floors):
                     row = col.row(align=True)
+                    is_active = (i == active)
                     op = row.operator(
-                        "room.select_arch_preset",
-                        text=f"{ap.name}  {ap.width*100:.0f}mm \u00d7 {ap.depth*10:.1f}mm",
+                        "room.select_floor",
+                        text=f"{fl.name}  (z={fl.z_offset:.3f})",
                         icon="LAYER_ACTIVE" if is_active else "LAYER_USED",
                         depress=is_active,
                     )
-                    op.preset_index = i
-                    rem = row.operator("room.remove_arch_preset", text="", icon="X")
-                    rem.preset_index = i
-                    if is_active:
-                        col.prop(ap, "name", text="Rename")
+                    op.floor_index = i
+                    rem = row.operator("room.remove_floor", text="", icon="X")
+                    rem.floor_index = i
 
-        # ── Threshold ─────────────────────────────────────────────────────────
-        col.separator()
-        col.label(text="Threshold:")
-        row = col.row(align=True)
-        row.prop(s, "add_threshold", toggle=True, icon="MESH_PLANE")
-        if s.add_threshold:
-            sub = col.column(align=True)
-            sub.prop(s, "threshold_height")
-            sub.prop(s, "threshold_depth")
-            sub.prop(s, "threshold_material", text="Material", icon="MATERIAL")
-            sub.operator("room.sync_thresholds", icon="FILE_REFRESH",
-                         text="Apply to All Doors")
+        # ── Wall Dimensions ───────────────────────────────────────────────────
+        box = L.box()
+        row = box.row()
+        row.prop(s, "show_wall_dims",
+                 icon='TRIA_DOWN' if s.show_wall_dims else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.label(text="Wall Dimensions", icon="MOD_BUILD")
+        if s.show_wall_dims:
+            col = box.column(align=True)
+            col.prop(s, "wall_height")
+            col.prop(s, "wall_thickness")
+            col.separator()
+            row = col.row(align=True)
+            row.prop(s, "snap_to_grid", toggle=True, icon="SNAP_GRID")
+            if s.snap_to_grid:
+                row.prop(s, "grid_snap_size", text="")
+
+        # ── Geometry ──────────────────────────────────────────────────────────
+        box = L.box()
+        row = box.row()
+        row.prop(s, "show_geometry",
+                 icon='TRIA_DOWN' if s.show_geometry else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.label(text="Geometry", icon="MESH_GRID")
+        if s.show_geometry:
+            col = box.column(align=True)
+            col.prop(s, "add_ceiling")
+            col.prop(s, "add_floor")
+            col.prop(s, "add_door")
+            col.prop(s, "add_architrave")
+            col.prop(s, "add_threshold")
+
+        # ── Trims ─────────────────────────────────────────────────────────────
+        box = L.box()
+        row = box.row()
+        row.prop(s, "show_trims",
+                 icon='TRIA_DOWN' if s.show_trims else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.label(text="Trims", icon="MOD_SOLIDIFY")
+        if s.show_trims:
+            col = box.column(align=True)
+            col.label(text="Plinth:")
+            row = col.row(align=True)
+            row.prop(s, "add_plinth_bottom", toggle=True, icon="TRIA_UP_BAR")
+            row.prop(s, "add_plinth_top",    toggle=True, icon="TRIA_DOWN_BAR")
+            if s.add_plinth_bottom:
+                sub = col.column(align=True)
+                sub.label(text="Bottom:")
+                sub.prop(s, "plinth_bottom_height")
+                sub.prop(s, "plinth_bottom_thickness")
+            if s.add_plinth_top:
+                sub = col.column(align=True)
+                sub.label(text="Top:")
+                sub.prop(s, "plinth_top_height")
+                sub.prop(s, "plinth_top_thickness")
+
+            col.separator()
+            col.label(text="Architrave:")
+            row = col.row(align=True)
+            row.prop(s, "add_architrave", toggle=True, icon="MOD_SOLIDIFY")
+            if s.add_architrave:
+                sub = col.column(align=True)
+                sub.prop(s, "architrave_preset")
+                sub = col.column(align=True)
+                sub.enabled = (s.architrave_preset == 'custom')
+                sub.prop(s, "architrave_width")
+                sub.prop(s, "architrave_depth")
+                col.operator("room.save_arch_preset", icon="ADD", text="Save as Preset")
+                arch_presets = context.scene.room_arch_presets
+                arch_active  = context.scene.room_active_arch_preset
+                if arch_presets:
+                    col.separator()
+                    for i, ap in enumerate(arch_presets):
+                        is_active = (i == arch_active)
+                        row = col.row(align=True)
+                        op = row.operator(
+                            "room.select_arch_preset",
+                            text=f"{ap.name}  {ap.width*100:.0f}mm \u00d7 {ap.depth*10:.1f}mm",
+                            icon="LAYER_ACTIVE" if is_active else "LAYER_USED",
+                            depress=is_active,
+                        )
+                        op.preset_index = i
+                        rem = row.operator("room.remove_arch_preset", text="", icon="X")
+                        rem.preset_index = i
+                        if is_active:
+                            col.prop(ap, "name", text="Rename")
+
+            col.separator()
+            col.label(text="Threshold:")
+            row = col.row(align=True)
+            row.prop(s, "add_threshold", toggle=True, icon="MESH_PLANE")
+            if s.add_threshold:
+                sub = col.column(align=True)
+                sub.prop(s, "threshold_height")
+                sub.prop(s, "threshold_depth")
+                sub.prop(s, "threshold_material", text="Material", icon="MATERIAL")
+                sub.operator("room.sync_thresholds", icon="FILE_REFRESH",
+                             text="Apply to All Doors")
 
         # ── Materials / Tiling ────────────────────────────────────────────────
         box = L.box()
-        col = box.column(align=True)
-        col.label(text="Materials  /  Tiling:", icon="MATERIAL")
-        row = col.row(align=True)
-        row.prop(s, "mat_apply_mode", expand=True)
-        col.separator()
-
-        col.label(text="Surfaces:")
-        for mat_attr, tile_attr, label in (
-            ("mat_walls",   "mat_walls_tiling",   "Walls"),
-            ("mat_floor",   "mat_floor_tiling",   "Floor"),
-            ("mat_ceiling", "mat_ceiling_tiling", "Ceiling"),
-        ):
+        row = box.row()
+        row.prop(s, "show_materials",
+                 icon='TRIA_DOWN' if s.show_materials else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.label(text="Materials / Tiling", icon="MATERIAL")
+        if s.show_materials:
+            col = box.column(align=True)
             row = col.row(align=True)
-            split = row.split(factor=0.65, align=True)
-            split.prop(s, mat_attr, text=label)
-            split.prop(s, tile_attr, text="")
+            row.prop(s, "mat_apply_mode", expand=True)
+            col.separator()
 
-        col.separator()
-        col.label(text="Openings:")
-        for mat_attr, tile_attr, label in (
-            ("mat_door_frame",   "mat_door_frame_tiling",   "Door (∅=Walls)"),
-            ("mat_window_frame", "mat_window_frame_tiling", "Win (∅=Walls)"),
-        ):
-            row = col.row(align=True)
-            split = row.split(factor=0.65, align=True)
-            split.prop(s, mat_attr, text=label)
-            split.prop(s, tile_attr, text="")
+            col.label(text="Surfaces:")
+            for mat_attr, tile_attr, label in (
+                ("mat_walls",   "mat_walls_tiling",   "Walls"),
+                ("mat_floor",   "mat_floor_tiling",   "Floor"),
+                ("mat_ceiling", "mat_ceiling_tiling", "Ceiling"),
+            ):
+                row = col.row(align=True)
+                split = row.split(factor=0.65, align=True)
+                split.prop(s, mat_attr, text=label)
+                split.prop(s, tile_attr, text="")
 
-        col.separator()
-        col.label(text="Trims:")
-        for mat_attr, tile_attr, label in (
-            ("mat_plinth_bottom", "mat_plinth_bottom_tiling", "Bot Plinth (∅=Walls)"),
-            ("mat_plinth_top",    "mat_plinth_top_tiling",    "Top Plinth (∅=Walls)"),
-            ("mat_architrave",    "mat_architrave_tiling",    "Architrave (∅=Walls)"),
-        ):
-            row = col.row(align=True)
-            split = row.split(factor=0.65, align=True)
-            split.prop(s, mat_attr, text=label)
-            split.prop(s, tile_attr, text="")
+            col.separator()
+            col.label(text="Openings:")
+            for mat_attr, tile_attr, label in (
+                ("mat_door_frame",   "mat_door_frame_tiling",   "Door (∅=Walls)"),
+                ("mat_window_frame", "mat_window_frame_tiling", "Win (∅=Walls)"),
+            ):
+                row = col.row(align=True)
+                split = row.split(factor=0.65, align=True)
+                split.prop(s, mat_attr, text=label)
+                split.prop(s, tile_attr, text="")
 
-        col.separator()
-        col.label(text="Stairs:")
-        for mat_attr, tile_attr, label in (
-            ("mat_stair",      "mat_stair_tiling",      "Sides"),
-            ("mat_stair_step", "mat_stair_step_tiling", "Treads"),
-        ):
-            row = col.row(align=True)
-            split = row.split(factor=0.65, align=True)
-            split.prop(s, mat_attr, text=label)
-            split.prop(s, tile_attr, text="")
+            col.separator()
+            col.label(text="Trims:")
+            for mat_attr, tile_attr, label in (
+                ("mat_plinth_bottom", "mat_plinth_bottom_tiling", "Bot Plinth (∅=Walls)"),
+                ("mat_plinth_top",    "mat_plinth_top_tiling",    "Top Plinth (∅=Walls)"),
+                ("mat_architrave",    "mat_architrave_tiling",    "Architrave (∅=Walls)"),
+            ):
+                row = col.row(align=True)
+                split = row.split(factor=0.65, align=True)
+                split.prop(s, mat_attr, text=label)
+                split.prop(s, tile_attr, text="")
+
+            col.separator()
+            col.label(text="Stairs:")
+            for mat_attr, tile_attr, label in (
+                ("mat_stair",      "mat_stair_tiling",      "Sides"),
+                ("mat_stair_step", "mat_stair_step_tiling", "Treads"),
+            ):
+                row = col.row(align=True)
+                split = row.split(factor=0.65, align=True)
+                split.prop(s, mat_attr, text=label)
+                split.prop(s, tile_attr, text="")
 
         # ── Utilities ─────────────────────────────────────────────────────────
         box = L.box()
-        col = box.column(align=True)
-        col.label(text="Utilities:", icon="TOOL_SETTINGS")
-        col.operator("room.clear_registry",  icon="X",              text="Reset Snap Registry")
-        col.operator("room.clear_overlays",  icon="GHOST_DISABLED", text="Clear Phantom Overlays")
+        row = box.row()
+        row.prop(s, "show_utilities",
+                 icon='TRIA_DOWN' if s.show_utilities else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.label(text="Utilities", icon="TOOL_SETTINGS")
+        if s.show_utilities:
+            col = box.column(align=True)
+            col.operator("room.clear_registry",  icon="X",              text="Reset Snap Registry")
+            col.operator("room.clear_overlays",  icon="GHOST_DISABLED", text="Clear Phantom Overlays")
 
 
 class ROOM_PT_door_panel(bpy.types.Panel):
@@ -8865,6 +9085,11 @@ def register():
         #     for all other objects Blender falls through to its default Delete behaviour)
         kmi7 = km.keymap_items.new("room.stair_delete", "DEL", "PRESS")
         ROOM_OT_draw._addon_kmaps.append((km, kmi7))
+
+    # Persistent edit-mode hint at bottom of viewport
+    _h = bpy.types.SpaceView3D.draw_handler_add(
+        _draw_room_hint_cb, (), 'WINDOW', 'POST_PIXEL')
+    _DRAW_HANDLES.add(_h)
 
     if _room_registry_cleanup not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_room_registry_cleanup)
