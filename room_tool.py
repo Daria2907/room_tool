@@ -62,6 +62,56 @@ class ROOM_PG_arch_preset(bpy.types.PropertyGroup):
     depth : bpy.props.FloatProperty(name="Depth", default=0.015, min=0.002, max=0.2, unit="LENGTH")
 
 
+class ROOM_PG_mat_preset(bpy.types.PropertyGroup):
+    """One saved material preset (name is the built-in PropertyGroup.name field).
+    Materials are stored as PointerProperty so renames are tracked automatically."""
+    mat_walls         : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_walls_tiling_x     : bpy.props.FloatProperty(default=1.0)
+    mat_walls_tiling_y     : bpy.props.FloatProperty(default=1.0)
+    mat_floor         : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_floor_tiling_x     : bpy.props.FloatProperty(default=1.0)
+    mat_floor_tiling_y     : bpy.props.FloatProperty(default=1.0)
+    mat_ceiling       : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_ceiling_tiling_x   : bpy.props.FloatProperty(default=1.0)
+    mat_ceiling_tiling_y   : bpy.props.FloatProperty(default=1.0)
+    mat_door_frame         : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_door_frame_tiling_x     : bpy.props.FloatProperty(default=1.0)
+    mat_door_frame_tiling_y     : bpy.props.FloatProperty(default=1.0)
+    mat_window_frame       : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_window_frame_tiling_x   : bpy.props.FloatProperty(default=1.0)
+    mat_window_frame_tiling_y   : bpy.props.FloatProperty(default=1.0)
+    mat_plinth_bottom      : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_plinth_bottom_tiling_x  : bpy.props.FloatProperty(default=1.0)
+    mat_plinth_bottom_tiling_y  : bpy.props.FloatProperty(default=1.0)
+    mat_plinth_top         : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_plinth_top_tiling_x     : bpy.props.FloatProperty(default=1.0)
+    mat_plinth_top_tiling_y     : bpy.props.FloatProperty(default=1.0)
+    mat_architrave         : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_architrave_tiling_x     : bpy.props.FloatProperty(default=1.0)
+    mat_architrave_tiling_y     : bpy.props.FloatProperty(default=1.0)
+    mat_stair              : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_stair_tiling_x          : bpy.props.FloatProperty(default=1.0)
+    mat_stair_tiling_y          : bpy.props.FloatProperty(default=1.0)
+    mat_stair_step         : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_stair_step_tiling_x     : bpy.props.FloatProperty(default=1.0)
+    mat_stair_step_tiling_y     : bpy.props.FloatProperty(default=1.0)
+
+
+# Ordered list of (mat_attr, tiling_x_attr, tiling_y_attr) — used by preset save/apply
+_PRESET_SURFACES = [
+    ("mat_walls",        "mat_walls_tiling_x",        "mat_walls_tiling_y"),
+    ("mat_floor",        "mat_floor_tiling_x",        "mat_floor_tiling_y"),
+    ("mat_ceiling",      "mat_ceiling_tiling_x",      "mat_ceiling_tiling_y"),
+    ("mat_door_frame",   "mat_door_frame_tiling_x",   "mat_door_frame_tiling_y"),
+    ("mat_window_frame", "mat_window_frame_tiling_x", "mat_window_frame_tiling_y"),
+    ("mat_plinth_bottom","mat_plinth_bottom_tiling_x","mat_plinth_bottom_tiling_y"),
+    ("mat_plinth_top",   "mat_plinth_top_tiling_x",   "mat_plinth_top_tiling_y"),
+    ("mat_architrave",   "mat_architrave_tiling_x",   "mat_architrave_tiling_y"),
+    ("mat_stair",        "mat_stair_tiling_x",        "mat_stair_tiling_y"),
+    ("mat_stair_step",   "mat_stair_step_tiling_x",   "mat_stair_step_tiling_y"),
+]
+
+
 class ROOM_PG_registry_entry(bpy.types.PropertyGroup):
     """One room's registry data persisted in the scene for addon-reload survival."""
     x1: bpy.props.FloatProperty()
@@ -87,28 +137,235 @@ class ROOM_PG_registry_entry(bpy.types.PropertyGroup):
     mesh_locked           : bpy.props.BoolProperty(default=False)
 
 
-def _cb_mat(self, context):
-    """PointerProperty update: re-apply materials — to all rooms or just the selected one."""
-    s = context.scene.room_settings
+def _update_arch_mat(reg, s):
+    """Update material on an existing arch object without rebuilding geometry."""
+    arch_obj = bpy.data.objects.get(reg.get("arch_obj_name", ""))
+    if arch_obj is None:
+        return
+    me = arch_obj.data
+    while me.materials:
+        me.materials.pop()
+    mat = getattr(s, 'mat_architrave', None) or getattr(s, 'mat_walls', None)
+    if mat:
+        me.materials.append(mat)
+
+
+def _update_arch_uv(reg, s):
+    """Recompute UV on an existing arch object without rebuilding geometry."""
+    arch_obj = bpy.data.objects.get(reg.get("arch_obj_name", ""))
+    if arch_obj is None:
+        return
+    me = arch_obj.data
+    while me.uv_layers:
+        me.uv_layers.remove(me.uv_layers[0])
+    _apply_cube_uv_to_mesh(me, s, obj=arch_obj)
+
+
+# Flag set while applying a preset so material/tiling callbacks skip redundant rebuilds.
+_preset_loading: bool = False
+
+
+def _sync_settings_to_active_preset(context):
+    """Write current room_settings materials + tiling back into the active preset."""
+    presets = getattr(context.scene, 'room_mat_presets', None)
+    if presets is None or len(presets) == 0:
+        return
+    idx = getattr(context.scene, 'room_mat_preset_active', -1)
+    if 0 <= idx < len(presets):
+        s = context.scene.room_settings
+        preset = presets[idx]
+        for mat_attr, tx, ty in _PRESET_SURFACES:
+            setattr(preset, mat_attr, getattr(s, mat_attr, None))
+            setattr(preset, tx, getattr(s, tx, 1.0))
+            setattr(preset, ty, getattr(s, ty, 1.0))
+
+
+def _apply_mat_preset_by_idx(context, idx):
+    """Load materials from preset *idx* into room_settings and apply to room meshes."""
+    global _preset_loading
+    presets = getattr(context.scene, 'room_mat_presets', None)
+    if presets is None or not (0 <= idx < len(presets)):
+        return
+    s      = context.scene.room_settings
+    preset = presets[idx]
+
+    _preset_loading = True
+    try:
+        for mat_attr, tx, ty in _PRESET_SURFACES:
+            setattr(s, mat_attr, getattr(preset, mat_attr, None))
+            setattr(s, tx, getattr(preset, tx, 1.0))
+            setattr(s, ty, getattr(preset, ty, 1.0))
+    finally:
+        _preset_loading = False
+
+    # Apply materials and UVs to rooms
     if getattr(s, 'mat_apply_mode', 'ALL') == 'SELECTED' and context.active_object:
         reg = next((r for r in ROOM_OT_draw._room_list
                     if r.get('obj_name') == context.active_object.name), None)
         if reg is not None:
             _apply_materials_one_room(reg, s)
+            _update_arch_mat(reg, s)
+            _apply_uvs_one_room(reg, s)
+            _update_arch_uv(reg, s)
             return
     _apply_materials_all_rooms(s)
+    _apply_uvs_all_rooms(s)
+    for reg in ROOM_OT_draw._room_list:
+        _update_arch_mat(reg, s)
+        _update_arch_uv(reg, s)
 
 
-def _cb_tiling(self, context):
-    """FloatProperty update: recompute UV — on all rooms or just the selected one."""
+# Track previous preset index so we can save the old preset before switching
+_prev_mat_preset_idx: list = [0]
+
+
+def _cb_mat_preset_active(self, context):
+    """Called when the user selects a different preset in the UIList.
+    Saves current materials to the *previous* preset, then loads the
+    new preset into room_settings UI slots — but does NOT apply to room
+    meshes (that only happens when the user clicks Apply)."""
+    global _preset_loading
+    if _preset_loading:
+        return
+    presets = getattr(context.scene, 'room_mat_presets', None)
+    if presets is None or len(presets) == 0:
+        return
+    new_idx = context.scene.room_mat_preset_active
+    old_idx = _prev_mat_preset_idx[0]
+
+    # Save current room_settings into the OLD preset before switching
+    if 0 <= old_idx < len(presets) and old_idx != new_idx:
+        s = context.scene.room_settings
+        old_preset = presets[old_idx]
+        for mat_attr, tx, ty in _PRESET_SURFACES:
+            setattr(old_preset, mat_attr, getattr(s, mat_attr, None))
+            setattr(old_preset, tx, getattr(s, tx, 1.0))
+            setattr(old_preset, ty, getattr(s, ty, 1.0))
+
+    # Load the NEW preset into room_settings UI slots only (no mesh apply)
+    if 0 <= new_idx < len(presets):
+        s      = context.scene.room_settings
+        preset = presets[new_idx]
+        _preset_loading = True
+        try:
+            for mat_attr, tx, ty in _PRESET_SURFACES:
+                setattr(s, mat_attr, getattr(preset, mat_attr, None))
+        finally:
+            _preset_loading = False
+
+    _prev_mat_preset_idx[0] = new_idx
+
+
+_in_mat_sync = False
+
+def _cb_mat(self, context):
+    """PointerProperty update: re-apply materials — to all rooms or just the selected one."""
+    global _in_mat_sync
+    if _preset_loading:
+        return
     s = context.scene.room_settings
+    # Propagate unified materials
+    if not _in_mat_sync:
+        _in_mat_sync = True
+        try:
+            if getattr(s, 'trim_single_mat', False):
+                s.mat_plinth_top = s.mat_plinth_bottom
+                s.mat_architrave = s.mat_plinth_bottom
+            if getattr(s, 'opening_single_mat', False):
+                s.mat_window_frame = s.mat_door_frame
+        finally:
+            _in_mat_sync = False
+    else:
+        return
     if getattr(s, 'mat_apply_mode', 'ALL') == 'SELECTED' and context.active_object:
         reg = next((r for r in ROOM_OT_draw._room_list
                     if r.get('obj_name') == context.active_object.name), None)
         if reg is not None:
-            _apply_uvs_one_room(reg, s)
+            _apply_materials_one_room(reg, s)
+            _update_arch_mat(reg, s)
             return
-    _apply_uvs_all_rooms(s)
+    _apply_materials_all_rooms(s)
+    for reg in ROOM_OT_draw._room_list:
+        _update_arch_mat(reg, s)
+
+
+def _cb_tiling(self, context):
+    """FloatProperty update: recompute UV — on all rooms or just the selected one."""
+    global _in_mat_sync
+    if _preset_loading:
+        return
+    # Propagate unified tiling
+    if not _in_mat_sync:
+        _in_mat_sync = True
+        try:
+            s = context.scene.room_settings
+            if getattr(s, 'trim_single_mat', False):
+                s.mat_plinth_top_tiling_x = s.mat_plinth_bottom_tiling_x
+                s.mat_plinth_top_tiling_y = s.mat_plinth_bottom_tiling_y
+                s.mat_plinth_top_rotation = s.mat_plinth_bottom_rotation
+                s.mat_architrave_tiling_x = s.mat_plinth_bottom_tiling_x
+                s.mat_architrave_tiling_y = s.mat_plinth_bottom_tiling_y
+                s.mat_architrave_rotation = s.mat_plinth_bottom_rotation
+            if getattr(s, 'opening_single_mat', False):
+                s.mat_window_frame_tiling_x = s.mat_door_frame_tiling_x
+                s.mat_window_frame_tiling_y = s.mat_door_frame_tiling_y
+                s.mat_window_frame_rotation = s.mat_door_frame_rotation
+        finally:
+            _in_mat_sync = False
+    else:
+        return
+    try:
+        s = context.scene.room_settings
+        if getattr(s, 'mat_apply_mode', 'ALL') == 'SELECTED' and context.active_object:
+            reg = next((r for r in ROOM_OT_draw._room_list
+                        if r.get('obj_name') == context.active_object.name), None)
+            if reg is not None:
+                _apply_uvs_one_room(reg, s)
+                _update_arch_uv(reg, s)
+                return
+        _apply_uvs_all_rooms(s)
+        for reg in ROOM_OT_draw._room_list:
+            _update_arch_uv(reg, s)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+def _cb_trim_single(self, context):
+    """Sync all trim materials when unified mode is toggled on."""
+    global _in_mat_sync
+    s = context.scene.room_settings
+    if s.trim_single_mat and not _in_mat_sync:
+        _in_mat_sync = True
+        try:
+            m = s.mat_plinth_bottom or s.mat_plinth_top or s.mat_architrave
+            s.mat_plinth_bottom = m; s.mat_plinth_top = m; s.mat_architrave = m
+            s.mat_plinth_top_tiling_x = s.mat_plinth_bottom_tiling_x
+            s.mat_plinth_top_tiling_y = s.mat_plinth_bottom_tiling_y
+            s.mat_plinth_top_rotation = s.mat_plinth_bottom_rotation
+            s.mat_architrave_tiling_x = s.mat_plinth_bottom_tiling_x
+            s.mat_architrave_tiling_y = s.mat_plinth_bottom_tiling_y
+            s.mat_architrave_rotation = s.mat_plinth_bottom_rotation
+        finally:
+            _in_mat_sync = False
+        _cb_mat(self, context)
+
+
+def _cb_opening_single(self, context):
+    """Sync all opening materials when unified mode is toggled on."""
+    global _in_mat_sync
+    s = context.scene.room_settings
+    if s.opening_single_mat and not _in_mat_sync:
+        _in_mat_sync = True
+        try:
+            m = s.mat_door_frame or s.mat_window_frame
+            s.mat_door_frame = m; s.mat_window_frame = m
+            s.mat_window_frame_tiling_x = s.mat_door_frame_tiling_x
+            s.mat_window_frame_tiling_y = s.mat_door_frame_tiling_y
+            s.mat_window_frame_rotation = s.mat_door_frame_rotation
+        finally:
+            _in_mat_sync = False
+        _cb_mat(self, context)
 
 
 def _cb_stair_mat(self, context):
@@ -118,19 +375,35 @@ def _cb_stair_mat(self, context):
 
 def _cb_stair_tiling(self, context):
     """FloatProperty update: recompute UV on all existing stairs."""
-    _apply_stair_uvs_all(context.scene.room_settings)
+    try:
+        _apply_stair_uvs_all(context.scene.room_settings)
+    except Exception:
+        import traceback
+        traceback.print_exc()
 
 
 def _cb_rebuild(self, context):
-    """BoolProperty/FloatProperty update: full geometry rebuild on all existing rooms."""
+    """BoolProperty/FloatProperty update: rebuild room geometry, respecting trim_apply_mode."""
     s = context.scene.room_settings
+    if getattr(s, 'trim_apply_mode', 'ALL') == 'SELECTED' and context.active_object:
+        reg = next((r for r in ROOM_OT_draw._room_list
+                    if r.get('obj_name') == context.active_object.name), None)
+        if reg is not None:
+            _rebuild_room_mesh(reg, s)
+            return
     for reg in ROOM_OT_draw._room_list:
         _rebuild_room_mesh(reg, s)
 
 
 def _cb_threshold(self, context):
     """Update callback: sync threshold strips across all rooms when settings change."""
-    _sync_all_thresholds(context.scene.room_settings)
+    s = context.scene.room_settings
+    for reg in ROOM_OT_draw._room_list:
+        obj = bpy.data.objects.get(reg.get("obj_name", ""))
+        if obj is None:
+            continue
+        col = next(iter(obj.users_collection), None)
+        _sync_thresholds(reg, col, s)
 
 
 def _cb_stair_hole(self, context):
@@ -158,8 +431,16 @@ def _cb_stair_hole(self, context):
 
 def _cb_rebuild_plinth(self, context):
     """Update callback for add_plinth_bottom / add_plinth_top scene toggles.
-    Syncs the per-room flags to the new scene value then rebuilds all rooms."""
+    Syncs per-room plinth flags and rebuilds, respecting trim_apply_mode."""
     s = context.scene.room_settings
+    if getattr(s, 'trim_apply_mode', 'ALL') == 'SELECTED' and context.active_object:
+        reg = next((r for r in ROOM_OT_draw._room_list
+                    if r.get('obj_name') == context.active_object.name), None)
+        if reg is not None:
+            reg['plinth_bottom_enabled'] = s.add_plinth_bottom
+            reg['plinth_top_enabled']    = s.add_plinth_top
+            _rebuild_room_mesh(reg, s)
+            return
     for reg in ROOM_OT_draw._room_list:
         reg['plinth_bottom_enabled'] = s.add_plinth_bottom
         reg['plinth_top_enabled']    = s.add_plinth_top
@@ -267,6 +548,13 @@ def _cb_stair_slab(self, context):
         print(f"[room_tool] _cb_stair_slab: sd not found for '{obj.name}' "
               f"(list has {len(ROOM_OT_draw._stair_list)} entries)")
         return
+    # Sync sd from the object's custom property so any undo that restored the
+    # mesh to a previous position is reflected before we rebuild.
+    try:
+        saved = json.loads(obj["room_stair"])
+        sd.update(saved)
+    except Exception:
+        pass
     s = context.scene.room_settings
     sd["open_under"] = s.stair_open_under
     sd["slab_thick"] = s.stair_slab_thick
@@ -331,6 +619,15 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         name="Window Height", default=1.2, min=0.1, max=15.0, unit="LENGTH")
     window_v_offset: bpy.props.FloatProperty(
         name="Sill Height",   default=0.9, min=0.0, max=10.0, unit="LENGTH")
+    window_v_mode : bpy.props.EnumProperty(
+        name="Sill Mode",
+        description="How sill height is set when placing windows",
+        items=[
+            ('PRESET', "Preset / Fixed", "Use the sill height from the preset or the Sill Height setting above"),
+            ('CUSTOM', "Custom",         "After clicking position, drag up/down to place the window vertically"),
+        ],
+        default='PRESET',
+    )
     window_array_count : bpy.props.IntProperty(
         name="Count",         default=1, min=1, max=20)
     window_array_gap   : bpy.props.FloatProperty(
@@ -344,16 +641,43 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         ],
         default='ALL',
     )
+    trim_apply_mode  : bpy.props.EnumProperty(
+        name="Apply To",
+        description="Whether trim/plinth geometry changes apply to all rooms or only the active selected room",
+        items=[
+            ('ALL',      "All Rooms",      "Apply trim changes to all rooms"),
+            ('SELECTED', "Selected Room",  "Apply trim changes only to the currently selected room"),
+        ],
+        default='ALL',
+    )
+    opening_single_mat : bpy.props.BoolProperty(
+        name="Unified Openings",
+        description="Use the same material for all opening frames (doors + windows)",
+        default=False, update=_cb_opening_single)
+    trim_single_mat : bpy.props.BoolProperty(
+        name="Unified Trims",
+        description="Use the same material for all trims (plinths + architrave)",
+        default=False, update=_cb_trim_single)
     mat_walls        : bpy.props.PointerProperty(type=bpy.types.Material, name="Walls",           update=_cb_mat)
-    mat_walls_tiling : bpy.props.FloatProperty(name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
-    mat_floor        : bpy.props.PointerProperty(type=bpy.types.Material, name="Floor",           update=_cb_mat)
-    mat_floor_tiling : bpy.props.FloatProperty(name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
-    mat_ceiling      : bpy.props.PointerProperty(type=bpy.types.Material, name="Ceiling",         update=_cb_mat)
-    mat_ceiling_tiling      : bpy.props.FloatProperty(name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
-    mat_door_frame          : bpy.props.PointerProperty(type=bpy.types.Material, name="Door Frames",   update=_cb_mat)
-    mat_door_frame_tiling   : bpy.props.FloatProperty(name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
-    mat_window_frame        : bpy.props.PointerProperty(type=bpy.types.Material, name="Window Frames", update=_cb_mat)
-    mat_window_frame_tiling : bpy.props.FloatProperty(name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_walls_tiling_x   : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_walls_tiling_y   : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_walls_rotation   : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_tiling)
+    mat_floor          : bpy.props.PointerProperty(type=bpy.types.Material, name="Floor",           update=_cb_mat)
+    mat_floor_tiling_x   : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_floor_tiling_y   : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_floor_rotation   : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_tiling)
+    mat_ceiling        : bpy.props.PointerProperty(type=bpy.types.Material, name="Ceiling",         update=_cb_mat)
+    mat_ceiling_tiling_x      : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_ceiling_tiling_y      : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_ceiling_rotation      : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_tiling)
+    mat_door_frame            : bpy.props.PointerProperty(type=bpy.types.Material, name="Door Frames",   update=_cb_mat)
+    mat_door_frame_tiling_x   : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_door_frame_tiling_y   : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_door_frame_rotation   : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_tiling)
+    mat_window_frame          : bpy.props.PointerProperty(type=bpy.types.Material, name="Window Frames", update=_cb_mat)
+    mat_window_frame_tiling_x : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_window_frame_tiling_y : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_window_frame_rotation : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_tiling)
     add_plinth_bottom : bpy.props.BoolProperty(
         name="Bottom Plinth",
         description="Add a skirting board / baseboard along the bottom of the walls",
@@ -368,16 +692,20 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
     plinth_bottom_thickness : bpy.props.FloatProperty(
         name="Thickness", default=0.02, min=0.002, max=0.5, unit="LENGTH",
         description="How far the bottom plinth protrudes from the wall surface", update=_cb_rebuild)
-    mat_plinth_bottom        : bpy.props.PointerProperty(type=bpy.types.Material, name="Bot Plinth", update=_cb_mat)
-    mat_plinth_bottom_tiling : bpy.props.FloatProperty(name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_plinth_bottom          : bpy.props.PointerProperty(type=bpy.types.Material, name="Bot Plinth", update=_cb_mat)
+    mat_plinth_bottom_tiling_x : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_plinth_bottom_tiling_y : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_plinth_bottom_rotation : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_tiling)
     plinth_top_height : bpy.props.FloatProperty(
         name="Height", default=0.1, min=0.005, max=2.0, unit="LENGTH",
         description="Height of the top plinth strip", update=_cb_rebuild)
     plinth_top_thickness : bpy.props.FloatProperty(
         name="Thickness", default=0.02, min=0.002, max=0.5, unit="LENGTH",
         description="How far the top plinth protrudes from the wall surface", update=_cb_rebuild)
-    mat_plinth_top        : bpy.props.PointerProperty(type=bpy.types.Material, name="Top Plinth", update=_cb_mat)
-    mat_plinth_top_tiling : bpy.props.FloatProperty(name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_plinth_top          : bpy.props.PointerProperty(type=bpy.types.Material, name="Top Plinth", update=_cb_mat)
+    mat_plinth_top_tiling_x : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_plinth_top_tiling_y : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_plinth_top_rotation : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_tiling)
     add_architrave : bpy.props.BoolProperty(
         name="Architrave",
         description="Add extruded door architrave (3-sided frame around each door opening)",
@@ -401,8 +729,10 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         name="Depth", default=0.015, min=0.002, max=0.2, unit='LENGTH',
         description="How far the architrave protrudes from the wall surface",
         update=_cb_rebuild)
-    mat_architrave        : bpy.props.PointerProperty(type=bpy.types.Material, name="Architrave", update=_cb_mat)
-    mat_architrave_tiling : bpy.props.FloatProperty(name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_architrave          : bpy.props.PointerProperty(type=bpy.types.Material, name="Architrave", update=_cb_mat)
+    mat_architrave_tiling_x : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_architrave_tiling_y : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_tiling)
+    mat_architrave_rotation : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_tiling)
     snap_to_grid : bpy.props.BoolProperty(
         name="Snap to Grid",
         description="Snap room corners to the configured grid step while drawing "
@@ -447,12 +777,14 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         default=1.0, min=0.5, max=1.0, update=_cb_stair_hole)
     mat_stair         : bpy.props.PointerProperty(type=bpy.types.Material, name="Stairs",
         update=_cb_stair_mat)
-    mat_stair_tiling  : bpy.props.FloatProperty(
-        name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
+    mat_stair_tiling_x    : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
+    mat_stair_tiling_y    : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
+    mat_stair_rotation    : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_stair_tiling)
     mat_stair_step        : bpy.props.PointerProperty(type=bpy.types.Material, name="Stair Steps",
         update=_cb_stair_mat)
-    mat_stair_step_tiling : bpy.props.FloatProperty(
-        name="Tiling", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
+    mat_stair_step_tiling_x  : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
+    mat_stair_step_tiling_y  : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
+    mat_stair_step_rotation  : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_stair_tiling)
     stair_apply_dir    : bpy.props.EnumProperty(
         name="Direction",
         items=[('LEFT','Left',''),('RIGHT','Right','')],
@@ -484,6 +816,9 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
         name="Material",
         description="Material applied to all threshold strip objects",
         update=_cb_threshold)
+    threshold_tiling_x : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_threshold)
+    threshold_tiling_y : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_threshold)
+    threshold_rotation : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_threshold)
     # ── Panel section collapse state ──────────────────────────────────────────
     show_wall_dims  : bpy.props.BoolProperty(name="Wall Dimensions",  default=True)
     show_geometry   : bpy.props.BoolProperty(name="Geometry",         default=True)
@@ -491,6 +826,13 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
     show_materials  : bpy.props.BoolProperty(name="Materials / Tiling", default=False)
     show_floors     : bpy.props.BoolProperty(name="Floors",           default=False)
     show_utilities  : bpy.props.BoolProperty(name="Utilities",        default=False)
+    show_select     : bpy.props.BoolProperty(name="Select",           default=False)
+    # ── Dimensions overlay ────────────────────────────────────────────────────
+    show_dimensions : bpy.props.BoolProperty(name="Dimensions",       default=False)
+    dim_rooms       : bpy.props.BoolProperty(name="Room Dimensions",  default=True,
+        description="Show width, depth and height annotations for each room")
+    dim_openings    : bpy.props.BoolProperty(name="Opening Labels",   default=True,
+        description="Show W×H label on each door and window opening")
     # ── Collection / hierarchy ────────────────────────────────────────────────
     use_hierarchy  : bpy.props.BoolProperty(
         name="Use Collections", default=True,
@@ -556,6 +898,7 @@ _CAT_PLINTH_TOP    = 6
 _CAT_STAIR         = 7
 _CAT_ARCHITRAVE    = 8
 _CAT_STAIR_STEP    = 9
+_CAT_THRESHOLD     = 10   # virtual — threshold is a separate mesh, not a room face category
 _CAT_NAMES = ('walls', 'floor', 'ceiling', 'door_frames', 'window_frames', 'plinth_bottom', 'plinth_top', 'stair', 'architrave', 'stair_step')
 
 def _face4(bm, v0, v1, v2, v3):
@@ -718,7 +1061,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
     # UV is applied after pivot shift via _apply_cube_uv_to_mesh (uses local coords)
     cat_layer   = bm.faces.layers.int.new("room_cat")
     _cur_cat    = [_CAT_WALL]
-    _cur_tiling = [s.mat_walls_tiling]   # kept for compatibility; UV handled post-pivot
+    _cur_tiling = [s.mat_walls_tiling_x]   # kept for compatibility; UV handled post-pivot
     def _f4(v0, v1, v2, v3):
         face = bm.faces.new([bm.verts.new(co) for co in (v0, v1, v2, v3)])
         face[cat_layer] = _cur_cat[0]
@@ -745,7 +1088,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
         segs_s = _wall_door_segs('S', x1, x2, x2 - x1)
         if segs_s:
             _cur_cat[0] = _CAT_WALL
-            _cur_tiling[0] = s.mat_walls_tiling
+            _cur_tiling[0] = s.mat_walls_tiling_x
             strip_iter = list(_gen_strips(segs_s))
             lo_x = x1
             for idx, (_, xb, levels) in enumerate(strip_iter):
@@ -757,25 +1100,25 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 if idx < len(segs_s):
                     lo_x = segs_s[idx][1]
             _cur_cat[0] = _CAT_DOOR_FRAME
-            _cur_tiling[0] = s.mat_door_frame_tiling
+            _cur_tiling[0] = s.mat_door_frame_tiling_x
             for j, (dl_i, dr_i, dh_i) in enumerate(segs_s):
                 lev_l, lev_r = _jamb_extra_levels(segs_s, j)
-                _cur_cat[0] = _CAT_WALL; _cur_tiling[0] = s.mat_walls_tiling
+                _cur_cat[0] = _CAT_WALL; _cur_tiling[0] = s.mat_walls_tiling_x
                 _f4((dr_i,y1,z+dh_i),(dl_i,y1,z+dh_i),(dl_i,y1,zt),(dr_i,y1,zt))
-                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling
+                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling_x
                 ll = sorted([z] + lev_l + [z + dh_i])
                 for k in range(len(ll) - 1):
-                    _f4((dl_i,y1,ll[k]),(dl_i,y1-fd,ll[k]),(dl_i,y1-fd,ll[k+1]),(dl_i,y1,ll[k+1]))
+                    _f4((dl_i,y1,ll[k+1]),(dl_i,y1-fd,ll[k+1]),(dl_i,y1-fd,ll[k]),(dl_i,y1,ll[k]))  # left jamb (+X normal)
                 rl = sorted([z] + lev_r + [z + dh_i])
                 for k in range(len(rl) - 1):
-                    _f4((dr_i,y1-fd,rl[k]),(dr_i,y1,rl[k]),(dr_i,y1,rl[k+1]),(dr_i,y1-fd,rl[k+1]))
+                    _f4((dr_i,y1-fd,rl[k+1]),(dr_i,y1,rl[k+1]),(dr_i,y1,rl[k]),(dr_i,y1-fd,rl[k]))  # right jamb (-X normal)
                 _f4((dr_i,y1,z+dh_i),(dl_i,y1,z+dh_i),(dl_i,y1-fd,z+dh_i),(dr_i,y1-fd,z+dh_i))
-                _cur_cat[0] = _CAT_FLOOR; _cur_tiling[0] = s.mat_floor_tiling
+                _cur_cat[0] = _CAT_FLOOR; _cur_tiling[0] = s.mat_floor_tiling_x
                 _f4((dl_i,y1-fd,z),(dr_i,y1-fd,z),(dr_i,y1,z),(dl_i,y1,z))
-                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling
+                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling_x
         else:
             _cur_cat[0] = _CAT_WALL
-            _cur_tiling[0] = s.mat_walls_tiling
+            _cur_tiling[0] = s.mat_walls_tiling_x
             if _ex:
                 xs = [x1] + _ex + [x2]
                 for i in range(len(xs) - 1):
@@ -785,7 +1128,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 _face_with_holes(_emit_s, x1, x2, z,              z+_dh_fallback, _s_holes)
                 _face_with_holes(_emit_s, x1, x2, z+_dh_fallback, zt,             _s_holes)
     _cur_cat[0] = _CAT_WIN_FRAME
-    _cur_tiling[0] = s.mat_window_frame_tiling
+    _cur_tiling[0] = s.mat_window_frame_tiling_x
     for (wl, wr, wz_lo, wz_hi) in _wall_win_segs('S', x1, x2):
         _f4((wl,y1,wz_lo),(wl,y1,wz_hi),(wl,y1-fd,wz_hi),(wl,y1-fd,wz_lo))  # left jamb
         _f4((wr,y1-fd,wz_lo),(wr,y1-fd,wz_hi),(wr,y1,wz_hi),(wr,y1,wz_lo))  # right jamb
@@ -797,7 +1140,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
         segs_n = _wall_door_segs('N', x1, x2, x2 - x1)
         if segs_n:
             _cur_cat[0] = _CAT_WALL
-            _cur_tiling[0] = s.mat_walls_tiling
+            _cur_tiling[0] = s.mat_walls_tiling_x
             lo_x = x1
             for idx, (_, xb, levels) in enumerate(list(_gen_strips(segs_n))):
                 hi_x = segs_n[idx][0] if idx < len(segs_n) else x2
@@ -808,25 +1151,25 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 if idx < len(segs_n):
                     lo_x = segs_n[idx][1]
             _cur_cat[0] = _CAT_DOOR_FRAME
-            _cur_tiling[0] = s.mat_door_frame_tiling
+            _cur_tiling[0] = s.mat_door_frame_tiling_x
             for j, (dl_i, dr_i, dh_i) in enumerate(segs_n):
                 lev_l, lev_r = _jamb_extra_levels(segs_n, j)
-                _cur_cat[0] = _CAT_WALL; _cur_tiling[0] = s.mat_walls_tiling
+                _cur_cat[0] = _CAT_WALL; _cur_tiling[0] = s.mat_walls_tiling_x
                 _f4((dl_i,y2,z+dh_i),(dr_i,y2,z+dh_i),(dr_i,y2,zt),(dl_i,y2,zt))
-                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling
+                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling_x
                 ll = sorted([z] + lev_l + [z + dh_i])
                 for k in range(len(ll) - 1):
-                    _f4((dl_i,y2+fd,ll[k]),(dl_i,y2,ll[k]),(dl_i,y2,ll[k+1]),(dl_i,y2+fd,ll[k+1]))
+                    _f4((dl_i,y2+fd,ll[k+1]),(dl_i,y2,ll[k+1]),(dl_i,y2,ll[k]),(dl_i,y2+fd,ll[k]))  # left jamb (+X normal)
                 rl = sorted([z] + lev_r + [z + dh_i])
                 for k in range(len(rl) - 1):
-                    _f4((dr_i,y2,rl[k]),(dr_i,y2+fd,rl[k]),(dr_i,y2+fd,rl[k+1]),(dr_i,y2,rl[k+1]))
+                    _f4((dr_i,y2,rl[k+1]),(dr_i,y2+fd,rl[k+1]),(dr_i,y2+fd,rl[k]),(dr_i,y2,rl[k]))  # right jamb (-X normal)
                 _f4((dl_i,y2,z+dh_i),(dr_i,y2,z+dh_i),(dr_i,y2+fd,z+dh_i),(dl_i,y2+fd,z+dh_i))
-                _cur_cat[0] = _CAT_FLOOR; _cur_tiling[0] = s.mat_floor_tiling
+                _cur_cat[0] = _CAT_FLOOR; _cur_tiling[0] = s.mat_floor_tiling_x
                 _f4((dl_i,y2,z),(dr_i,y2,z),(dr_i,y2+fd,z),(dl_i,y2+fd,z))
-                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling
+                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling_x
         else:
             _cur_cat[0] = _CAT_WALL
-            _cur_tiling[0] = s.mat_walls_tiling
+            _cur_tiling[0] = s.mat_walls_tiling_x
             if _ex:
                 xs = [x1] + _ex + [x2]
                 for i in range(len(xs) - 1):
@@ -836,7 +1179,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 _face_with_holes(_emit_n, x1, x2, z,              z+_dh_fallback, _n_holes)
                 _face_with_holes(_emit_n, x1, x2, z+_dh_fallback, zt,             _n_holes)
     _cur_cat[0] = _CAT_WIN_FRAME
-    _cur_tiling[0] = s.mat_window_frame_tiling
+    _cur_tiling[0] = s.mat_window_frame_tiling_x
     for (wl, wr, wz_lo, wz_hi) in _wall_win_segs('N', x1, x2):
         _f4((wl,y2+fd,wz_lo),(wl,y2+fd,wz_hi),(wl,y2,wz_hi),(wl,y2,wz_lo))  # left jamb
         _f4((wr,y2,wz_lo),(wr,y2,wz_hi),(wr,y2+fd,wz_hi),(wr,y2+fd,wz_lo))  # right jamb
@@ -848,7 +1191,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
         segs_w = _wall_door_segs('W', y1, y2, y2 - y1)
         if segs_w:
             _cur_cat[0] = _CAT_WALL
-            _cur_tiling[0] = s.mat_walls_tiling
+            _cur_tiling[0] = s.mat_walls_tiling_x
             lo_y = y1
             for idx, (_, yb, levels) in enumerate(list(_gen_strips(segs_w))):
                 hi_y = segs_w[idx][0] if idx < len(segs_w) else y2
@@ -859,12 +1202,12 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 if idx < len(segs_w):
                     lo_y = segs_w[idx][1]
             _cur_cat[0] = _CAT_DOOR_FRAME
-            _cur_tiling[0] = s.mat_door_frame_tiling
+            _cur_tiling[0] = s.mat_door_frame_tiling_x
             for j, (db_i, df_i, dh_i) in enumerate(segs_w):
                 lev_l, lev_r = _jamb_extra_levels(segs_w, j)
-                _cur_cat[0] = _CAT_WALL; _cur_tiling[0] = s.mat_walls_tiling
+                _cur_cat[0] = _CAT_WALL; _cur_tiling[0] = s.mat_walls_tiling_x
                 _f4((x1,db_i,z+dh_i),(x1,df_i,z+dh_i),(x1,df_i,zt),(x1,db_i,zt))
-                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling
+                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling_x
                 ll = sorted([z] + lev_l + [z + dh_i])
                 for k in range(len(ll) - 1):
                     _f4((x1,db_i,ll[k]),(x1-fd,db_i,ll[k]),(x1-fd,db_i,ll[k+1]),(x1,db_i,ll[k+1]))
@@ -872,12 +1215,12 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 for k in range(len(rl) - 1):
                     _f4((x1-fd,df_i,rl[k]),(x1,df_i,rl[k]),(x1,df_i,rl[k+1]),(x1-fd,df_i,rl[k+1]))
                 _f4((x1,db_i,z+dh_i),(x1-fd,db_i,z+dh_i),(x1-fd,df_i,z+dh_i),(x1,df_i,z+dh_i))
-                _cur_cat[0] = _CAT_FLOOR; _cur_tiling[0] = s.mat_floor_tiling
+                _cur_cat[0] = _CAT_FLOOR; _cur_tiling[0] = s.mat_floor_tiling_x
                 _f4((x1-fd,db_i,z),(x1,db_i,z),(x1,df_i,z),(x1-fd,df_i,z))
-                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling
+                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling_x
         else:
             _cur_cat[0] = _CAT_WALL
-            _cur_tiling[0] = s.mat_walls_tiling
+            _cur_tiling[0] = s.mat_walls_tiling_x
             if _ey:
                 ys = [y1] + _ey + [y2]
                 for i in range(len(ys) - 1):
@@ -887,7 +1230,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 _face_with_holes(_emit_w, y1, y2, z,              z+_dh_fallback, _w_holes)
                 _face_with_holes(_emit_w, y1, y2, z+_dh_fallback, zt,             _w_holes)
     _cur_cat[0] = _CAT_WIN_FRAME
-    _cur_tiling[0] = s.mat_window_frame_tiling
+    _cur_tiling[0] = s.mat_window_frame_tiling_x
     for (wb, wf, wz_lo, wz_hi) in _wall_win_segs('W', y1, y2):
         _f4((x1,wb,wz_lo),(x1-fd,wb,wz_lo),(x1-fd,wb,wz_hi),(x1,wb,wz_hi))  # back jamb
         _f4((x1,wf,wz_hi),(x1-fd,wf,wz_hi),(x1-fd,wf,wz_lo),(x1,wf,wz_lo))  # front jamb
@@ -899,7 +1242,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
         segs_e = _wall_door_segs('E', y1, y2, y2 - y1)
         if segs_e:
             _cur_cat[0] = _CAT_WALL
-            _cur_tiling[0] = s.mat_walls_tiling
+            _cur_tiling[0] = s.mat_walls_tiling_x
             lo_y = y1
             for idx, (_, yb, levels) in enumerate(list(_gen_strips(segs_e))):
                 hi_y = segs_e[idx][0] if idx < len(segs_e) else y2
@@ -910,12 +1253,12 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 if idx < len(segs_e):
                     lo_y = segs_e[idx][1]
             _cur_cat[0] = _CAT_DOOR_FRAME
-            _cur_tiling[0] = s.mat_door_frame_tiling
+            _cur_tiling[0] = s.mat_door_frame_tiling_x
             for j, (db_i, df_i, dh_i) in enumerate(segs_e):
                 lev_l, lev_r = _jamb_extra_levels(segs_e, j)
-                _cur_cat[0] = _CAT_WALL; _cur_tiling[0] = s.mat_walls_tiling
+                _cur_cat[0] = _CAT_WALL; _cur_tiling[0] = s.mat_walls_tiling_x
                 _f4((x2,df_i,z+dh_i),(x2,db_i,z+dh_i),(x2,db_i,zt),(x2,df_i,zt))
-                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling
+                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling_x
                 ll = sorted([z] + lev_l + [z + dh_i])
                 for k in range(len(ll) - 1):
                     _f4((x2+fd,db_i,ll[k]),(x2,db_i,ll[k]),(x2,db_i,ll[k+1]),(x2+fd,db_i,ll[k+1]))
@@ -923,12 +1266,12 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 for k in range(len(rl) - 1):
                     _f4((x2,df_i,rl[k]),(x2+fd,df_i,rl[k]),(x2+fd,df_i,rl[k+1]),(x2,df_i,rl[k+1]))
                 _f4((x2+fd,db_i,z+dh_i),(x2,db_i,z+dh_i),(x2,df_i,z+dh_i),(x2+fd,df_i,z+dh_i))
-                _cur_cat[0] = _CAT_FLOOR; _cur_tiling[0] = s.mat_floor_tiling
+                _cur_cat[0] = _CAT_FLOOR; _cur_tiling[0] = s.mat_floor_tiling_x
                 _f4((x2,db_i,z),(x2+fd,db_i,z),(x2+fd,df_i,z),(x2,df_i,z))
-                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling
+                _cur_cat[0] = _CAT_DOOR_FRAME; _cur_tiling[0] = s.mat_door_frame_tiling_x
         else:
             _cur_cat[0] = _CAT_WALL
-            _cur_tiling[0] = s.mat_walls_tiling
+            _cur_tiling[0] = s.mat_walls_tiling_x
             if _ey:
                 ys = [y1] + _ey + [y2]
                 for i in range(len(ys) - 1):
@@ -938,7 +1281,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 _face_with_holes(_emit_e, y1, y2, z,              z+_dh_fallback, _e_holes)
                 _face_with_holes(_emit_e, y1, y2, z+_dh_fallback, zt,             _e_holes)
     _cur_cat[0] = _CAT_WIN_FRAME
-    _cur_tiling[0] = s.mat_window_frame_tiling
+    _cur_tiling[0] = s.mat_window_frame_tiling_x
     for (wb, wf, wz_lo, wz_hi) in _wall_win_segs('E', y1, y2):
         _f4((x2+fd,wb,wz_lo),(x2,wb,wz_lo),(x2,wb,wz_hi),(x2+fd,wb,wz_hi))  # back jamb
         _f4((x2,wf,wz_lo),(x2+fd,wf,wz_lo),(x2+fd,wf,wz_hi),(x2,wf,wz_hi))  # front jamb
@@ -964,7 +1307,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
 
     if s.add_ceiling:
         _cur_cat[0] = _CAT_CEILING
-        _cur_tiling[0] = s.mat_ceiling_tiling
+        _cur_tiling[0] = s.mat_ceiling_tiling_x
         if _sh_xs or _sh_ys or stair_holes:
             xs = [x1] + [v for v in _sh_xs if x1 < v < x2] + [x2]
             ys = [y1] + [v for v in _sh_ys if y1 < v < y2] + [y2]
@@ -979,7 +1322,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
 
     if s.add_floor:
         _cur_cat[0] = _CAT_FLOOR
-        _cur_tiling[0] = s.mat_floor_tiling
+        _cur_tiling[0] = s.mat_floor_tiling_x
         if _sh_xs or _sh_ys or stair_holes:
             xs = [x1] + [v for v in _sh_xs if x1 < v < x2] + [x2]
             ys = [y1] + [v for v in _sh_ys if y1 < v < y2] + [y2]
@@ -1002,7 +1345,7 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
         sx1, sy1, sx2, sy2 = sh["x1"], sh["y1"], sh["x2"], sh["y2"]
         cut = sh.get("cut", "both")
         _cur_cat[0]    = _CAT_WALL
-        _cur_tiling[0] = s.mat_walls_tiling
+        _cur_tiling[0] = s.mat_walls_tiling_x
         if s.add_ceiling and cut in ("ceiling", "both"):
             slab_top = sh.get("slab_z", zt)
             d2 = max(0.0, slab_top - zt) / 2       # half slab thickness
@@ -1062,11 +1405,15 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 for _xa, _xb in _plinth_gaps('S', x1 + _pcw_b, x2 - _pce_b):
                     _f4((_xb, y1+_pt_b, z),       (_xa, y1+_pt_b, z),       (_xa, y1+_pt_b, z+_ph_b),    (_xb, y1+_pt_b, z+_ph_b))   # front  (+Y)
                     _f4((_xa, y1,       z+_ph_b),  (_xb, y1,       z+_ph_b), (_xb, y1+_pt_b, z+_ph_b),   (_xa, y1+_pt_b, z+_ph_b))   # top    (+Z)
+                    _f4((_xa, y1, z), (_xa, y1, z+_ph_b), (_xa, y1+_pt_b, z+_ph_b), (_xa, y1+_pt_b, z))  # left cap  (-X)
+                    _f4((_xb, y1+_pt_b, z), (_xb, y1+_pt_b, z+_ph_b), (_xb, y1, z+_ph_b), (_xb, y1, z)) # right cap (+X)
             if _add_pt:
                 _cur_cat[0] = _CAT_PLINTH_TOP
                 for _xa, _xb in [(x1 + _pcw_t, x2 - _pce_t)]:
                     _f4((_xb, y1+_pt_t, zt-_ph_t), (_xa, y1+_pt_t, zt-_ph_t), (_xa, y1+_pt_t, zt),       (_xb, y1+_pt_t, zt))        # front  (+Y)
                     _f4((_xa, y1,       zt-_ph_t),  (_xa, y1+_pt_t, zt-_ph_t), (_xb, y1+_pt_t, zt-_ph_t), (_xb, y1,       zt-_ph_t))  # bottom (-Z)
+                    _f4((_xa, y1, zt-_ph_t), (_xa, y1, zt), (_xa, y1+_pt_t, zt), (_xa, y1+_pt_t, zt-_ph_t))  # left cap  (-X)
+                    _f4((_xb, y1+_pt_t, zt-_ph_t), (_xb, y1+_pt_t, zt), (_xb, y1, zt), (_xb, y1, zt-_ph_t)) # right cap (+X)
 
         # North wall — inner face at y=y2, plinth protrudes toward -Y
         if 'N' not in no_walls:
@@ -1075,11 +1422,15 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 for _xa, _xb in _plinth_gaps('N', x1 + _pcw_b, x2 - _pce_b):
                     _f4((_xa, y2-_pt_b, z),       (_xb, y2-_pt_b, z),       (_xb, y2-_pt_b, z+_ph_b),   (_xa, y2-_pt_b, z+_ph_b))   # front  (-Y)
                     _f4((_xa, y2-_pt_b, z+_ph_b), (_xb, y2-_pt_b, z+_ph_b), (_xb, y2,       z+_ph_b),   (_xa, y2,       z+_ph_b))   # top    (+Z)
+                    _f4((_xa, y2-_pt_b, z), (_xa, y2-_pt_b, z+_ph_b), (_xa, y2, z+_ph_b), (_xa, y2, z))  # left cap  (-X)
+                    _f4((_xb, y2, z), (_xb, y2, z+_ph_b), (_xb, y2-_pt_b, z+_ph_b), (_xb, y2-_pt_b, z)) # right cap (+X)
             if _add_pt:
                 _cur_cat[0] = _CAT_PLINTH_TOP
                 for _xa, _xb in [(x1 + _pcw_t, x2 - _pce_t)]:
                     _f4((_xa, y2-_pt_t, zt-_ph_t), (_xb, y2-_pt_t, zt-_ph_t), (_xb, y2-_pt_t, zt),      (_xa, y2-_pt_t, zt))        # front  (-Y)
                     _f4((_xa, y2,       zt-_ph_t),  (_xb, y2,       zt-_ph_t), (_xb, y2-_pt_t, zt-_ph_t), (_xa, y2-_pt_t, zt-_ph_t)) # bottom (-Z)
+                    _f4((_xa, y2-_pt_t, zt-_ph_t), (_xa, y2-_pt_t, zt), (_xa, y2, zt), (_xa, y2, zt-_ph_t))  # left cap  (-X)
+                    _f4((_xb, y2, zt-_ph_t), (_xb, y2, zt), (_xb, y2-_pt_t, zt), (_xb, y2-_pt_t, zt-_ph_t)) # right cap (+X)
 
         # East wall — inner face at x=x2, plinth protrudes toward -X
         if 'E' not in no_walls:
@@ -1088,11 +1439,15 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 for _ya, _yb in _plinth_gaps('E', y1, y2):
                     _f4((x2-_pt_b, _yb, z),       (x2-_pt_b, _ya, z),       (x2-_pt_b, _ya, z+_ph_b),  (x2-_pt_b, _yb, z+_ph_b))   # front  (-X)
                     _f4((x2-_pt_b, _ya, z+_ph_b), (x2,       _ya, z+_ph_b), (x2,       _yb, z+_ph_b),  (x2-_pt_b, _yb, z+_ph_b))   # top    (+Z)
+                    _f4((x2, _ya, z), (x2, _ya, z+_ph_b), (x2-_pt_b, _ya, z+_ph_b), (x2-_pt_b, _ya, z)) # left cap  (-Y)
+                    _f4((x2-_pt_b, _yb, z), (x2-_pt_b, _yb, z+_ph_b), (x2, _yb, z+_ph_b), (x2, _yb, z)) # right cap (+Y)
             if _add_pt:
                 _cur_cat[0] = _CAT_PLINTH_TOP
                 for _ya, _yb in [(y1, y2)]:
                     _f4((x2-_pt_t, _yb, zt-_ph_t), (x2-_pt_t, _ya, zt-_ph_t), (x2-_pt_t, _ya, zt),     (x2-_pt_t, _yb, zt))        # front  (-X)
                     _f4((x2-_pt_t, _yb, zt-_ph_t), (x2,       _yb, zt-_ph_t), (x2,       _ya, zt-_ph_t), (x2-_pt_t, _ya, zt-_ph_t)) # bottom (-Z)
+                    _f4((x2, _ya, zt-_ph_t), (x2, _ya, zt), (x2-_pt_t, _ya, zt), (x2-_pt_t, _ya, zt-_ph_t)) # left cap  (-Y)
+                    _f4((x2-_pt_t, _yb, zt-_ph_t), (x2-_pt_t, _yb, zt), (x2, _yb, zt), (x2, _yb, zt-_ph_t)) # right cap (+Y)
 
         # West wall — inner face at x=x1, plinth protrudes toward +X
         if 'W' not in no_walls:
@@ -1101,11 +1456,15 @@ def _fill_room(bm, x1, y1, x2, y2, z, s, doors=(), no_walls=(), windows=(),
                 for _ya, _yb in _plinth_gaps('W', y1, y2):
                     _f4((x1+_pt_b, _ya, z),       (x1+_pt_b, _yb, z),       (x1+_pt_b, _yb, z+_ph_b),  (x1+_pt_b, _ya, z+_ph_b))   # front  (+X)
                     _f4((x1,       _ya, z+_ph_b), (x1+_pt_b, _ya, z+_ph_b), (x1+_pt_b, _yb, z+_ph_b),  (x1,       _yb, z+_ph_b))   # top    (+Z)
+                    _f4((x1+_pt_b, _ya, z), (x1, _ya, z), (x1, _ya, z+_ph_b), (x1+_pt_b, _ya, z+_ph_b)) # left cap  (-Y)
+                    _f4((x1, _yb, z), (x1+_pt_b, _yb, z), (x1+_pt_b, _yb, z+_ph_b), (x1, _yb, z+_ph_b)) # right cap (+Y)
             if _add_pt:
                 _cur_cat[0] = _CAT_PLINTH_TOP
                 for _ya, _yb in [(y1, y2)]:
                     _f4((x1+_pt_t, _ya, zt-_ph_t), (x1+_pt_t, _yb, zt-_ph_t), (x1+_pt_t, _yb, zt),     (x1+_pt_t, _ya, zt))        # front  (+X)
                     _f4((x1,       _yb, zt-_ph_t), (x1+_pt_t, _yb, zt-_ph_t), (x1+_pt_t, _ya, zt-_ph_t), (x1,       _ya, zt-_ph_t)) # bottom (-Z)
+                    _f4((x1+_pt_t, _ya, zt-_ph_t), (x1, _ya, zt-_ph_t), (x1, _ya, zt), (x1+_pt_t, _ya, zt)) # left cap  (-Y)
+                    _f4((x1, _yb, zt-_ph_t), (x1+_pt_t, _yb, zt-_ph_t), (x1+_pt_t, _yb, zt), (x1, _yb, zt)) # right cap (+Y)
 
     # ── Architrave ─────────────────────────────────────────────────────────────
     _add_arch = add_architrave if add_architrave is not None else getattr(s, 'add_architrave', False)
@@ -1257,16 +1616,31 @@ def _apply_cube_uv_to_mesh(me, s, obj=None):
     if uv_layer is None:
         return  # mesh has no polygons — nothing to UV-map
     cat_attr = me.attributes.get("room_cat") if hasattr(me, 'attributes') else None
+    import math as _math
+    def _t(attr_x, attr_y):
+        return (getattr(s, attr_x, 1.0), getattr(s, attr_y, 1.0))
+
     tiling_map = [
-        s.mat_walls_tiling,                            # 0 = _CAT_WALL
-        s.mat_floor_tiling,                            # 1 = _CAT_FLOOR
-        s.mat_ceiling_tiling,                          # 2 = _CAT_CEILING
-        s.mat_door_frame_tiling,                       # 3 = _CAT_DOOR_FRAME
-        s.mat_window_frame_tiling,                     # 4 = _CAT_WIN_FRAME
-        getattr(s, 'mat_plinth_bottom_tiling', 1.0),  # 5 = _CAT_PLINTH_BOTTOM
-        getattr(s, 'mat_plinth_top_tiling',    1.0),  # 6 = _CAT_PLINTH_TOP
-        1.0,                                           # 7 = _CAT_STAIR (uses walls mat in room mesh)
-        getattr(s, 'mat_architrave_tiling',    1.0),  # 8 = _CAT_ARCHITRAVE
+        _t('mat_walls_tiling_x',         'mat_walls_tiling_y'),          # 0 = _CAT_WALL
+        _t('mat_floor_tiling_x',         'mat_floor_tiling_y'),          # 1 = _CAT_FLOOR
+        _t('mat_ceiling_tiling_x',       'mat_ceiling_tiling_y'),        # 2 = _CAT_CEILING
+        _t('mat_door_frame_tiling_x',    'mat_door_frame_tiling_y'),     # 3 = _CAT_DOOR_FRAME
+        _t('mat_window_frame_tiling_x',  'mat_window_frame_tiling_y'),   # 4 = _CAT_WIN_FRAME
+        _t('mat_plinth_bottom_tiling_x', 'mat_plinth_bottom_tiling_y'),  # 5 = _CAT_PLINTH_BOTTOM
+        _t('mat_plinth_top_tiling_x',    'mat_plinth_top_tiling_y'),     # 6 = _CAT_PLINTH_TOP
+        (1.0, 1.0),                                                       # 7 = _CAT_STAIR
+        _t('mat_architrave_tiling_x',    'mat_architrave_tiling_y'),     # 8 = _CAT_ARCHITRAVE
+    ]
+    rotation_map = [
+        getattr(s, 'mat_walls_rotation',         0.0),   # 0
+        getattr(s, 'mat_floor_rotation',         0.0),   # 1
+        getattr(s, 'mat_ceiling_rotation',       0.0),   # 2
+        getattr(s, 'mat_door_frame_rotation',    0.0),   # 3
+        getattr(s, 'mat_window_frame_rotation',  0.0),   # 4
+        getattr(s, 'mat_plinth_bottom_rotation', 0.0),   # 5
+        getattr(s, 'mat_plinth_top_rotation',    0.0),   # 6
+        0.0,                                             # 7
+        getattr(s, 'mat_architrave_rotation',    0.0),   # 8
     ]
     # World-rotation matrix so we can classify extruded faces by world normal.
     rot3 = obj.matrix_world.to_3x3().normalized() if obj is not None else None
@@ -1278,65 +1652,65 @@ def _apply_cube_uv_to_mesh(me, s, obj=None):
 
         # For newly-created geometry (room_cat == 0) use the world-space normal
         # to distinguish wall faces from horizontal (floor / ceiling) faces.
-        # Original parametric floor/ceiling faces have room_cat == 1 or 2 and
-        # are unaffected by this branch.
         if cat == 0 and rot3 is not None:
             wn_z = (rot3 @ poly.normal).z
-            if wn_z > 0.7:          # mostly up  → floor
-                cat = 1             # _CAT_FLOOR
-            elif wn_z < -0.7:       # mostly down → ceiling
-                cat = 2             # _CAT_CEILING
-            # else: stays 0 = _CAT_WALL
+            if wn_z > 0.7:
+                cat = 1   # _CAT_FLOOR
+            elif wn_z < -0.7:
+                cat = 2   # _CAT_CEILING
 
-        sc  = tiling_map[cat] if 0 <= cat < len(tiling_map) else 1.0
+        sc_x, sc_y  = tiling_map[cat]    if 0 <= cat < len(tiling_map)    else (1.0, 1.0)
+        rot_deg     = rotation_map[cat]  if 0 <= cat < len(rotation_map)  else 0.0
         n   = poly.normal
         ax, ay, az = abs(n.x), abs(n.y), abs(n.z)
+        if rot_deg != 0.0:
+            _cos = _math.cos(_math.radians(rot_deg))
+            _sin = _math.sin(_math.radians(rot_deg))
         for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
             co = verts[loops[li].vertex_index].co
-            if az >= ax and az >= ay:
-                uv_layer.data[li].uv = (co.x * sc, co.y * sc)
-            elif ax >= ay:
-                uv_layer.data[li].uv = (co.y * sc, co.z * sc)
-            else:
-                uv_layer.data[li].uv = (co.x * sc, co.z * sc)
+            if az >= ax and az >= ay:           # horizontal (floor / ceiling)
+                u, v = co.x * sc_x, co.y * sc_y
+            elif ax >= ay:                       # wall facing X
+                u, v = co.y * sc_x, co.z * sc_y
+            else:                               # wall facing Y
+                u, v = co.x * sc_x, co.z * sc_y
+            if rot_deg != 0.0:
+                u, v = _cos * u - _sin * v, _sin * u + _cos * v
+            uv_layer.data[li].uv = (u, v)
+
+
+def _sync_material_indices(me, mats):
+    """Re-assign poly.material_index from the stored room_cat face attribute.
+    This corrects any mesh that was built before the fixed-slot approach, where
+    deduplication may have left plinth/trim faces pointing to the wrong slot."""
+    cat_attr = me.attributes.get("room_cat") if hasattr(me, 'attributes') else None
+    if cat_attr is None:
+        return
+    n = len(mats)
+    for poly in me.polygons:
+        cat = cat_attr.data[poly.index].value
+        if 0 <= cat < n:
+            poly.material_index = cat
 
 
 def _apply_materials_all_rooms(s):
-    """Update material slots + face material_index on every existing room mesh.
-    Uses me.attributes['room_cat'] — no geometry rebuild required."""
+    """Update material slot pointers on every existing room mesh and re-sync
+    face material_index from the stored room_cat attribute so that trim/plinth
+    faces always point to the correct slot regardless of how the mesh was built."""
+    mats = _room_mat_list(s)
     for reg in ROOM_OT_draw._room_list:
         obj_name = reg.get("obj_name", "")
         if obj_name not in bpy.data.objects:
             continue
         me = bpy.data.objects[obj_name].data
-        while me.materials:
-            me.materials.pop(index=0)
-        mat_w  = getattr(s, 'mat_walls',        None)
-        mat_f  = getattr(s, 'mat_floor',        None)
-        mat_c  = getattr(s, 'mat_ceiling',      None)
-        mat_d  = getattr(s, 'mat_door_frame',   None) or mat_w
-        mat_wf = getattr(s, 'mat_window_frame', None) or mat_w
-        mat_pb   = getattr(s, 'mat_plinth_bottom', None) or mat_w
-        mat_pt   = getattr(s, 'mat_plinth_top',    None) or mat_w
-        mat_arch = getattr(s, 'mat_architrave',    None) or mat_w
-        mat_list, slot_map = [], {}
-        # Index must match _CAT_* constants (7=stair→wall fallback, 8=architrave)
-        for cat, mat in enumerate((mat_w, mat_f, mat_c, mat_d, mat_wf, mat_pb, mat_pt, mat_w, mat_arch)):
-            if mat is None:
-                slot_map[cat] = None
-            elif mat in mat_list:
-                slot_map[cat] = mat_list.index(mat)
-            else:
-                slot_map[cat] = len(mat_list)
-                mat_list.append(mat)
-        for mat in mat_list:
-            me.materials.append(mat)
-        cat_attr = me.attributes.get("room_cat") if hasattr(me, 'attributes') else None
-        if cat_attr and any(v is not None for v in slot_map.values()):
-            for poly in me.polygons:
-                si = slot_map.get(cat_attr.data[poly.index].value)
-                if si is not None:
-                    poly.material_index = si
+        # Ensure exactly 9 slots exist
+        while len(me.materials) < len(mats):
+            me.materials.append(None)
+        while len(me.materials) > len(mats):
+            me.materials.pop(index=len(me.materials) - 1)
+        for i, mat in enumerate(mats):
+            me.materials[i] = mat
+        _sync_material_indices(me, mats)
         me.update()
 
 
@@ -1355,38 +1729,20 @@ def _apply_uvs_all_rooms(s):
 
 
 def _apply_materials_one_room(reg, s):
-    """Update material slots + face material_index for a single room registry entry."""
+    """Update material slot pointers for a single room registry entry and re-sync
+    face material_index from the stored room_cat attribute."""
     obj_name = reg.get("obj_name", "")
     if obj_name not in bpy.data.objects:
         return
     me = bpy.data.objects[obj_name].data
-    while me.materials:
-        me.materials.pop(index=0)
-    mat_w  = getattr(s, 'mat_walls',        None)
-    mat_f  = getattr(s, 'mat_floor',        None)
-    mat_c  = getattr(s, 'mat_ceiling',      None)
-    mat_d  = getattr(s, 'mat_door_frame',   None) or mat_w
-    mat_wf = getattr(s, 'mat_window_frame', None) or mat_w
-    mat_pb   = getattr(s, 'mat_plinth_bottom', None) or mat_w
-    mat_pt   = getattr(s, 'mat_plinth_top',    None) or mat_w
-    mat_arch = getattr(s, 'mat_architrave',    None) or mat_w
-    mat_list, slot_map = [], {}
-    for cat, mat in enumerate((mat_w, mat_f, mat_c, mat_d, mat_wf, mat_pb, mat_pt, mat_w, mat_arch)):
-        if mat is None:
-            slot_map[cat] = None
-        elif mat in mat_list:
-            slot_map[cat] = mat_list.index(mat)
-        else:
-            slot_map[cat] = len(mat_list)
-            mat_list.append(mat)
-    for mat in mat_list:
-        me.materials.append(mat)
-    cat_attr = me.attributes.get("room_cat") if hasattr(me, 'attributes') else None
-    if cat_attr and any(v is not None for v in slot_map.values()):
-        for poly in me.polygons:
-            si = slot_map.get(cat_attr.data[poly.index].value)
-            if si is not None:
-                poly.material_index = si
+    mats = _room_mat_list(s)
+    while len(me.materials) < len(mats):
+        me.materials.append(None)
+    while len(me.materials) > len(mats):
+        me.materials.pop(index=len(me.materials) - 1)
+    for i, mat in enumerate(mats):
+        me.materials[i] = mat
+    _sync_material_indices(me, mats)
     me.update()
 
 
@@ -1474,22 +1830,6 @@ def _build_stair_mesh(sd, s):
         faces_out.append((base, base + 1, base + 2))
         cats_out.append(cat)
 
-    def _step_profile(t_lo, t_hi, n_steps, rise_per_step):
-        """Build (t,z) polygon profile for one stringer side."""
-        d = (t_hi - t_lo) / n_steps
-        steps_lr = []
-        for i in range(n_steps):
-            t_f = t_lo + i * d
-            t_b = t_f + d
-            zh  = z_bot + (i + 1) * rise_per_step
-            steps_lr.append((min(t_f, t_b), max(t_f, t_b), zh))
-        steps_lr.sort()
-        profile = [(t_lo, z_bot)]
-        for (tl, tr, zh) in steps_lr:
-            profile.append((tl, zh))
-            profile.append((tr, zh))
-        profile.append((t_hi, z_bot))
-        return profile, steps_lr
 
     # Helpers: interpolate perpendicular (width) bounds linearly from lower to upper rect.
     # frac=0 → lower rect perpendicular; frac=1 → upper rect perpendicular.
@@ -1590,33 +1930,26 @@ def _build_stair_mesh(sd, s):
             else:
                 _quad((xw, yb_w, z_bot), (xw, ya_w, z_bot), (xw, ya_w, z_top), (xw, yb_w, z_top))
 
-            # Solid N-gon stringer on each side
-            _, steps_lr = _step_profile(t_start, t_end, n, actual_rise)
+            # Solid stringer on each side: one quad per step
+            def _stringer_quads(side_fn, outward_neg_y):
+                """One quad per step: spans the step's X width from z_bot to step
+                height.  Avoids fan-triangulation artifacts on the concave polygon."""
+                for i in range(n):
+                    xf = t_start + td * i * step_d
+                    xb = t_start + td * (i + 1) * step_d
+                    zh = z_bot + (i + 1) * actual_rise
+                    x_lo, x_hi = (xf, xb) if xb > xf else (xb, xf)
+                    yl = side_fn(x_lo)
+                    yh = side_fn(x_hi)
+                    if outward_neg_y:   # −Y outward normal
+                        _quad((x_hi, yh, z_bot), (x_lo, yl, z_bot),
+                              (x_lo, yl, zh),    (x_hi, yh, zh))
+                    else:               # +Y outward normal
+                        _quad((x_lo, yl, z_bot), (x_hi, yh, z_bot),
+                              (x_hi, yh, zh),    (x_lo, yl, zh))
 
-            def _x_profile(side_fn):
-                pts = [(t_start, side_fn(t_start), z_bot)]
-                if td > 0:
-                    for (tl, tr, zh) in steps_lr:
-                        pts.append((tl, side_fn(tl), zh))
-                        pts.append((tr, side_fn(tr), zh))
-                else:
-                    for (tl, tr, zh) in reversed(steps_lr):
-                        pts.append((tr, side_fn(tr), zh))
-                        pts.append((tl, side_fn(tl), zh))
-                pts.append((t_end, side_fn(t_end), z_bot))
-                return pts
-
-            def _stringer_ngon(side_fn, outward_neg_y):
-                pts = _x_profile(side_fn)
-                if outward_neg_y == (td > 0):
-                    pts = pts[::-1]
-                base = len(verts_out)
-                verts_out.extend(pts)
-                faces_out.append(tuple(range(base, base + len(pts))))
-                cats_out.append(_CAT_STAIR)
-
-            _stringer_ngon(_ya, outward_neg_y=True)
-            _stringer_ngon(_yb, outward_neg_y=False)
+            _stringer_quads(_ya, outward_neg_y=True)
+            _stringer_quads(_yb, outward_neg_y=False)
 
     else:   # Y travel — perpendicular axis is X; interpolate lx1/lx2 → ux1/ux2
         def _xa(t): return lx1 + (ux1 - lx1) * _frac(t)
@@ -1631,11 +1964,11 @@ def _build_stair_mesh(sd, s):
             xaf = _xa(yf); xbf = _xb(yf)
             xab = _xa(yb_); xbb = _xb(yb_)
             if td > 0:
-                _quad((xaf, yf, zh), (xab, yb_, zh), (xbb, yb_, zh), (xbf, yf, zh), cat=_CAT_STAIR_STEP)  # tread
-                _quad((xbf, yf, zl), (xaf, yf, zl), (xaf, yf, zh), (xbf, yf, zh))    # riser
+                _quad((xaf, yf, zh), (xbf, yf, zh), (xbb, yb_, zh), (xab, yb_, zh), cat=_CAT_STAIR_STEP)  # tread
+                _quad((xaf, yf, zl), (xbf, yf, zl), (xbf, yf, zh), (xaf, yf, zh))    # riser (−Y normal)
             else:
-                _quad((xab, yb_, zh), (xaf, yf, zh), (xbf, yf, zh), (xbb, yb_, zh), cat=_CAT_STAIR_STEP)
-                _quad((xaf, yf, zl), (xbf, yf, zl), (xbf, yf, zh), (xaf, yf, zh))
+                _quad((xab, yb_, zh), (xbb, yb_, zh), (xbf, yf, zh), (xaf, yf, zh), cat=_CAT_STAIR_STEP)
+                _quad((xbf, yf, zl), (xaf, yf, zl), (xaf, yf, zh), (xbf, yf, zh))    # riser (+Y normal)
 
         z_slab_top = z_bot + dz
 
@@ -1698,32 +2031,26 @@ def _build_stair_mesh(sd, s):
             else:
                 _quad((xa_w, yw, z_bot), (xb_w, yw, z_bot), (xb_w, yw, z_top), (xa_w, yw, z_top))
 
-            _, steps_lr = _step_profile(t_start, t_end, n, actual_rise)
+            # Solid stringer on each side: one quad per step
+            def _stringer_y_quads(side_fn, outward_neg_x):
+                """One quad per step: spans the step's Y width from z_bot to step
+                height.  Avoids fan-triangulation artifacts on the concave polygon."""
+                for i in range(n):
+                    yf  = t_start + td * i * step_d
+                    yb_ = t_start + td * (i + 1) * step_d
+                    zh  = z_bot + (i + 1) * actual_rise
+                    y_lo, y_hi = (yf, yb_) if yb_ > yf else (yb_, yf)
+                    xl = side_fn(y_lo)
+                    xh = side_fn(y_hi)
+                    if outward_neg_x:   # −X outward normal
+                        _quad((xh, y_hi, z_bot), (xl, y_lo, z_bot),
+                              (xl, y_lo, zh),    (xh, y_hi, zh))
+                    else:               # +X outward normal
+                        _quad((xl, y_lo, z_bot), (xh, y_hi, z_bot),
+                              (xh, y_hi, zh),    (xl, y_lo, zh))
 
-            def _y_profile(side_fn):
-                pts = [(side_fn(t_start), t_start, z_bot)]
-                if td > 0:
-                    for (tl, tr, zh) in steps_lr:
-                        pts.append((side_fn(tl), tl, zh))
-                        pts.append((side_fn(tr), tr, zh))
-                else:
-                    for (tl, tr, zh) in reversed(steps_lr):
-                        pts.append((side_fn(tr), tr, zh))
-                        pts.append((side_fn(tl), tl, zh))
-                pts.append((side_fn(t_end), t_end, z_bot))
-                return pts
-
-            def _stringer_y_ngon(side_fn, outward_neg_x):
-                pts = _y_profile(side_fn)
-                if outward_neg_x == (td < 0):
-                    pts = pts[::-1]
-                base = len(verts_out)
-                verts_out.extend(pts)
-                faces_out.append(tuple(range(base, base + len(pts))))
-                cats_out.append(_CAT_STAIR)
-
-            _stringer_y_ngon(_xa, outward_neg_x=True)
-            _stringer_y_ngon(_xb, outward_neg_x=False)
+            _stringer_y_quads(_xa, outward_neg_x=True)
+            _stringer_y_quads(_xb, outward_neg_x=False)
 
     return verts_out, faces_out, cats_out
 
@@ -1850,26 +2177,39 @@ def _apply_stair_uvs_all(s):
 
 
 def _apply_stair_uv(me, s):
-    """Cube-project UV for stair mesh, with separate tiling for treads vs sides."""
+    """Cube-project UV for stair mesh, with separate X/Y tiling for treads vs sides."""
+    import math as _math
     uv_layer = me.uv_layers.new(name="UVMap")
-    sc_side = getattr(s, 'mat_stair_tiling',      1.0)
-    sc_step = getattr(s, 'mat_stair_step_tiling', 1.0)
+    side_x   = getattr(s, 'mat_stair_tiling_x',       1.0)
+    side_y   = getattr(s, 'mat_stair_tiling_y',       1.0)
+    side_rot = getattr(s, 'mat_stair_rotation',        0.0)
+    step_x   = getattr(s, 'mat_stair_step_tiling_x',  1.0)
+    step_y   = getattr(s, 'mat_stair_step_tiling_y',  1.0)
+    step_rot = getattr(s, 'mat_stair_step_rotation',  0.0)
     cat_attr = me.attributes.get("stair_cat") if hasattr(me, 'attributes') else None
     verts = me.vertices
     loops = me.loops
     for poly in me.polygons:
         cat = cat_attr.data[poly.index].value if cat_attr else _CAT_STAIR
-        sc = sc_step if cat == _CAT_STAIR_STEP else sc_side
+        is_step = (cat == _CAT_STAIR_STEP)
+        sc_x, sc_y = (step_x, step_y) if is_step else (side_x, side_y)
+        rot_deg    = step_rot if is_step else side_rot
         n = poly.normal
         ax, ay, az = abs(n.x), abs(n.y), abs(n.z)
+        if rot_deg != 0.0:
+            _cos = _math.cos(_math.radians(rot_deg))
+            _sin = _math.sin(_math.radians(rot_deg))
         for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
             co = verts[loops[li].vertex_index].co
             if az >= ax and az >= ay:
-                uv_layer.data[li].uv = (co.x * sc, co.y * sc)
+                u, v = co.x * sc_x, co.y * sc_y
             elif ax >= ay:
-                uv_layer.data[li].uv = (co.y * sc, co.z * sc)
+                u, v = co.y * sc_x, co.z * sc_y
             else:
-                uv_layer.data[li].uv = (co.x * sc, co.z * sc)
+                u, v = co.x * sc_x, co.z * sc_y
+            if rot_deg != 0.0:
+                u, v = _cos * u - _sin * v, _sin * u + _cos * v
+            uv_layer.data[li].uv = (u, v)
 
 
 def _get_or_create_stair_col(context):
@@ -1884,7 +2224,8 @@ def _make_room_obj(name, x1, y1, x2, y2, s, doors=(), no_walls=(), windows=(), c
     y1, y2 = min(y1, y2), max(y1, y2)
     me = bpy.data.meshes.new(name)
     bm = bmesh.new()
-    cat_vert_sets = _fill_room(bm, x1, y1, x2, y2, s.z_foundation, s, doors, no_walls, windows)
+    cat_vert_sets = _fill_room(bm, x1, y1, x2, y2, s.z_foundation, s, doors, no_walls, windows,
+                               add_architrave=False)  # architrave is a separate object
     _setup_room_materials(me, s, bm)
     bm.to_mesh(me)
     bm.free()
@@ -1895,6 +2236,327 @@ def _make_room_obj(name, x1, y1, x2, y2, s, doors=(), no_walls=(), windows=(), c
     _apply_room_pivot(obj, x1, y1, x2, y2, s.z_foundation, s.pivot_mode)
     _apply_cube_uv_to_mesh(me, s, obj=obj)
     return obj
+
+
+def _cut_hole_in_locked_mesh(reg, opening, s):
+    """Boolean-cut a rectangular hole for a new opening in a manually-edited room.
+
+    Called only when the room mesh is locked (Save Edits) and a new door or
+    window has been added.  Uses a temporary box cutter + Boolean modifier so
+    the rest of the edited mesh is untouched.
+
+    Returns True on success, False if the Boolean failed.
+    """
+    obj = bpy.data.objects.get(reg.get("obj_name", ""))
+    if obj is None:
+        return False
+
+    wc     = opening.get("wc", "S")
+    anchor = opening.get("anchor", 0.0)
+    w      = opening.get("w", 1.0)
+    h      = opening.get("h", 2.0)
+    v_off  = opening.get("v_offset", 0.0)   # 0 for doors
+    z      = reg.get("z", getattr(s, 'z_foundation', 0.0))
+    t      = reg.get("t", getattr(s, 'wall_thickness', 0.125))
+    x1, y1, x2, y2 = reg["x1"], reg["y1"], reg["x2"], reg["y2"]
+
+    depth  = t + 0.06   # slightly deeper than wall for a clean cut
+    half_w = w * 0.5
+    z_bot  = z + v_off
+    z_top  = z + v_off + h
+    hd     = depth * 0.5
+
+    if wc == 'S':
+        cx, cy = anchor, y1
+        verts = [(cx - half_w, cy - hd, z_bot), (cx + half_w, cy - hd, z_bot),
+                 (cx + half_w, cy + hd, z_bot), (cx - half_w, cy + hd, z_bot),
+                 (cx - half_w, cy - hd, z_top), (cx + half_w, cy - hd, z_top),
+                 (cx + half_w, cy + hd, z_top), (cx - half_w, cy + hd, z_top)]
+    elif wc == 'N':
+        cx, cy = anchor, y2
+        verts = [(cx - half_w, cy - hd, z_bot), (cx + half_w, cy - hd, z_bot),
+                 (cx + half_w, cy + hd, z_bot), (cx - half_w, cy + hd, z_bot),
+                 (cx - half_w, cy - hd, z_top), (cx + half_w, cy - hd, z_top),
+                 (cx + half_w, cy + hd, z_top), (cx - half_w, cy + hd, z_top)]
+    elif wc == 'W':
+        cx, cy = x1, anchor
+        verts = [(cx - hd, cy - half_w, z_bot), (cx + hd, cy - half_w, z_bot),
+                 (cx + hd, cy + half_w, z_bot), (cx - hd, cy + half_w, z_bot),
+                 (cx - hd, cy - half_w, z_top), (cx + hd, cy - half_w, z_top),
+                 (cx + hd, cy + half_w, z_top), (cx - hd, cy + half_w, z_top)]
+    elif wc == 'E':
+        cx, cy = x2, anchor
+        verts = [(cx - hd, cy - half_w, z_bot), (cx + hd, cy - half_w, z_bot),
+                 (cx + hd, cy + half_w, z_bot), (cx - hd, cy + half_w, z_bot),
+                 (cx - hd, cy - half_w, z_top), (cx + hd, cy - half_w, z_top),
+                 (cx + hd, cy + half_w, z_top), (cx - hd, cy + half_w, z_top)]
+    else:
+        return False
+
+    faces = [(0,1,2,3),(7,6,5,4),(0,4,5,1),(2,6,7,3),(0,3,7,4),(1,5,6,2)]
+    cutter_me  = bpy.data.meshes.new("__rt_cutter__")
+    cutter_me.from_pydata(verts, [], faces)
+    cutter_me.update()
+    cutter_obj = bpy.data.objects.new("__rt_cutter__", cutter_me)
+    # Must be in same collection and VISIBLE — hidden objects are ignored by Boolean
+    col = next(iter(obj.users_collection), bpy.context.scene.collection)
+    col.objects.link(cutter_obj)
+
+    mod = obj.modifiers.new("__rt_bool__", 'BOOLEAN')
+    mod.operation = 'DIFFERENCE'
+    mod.solver    = 'EXACT'
+    mod.object    = cutter_obj
+
+    success = False
+    try:
+        # Use depsgraph evaluation — does not need operator context
+        bpy.context.view_layer.update()
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        eval_obj  = obj.evaluated_get(depsgraph)
+        new_me    = bpy.data.meshes.new_from_object(
+                        eval_obj, preserve_all_data_layers=True,
+                        depsgraph=depsgraph)
+        # Copy material slots from the original mesh
+        old_me = obj.data
+        new_me.name = old_me.name + "__bool__"
+        for mat in old_me.materials:
+            new_me.materials.append(mat)
+        # Swap mesh data and remove the now-unused original
+        obj.data = new_me
+        obj.modifiers.remove(mod)
+        new_me.update()
+        new_me.name = old_me.name
+        if old_me.users == 0:
+            bpy.data.meshes.remove(old_me)
+        success = True
+    except Exception as e:
+        print(f"[RoomTool] Boolean hole cut failed: {e}")
+        try:
+            obj.modifiers.remove(mod)
+        except Exception:
+            pass
+
+    bpy.data.objects.remove(cutter_obj, do_unlink=True)
+    if cutter_me.users == 0:
+        bpy.data.meshes.remove(cutter_me)
+    return success
+
+
+# ── Separate architrave object ────────────────────────────────────────────────
+
+def _door_segs_for_reg(reg, wc, span_lo, span_hi):
+    """Top-level version of _wall_door_segs (usable outside _fill_room)."""
+    doors    = reg.get("doors", [])
+    h        = reg.get("h", 2.4)
+    t        = reg.get("t", 0.125)
+    max_span = span_hi - span_lo
+    result   = []
+    for d in doors:
+        if d.get("wc") != wc:
+            continue
+        dh_i = min(d["h"], h - t)
+        dw_i = min(d["w"], max_span * 0.85)
+        cx   = d["anchor"]
+        dl_i = max(span_lo, cx - dw_i * 0.5)
+        dr_i = min(span_hi, cx + dw_i * 0.5)
+        if dr_i > dl_i:
+            result.append((dl_i, dr_i, dh_i))
+    result.sort(key=lambda seg: seg[0])
+    return result
+
+
+def _gen_arch_pydata(reg, aw_raw, ad):
+    """Generate architrave geometry for all doors in reg.
+    Returns (verts, faces) in world space (pre-pivot) for use with from_pydata.
+    Each face uses an explicit normal hint — no heuristic dot-product guessing."""
+    x1 = reg.get("x1", 0.0); y1 = reg.get("y1", 0.0)
+    x2 = reg.get("x2", 3.0); y2 = reg.get("y2", 4.0)
+    z  = reg.get("z", reg.get("z_foundation", 0.0))
+
+    verts = []
+    faces = []
+
+    from mathutils import Vector
+
+    def quad(v0, v1, v2, v3, nx, ny, nz):
+        """Emit a quad. Winding is chosen so the face normal matches (nx,ny,nz)."""
+        base = len(verts)
+        verts.extend([v0, v1, v2, v3])
+        a = Vector(v1) - Vector(v0)
+        b = Vector(v3) - Vector(v0)
+        if a.cross(b).dot(Vector((nx, ny, nz))) >= 0:
+            faces.append((base, base+1, base+2, base+3))
+        else:
+            faces.append((base, base+3, base+2, base+1))
+
+    # ── South wall — inner face at y=y1, arch protrudes +Y into room ──────────
+    for _dl, _dr, _dh in _door_segs_for_reg(reg, 'S', x1, x2):
+        _aw = min(aw_raw, (_dr - _dl) * 0.5 - 1e-4)
+        if _aw <= 0: continue
+        quad((_dl,     y1+ad, z),        (_dl-_aw, y1+ad, z),        (_dl-_aw, y1+ad, z+_dh+_aw), (_dl,     y1+ad, z+_dh),        0, 1, 0)  # left front
+        quad((_dl,     y1, z),           (_dl, y1+ad, z),             (_dl, y1+ad, z+_dh),           (_dl, y1, z+_dh),               1, 0, 0)  # left inner
+        quad((_dl-_aw, y1+ad, z),        (_dl-_aw, y1, z),            (_dl-_aw, y1, z+_dh+_aw),      (_dl-_aw, y1+ad, z+_dh+_aw),  -1, 0, 0)  # left outer
+        quad((_dl,     y1, z+_dh),       (_dl, y1+ad, z+_dh),         (_dl-_aw, y1+ad, z+_dh+_aw),   (_dl-_aw, y1, z+_dh+_aw),     -1, 0, 1)  # left miter
+        quad((_dr,     y1+ad, z+_dh),    (_dl, y1+ad, z+_dh),         (_dl-_aw, y1+ad, z+_dh+_aw),   (_dr+_aw, y1+ad, z+_dh+_aw),   0, 1, 0)  # head front
+        quad((_dr,     y1, z+_dh),       (_dl, y1, z+_dh),            (_dl, y1+ad, z+_dh),            (_dr, y1+ad, z+_dh),            0, 0,-1)  # head soffit
+        quad((_dl-_aw, y1, z+_dh+_aw),  (_dr+_aw, y1, z+_dh+_aw),   (_dr+_aw, y1+ad, z+_dh+_aw),   (_dl-_aw, y1+ad, z+_dh+_aw),   0, 0, 1)  # top
+        quad((_dr+_aw, y1, z+_dh+_aw),  (_dr, y1, z+_dh),            (_dr, y1+ad, z+_dh),            (_dr+_aw, y1+ad, z+_dh+_aw),   1, 0, 1)  # right miter
+        quad((_dr+_aw, y1+ad, z),        (_dr, y1+ad, z),             (_dr, y1+ad, z+_dh),            (_dr+_aw, y1+ad, z+_dh+_aw),   0, 1, 0)  # right front
+        quad((_dr,     y1+ad, z+_dh),    (_dr, y1+ad, z),             (_dr, y1, z),                   (_dr, y1, z+_dh),              -1, 0, 0)  # right inner
+        quad((_dr+_aw, y1, z),           (_dr+_aw, y1+ad, z),         (_dr+_aw, y1+ad, z+_dh+_aw),   (_dr+_aw, y1, z+_dh+_aw),      1, 0, 0)  # right outer
+
+    # ── North wall — inner face at y=y2, arch protrudes -Y into room ──────────
+    for _dl, _dr, _dh in _door_segs_for_reg(reg, 'N', x1, x2):
+        _aw = min(aw_raw, (_dr - _dl) * 0.5 - 1e-4)
+        if _aw <= 0: continue
+        quad((_dl-_aw, y2-ad, z),        (_dl, y2-ad, z),             (_dl, y2-ad, z+_dh),             (_dl-_aw, y2-ad, z+_dh+_aw),  0,-1, 0)  # left front
+        quad((_dl,     y2-ad, z),        (_dl, y2, z),                (_dl, y2, z+_dh),                 (_dl, y2-ad, z+_dh),            1, 0, 0)  # left inner
+        quad((_dl-_aw, y2, z),           (_dl-_aw, y2-ad, z),         (_dl-_aw, y2-ad, z+_dh+_aw),     (_dl-_aw, y2, z+_dh+_aw),     -1, 0, 0)  # left outer
+        quad((_dl-_aw, y2, z+_dh+_aw),  (_dl-_aw, y2-ad, z+_dh+_aw),(_dl, y2-ad, z+_dh),             (_dl, y2, z+_dh),              -1, 0, 1)  # left miter
+        quad((_dr+_aw, y2-ad, z+_dh+_aw),(_dl-_aw, y2-ad, z+_dh+_aw),(_dl, y2-ad, z+_dh),            (_dr, y2-ad, z+_dh),            0,-1, 0)  # head front
+        quad((_dl,     y2-ad, z+_dh),    (_dr, y2-ad, z+_dh),         (_dr, y2, z+_dh),                (_dl, y2, z+_dh),               0, 0,-1)  # head soffit
+        quad((_dr+_aw, y2-ad, z+_dh+_aw),(_dl-_aw, y2-ad, z+_dh+_aw),(_dl-_aw, y2, z+_dh+_aw),      (_dr+_aw, y2, z+_dh+_aw),      0, 0, 1)  # top
+        quad((_dr+_aw, y2-ad, z+_dh+_aw),(_dr+_aw, y2, z+_dh+_aw),  (_dr, y2, z+_dh),                (_dr, y2-ad, z+_dh),            1, 0, 1)  # right miter
+        quad((_dr,     y2-ad, z+_dh),    (_dr+_aw, y2-ad, z+_dh+_aw),(_dr+_aw, y2-ad, z),             (_dr, y2-ad, z),                0,-1, 0)  # right front
+        quad((_dr,     y2, z+_dh),       (_dr, y2, z),                (_dr, y2-ad, z),                  (_dr, y2-ad, z+_dh),           -1, 0, 0)  # right inner
+        quad((_dr+_aw, y2-ad, z),        (_dr+_aw, y2, z),            (_dr+_aw, y2, z+_dh+_aw),        (_dr+_aw, y2-ad, z+_dh+_aw),   1, 0, 0)  # right outer
+
+    # ── East wall — inner face at x=x2, arch protrudes -X into room ───────────
+    for _dl, _dr, _dh in _door_segs_for_reg(reg, 'E', y1, y2):
+        _aw = min(aw_raw, (_dr - _dl) * 0.5 - 1e-4)
+        if _aw <= 0: continue
+        quad((x2-ad, _dl-_aw, z),        (x2-ad, _dl, z),             (x2-ad, _dl, z+_dh),             (x2-ad, _dl-_aw, z+_dh+_aw),  -1, 0, 0)  # left front
+        quad((x2-ad, _dl, z),            (x2, _dl, z),                (x2, _dl, z+_dh),                 (x2-ad, _dl, z+_dh),            0, 1, 0)  # left inner
+        quad((x2,    _dl-_aw, z),        (x2-ad, _dl-_aw, z),         (x2-ad, _dl-_aw, z+_dh+_aw),     (x2, _dl-_aw, z+_dh+_aw),      0,-1, 0)  # left outer
+        quad((x2,    _dl-_aw, z+_dh+_aw),(x2-ad, _dl-_aw, z+_dh+_aw),(x2-ad, _dl, z+_dh),             (x2, _dl, z+_dh),               0,-1, 1)  # left miter
+        quad((x2-ad, _dr+_aw, z+_dh+_aw),(x2-ad, _dl-_aw, z+_dh+_aw),(x2-ad, _dl, z+_dh),            (x2-ad, _dr, z+_dh),            -1, 0, 0)  # head front
+        quad((x2-ad, _dl, z+_dh),        (x2-ad, _dr, z+_dh),         (x2, _dr, z+_dh),                (x2, _dl, z+_dh),               0, 0,-1)  # head soffit
+        quad((x2-ad, _dr+_aw, z+_dh+_aw),(x2, _dr+_aw, z+_dh+_aw),  (x2, _dl-_aw, z+_dh+_aw),        (x2-ad, _dl-_aw, z+_dh+_aw),   0, 0, 1)  # top
+        quad((x2-ad, _dr+_aw, z+_dh+_aw),(x2-ad, _dr, z+_dh),        (x2, _dr, z+_dh),                (x2, _dr+_aw, z+_dh+_aw),       0, 1, 1)  # right miter
+        quad((x2-ad, _dr, z),            (x2-ad, _dr+_aw, z),         (x2-ad, _dr+_aw, z+_dh+_aw),     (x2-ad, _dr, z+_dh),           -1, 0, 0)  # right front
+        quad((x2,    _dr, z+_dh),        (x2, _dr, z),                (x2-ad, _dr, z),                  (x2-ad, _dr, z+_dh),            0,-1, 0)  # right inner
+        quad((x2-ad, _dr+_aw, z+_dh+_aw),(x2-ad, _dr+_aw, z),        (x2, _dr+_aw, z),                (x2, _dr+_aw, z+_dh+_aw),       0, 1, 0)  # right outer
+
+    # ── West wall — inner face at x=x1, arch protrudes +X into room ───────────
+    for _dl, _dr, _dh in _door_segs_for_reg(reg, 'W', y1, y2):
+        _aw = min(aw_raw, (_dr - _dl) * 0.5 - 1e-4)
+        if _aw <= 0: continue
+        quad((x1+ad, _dr, z),            (x1+ad, _dr+_aw, z),         (x1+ad, _dr+_aw, z+_dh+_aw),    (x1+ad, _dr, z+_dh),            1, 0, 0)  # right front
+        quad((x1+ad, _dr, z),            (x1, _dr, z),                (x1, _dr, z+_dh),                 (x1+ad, _dr, z+_dh),            0,-1, 0)  # right inner
+        quad((x1,    _dr+_aw, z),        (x1+ad, _dr+_aw, z),         (x1+ad, _dr+_aw, z+_dh+_aw),     (x1, _dr+_aw, z+_dh+_aw),      0, 1, 0)  # right outer
+        quad((x1,    _dr+_aw, z+_dh+_aw),(x1+ad, _dr+_aw, z+_dh+_aw),(x1+ad, _dr, z+_dh),             (x1, _dr, z+_dh),               0, 1, 1)  # right miter
+        quad((x1+ad, _dl-_aw, z+_dh+_aw),(x1+ad, _dr+_aw, z+_dh+_aw),(x1+ad, _dr, z+_dh),            (x1+ad, _dl, z+_dh),             1, 0, 0)  # head front
+        quad((x1+ad, _dr, z+_dh),        (x1+ad, _dl, z+_dh),         (x1, _dl, z+_dh),                (x1, _dr, z+_dh),               0, 0,-1)  # head soffit
+        quad((x1,    _dr+_aw, z+_dh+_aw),(x1+ad, _dr+_aw, z+_dh+_aw),(x1+ad, _dl-_aw, z+_dh+_aw),   (x1, _dl-_aw, z+_dh+_aw),      0, 0, 1)  # top
+        quad((x1+ad, _dl-_aw, z+_dh+_aw),(x1, _dl-_aw, z+_dh+_aw),  (x1, _dl, z+_dh),                (x1+ad, _dl, z+_dh),            0,-1, 1)  # left miter
+        quad((x1+ad, _dl, z+_dh),        (x1+ad, _dl-_aw, z+_dh+_aw),(x1+ad, _dl-_aw, z),             (x1+ad, _dl, z),                1, 0, 0)  # left front
+        quad((x1,    _dl, z+_dh),        (x1, _dl, z),                (x1+ad, _dl, z),                  (x1+ad, _dl, z+_dh),            0, 1, 0)  # left inner
+        quad((x1+ad, _dl-_aw, z),        (x1, _dl-_aw, z),            (x1, _dl-_aw, z+_dh+_aw),        (x1+ad, _dl-_aw, z+_dh+_aw),   0,-1, 0)  # left outer
+
+    return verts, faces
+
+
+def _sync_arch_obj(reg, s):
+    """Create / update / remove the separate architrave object for one room."""
+    obj_name  = reg.get("obj_name", "")
+    obj       = bpy.data.objects.get(obj_name)
+    arch_name = f"{obj_name}_Arch"
+    col       = next(iter(obj.users_collection), None) if obj else None
+
+    # Remove if disabled or room missing
+    if not getattr(s, 'add_architrave', False) or obj is None:
+        old = bpy.data.objects.get(arch_name)
+        if old:
+            old_me = old.data
+            bpy.data.objects.remove(old, do_unlink=True)
+            if old_me and old_me.users == 0:
+                bpy.data.meshes.remove(old_me)
+        reg.pop("arch_obj_name", None)
+        return
+
+    aw  = max(getattr(s, 'architrave_width',  0.07),  0.001)
+    ad  = max(getattr(s, 'architrave_depth',  0.015), 0.001)
+    verts, faces = _gen_arch_pydata(reg, aw, ad)
+
+    if not verts:
+        return  # no doors — nothing to generate
+
+    # Reuse existing object or create new one
+    arch_obj = bpy.data.objects.get(arch_name)
+    if arch_obj is not None:
+        old_me = arch_obj.data
+        new_me = bpy.data.meshes.new(arch_name)
+        arch_obj.data = new_me
+        if old_me and old_me.users == 0:
+            bpy.data.meshes.remove(old_me)
+        me = new_me
+    else:
+        me       = bpy.data.meshes.new(arch_name)
+        arch_obj = bpy.data.objects.new(arch_name, me)
+        (col or bpy.context.collection).objects.link(arch_obj)
+
+    me.from_pydata(verts, [], faces)
+    me.update()
+
+    # Merge coincident vertices so adjacent quads share edges (cleaner mesh,
+    # correct smooth shading). Normals are already correct from explicit hints
+    # in _gen_arch_pydata — no recalc_face_normals needed.
+    bm_arch = bmesh.new()
+    bm_arch.from_mesh(me)
+    bmesh.ops.remove_doubles(bm_arch, verts=bm_arch.verts, dist=1e-5)
+    bm_arch.normal_update()
+    bm_arch.to_mesh(me)
+    bm_arch.free()
+    me.update()
+
+    # Tag all faces as _CAT_ARCHITRAVE for correct UV tiling
+    cat_attr = (me.attributes.get("room_cat") or
+                me.attributes.new("room_cat", 'INT', 'FACE'))
+    for poly in me.polygons:
+        cat_attr.data[poly.index].value = _CAT_ARCHITRAVE
+
+    # Apply UV
+    while me.uv_layers:
+        me.uv_layers.remove(me.uv_layers[0])
+    _apply_cube_uv_to_mesh(me, s, obj=arch_obj)
+
+    # Apply material
+    while me.materials:
+        me.materials.pop()
+    mat = getattr(s, 'mat_architrave', None) or getattr(s, 'mat_walls', None)
+    if mat:
+        me.materials.append(mat)
+
+    # Match pivot of the room object (keeps both objects aligned)
+    pivot = obj.location.copy()
+    arch_obj.location = pivot
+    for v in me.vertices:
+        v.co.x -= pivot.x
+        v.co.y -= pivot.y
+        v.co.z -= pivot.z
+    me.update()
+
+    reg["arch_obj_name"] = arch_name
+
+
+def _sync_reg_bounds_from_mesh(reg, obj):
+    """Update reg x1/y1/x2/y2/z from the actual mesh world-space bounding box.
+    Called for locked rooms before cutting holes or placing instances so that
+    manually-moved walls are accounted for correctly."""
+    if obj is None or obj.type != 'MESH' or not obj.data.vertices:
+        return
+    mw = obj.matrix_world
+    xs, ys, zs = [], [], []
+    for v in obj.data.vertices:
+        wco = mw @ v.co
+        xs.append(wco.x)
+        ys.append(wco.y)
+        zs.append(wco.z)
+    reg["x1"] = min(xs)
+    reg["x2"] = max(xs)
+    reg["y1"] = min(ys)
+    reg["y2"] = max(ys)
+    reg["z"]  = min(zs)
 
 
 def _rebuild_room_mesh(reg, s):
@@ -1911,14 +2573,28 @@ def _rebuild_room_mesh(reg, s):
     obj = bpy.data.objects[obj_name]
 
     if reg.get("mesh_locked", False):
-        # Locked: skip geometry rebuild, only reposition opening instances.
-        # Refresh ew refs first so doors/windows follow any mesh edits (extrusions etc.)
+        # Locked: skip geometry rebuild, only cut new holes and reposition instances.
+        # Refresh registry bounds from the actual (possibly edited) mesh so that
+        # hole cutters and instance placement use the current wall positions.
+        _sync_reg_bounds_from_mesh(reg, obj)
         _refresh_ew_refs(reg, s)
         col = next(iter(obj.users_collection), None)
+        any_cut = False
+        for opening in reg.get("doors", []) + reg.get("windows", []):
+            if not opening.get("hole_cut_locked", False):
+                ok = _cut_hole_in_locked_mesh(reg, opening, s)
+                if ok:
+                    opening["hole_cut_locked"] = True
+                    any_cut = True
+        # After Boolean cuts, fix material_index on the whole mesh from the stored
+        # room_cat attribute without touching slot contents (which may hold per-room
+        # material assignments that differ from the active preset).
+        if any_cut:
+            me = obj.data
+            _sync_material_indices(me, _room_mat_list(s))
+            me.update()
         _sync_opening_meshes(reg, collection=col, s=s)
-        # Still update plinth dims/materials when settings change
-        if reg.get('plinth_bottom_enabled', False) or reg.get('plinth_top_enabled', False):
-            _recalculate_plinth_for_obj(reg, obj, s)
+        _sync_arch_obj(reg, s)
         return
 
     obj.location = (0.0, 0.0, 0.0)   # reset before regenerating at world coords
@@ -1933,7 +2609,7 @@ def _rebuild_room_mesh(reg, s):
                add_plinth_bottom=reg.get('plinth_bottom_enabled', False),
                add_plinth_top   =reg.get('plinth_top_enabled',    False),
                stair_holes      =reg.get('stair_holes', []),
-               add_architrave   =getattr(s, 'add_architrave', False))
+               add_architrave   =False)   # architrave is now a separate object
     _setup_room_materials(me, s, bm)
     bm.to_mesh(me)
     bm.free()
@@ -1941,9 +2617,23 @@ def _rebuild_room_mesh(reg, s):
     _setup_room_vertex_groups(obj, cat_vert_sets)
     _apply_room_pivot(obj, x1, y1, x2, y2, z, s.pivot_mode)
     _apply_cube_uv_to_mesh(me, s, obj=obj)
-    # Reposition any assigned door/window mesh instances
     col = next(iter(obj.users_collection), None)
     _sync_opening_meshes(reg, collection=col, s=s)
+    _sync_arch_obj(reg, s)  # build/update/remove separate arch object
+    # Also rebuild architrave on partner rooms that share a wall with this room's doors
+    rooms = ROOM_OT_draw._room_list
+    for door in reg.get("doors", []):
+        wc  = door.get("wc")
+        if not wc:
+            continue
+        for other in rooms:
+            if other is reg:
+                continue
+            for pd in other.get("doors", []):
+                if (pd.get("wc") == _OPPOSITE.get(wc)
+                        and abs(pd.get("anchor", 0) - door.get("anchor", 0)) < 0.05):
+                    _sync_arch_obj(other, s)
+                    break
 
 
 # ── Opening mesh helpers ──────────────────────────────────────────────────────
@@ -2102,7 +2792,8 @@ def _place_opening_mesh(opening, source_name, w, h, reg, collection=None):
     # Position / rotate
     inst.location = (cx, cy, cz)
     inst.rotation_euler = (0.0, 0.0, rot_z)
-    inst.scale = (-sx if flip_lr else sx, -1.0 if flip_io else 1.0, sz)
+    sy = src.scale.y  # propagate source Y (depth/thickness) scale to instance
+    inst.scale = (-sx if flip_lr else sx, -sy if flip_io else sy, sz)
 
 
 def _place_threshold(door, door_idx, reg, collection, s):
@@ -2176,6 +2867,29 @@ def _place_threshold(door, door_idx, reg, collection, s):
     bm.faces.new([vs[1], vs[2], vs[6], vs[5]])   # end 2
     bm.to_mesh(mesh)
     bm.free()
+    # UV mapping — cube projection with tiling/rotation from settings
+    import math as _math_uv
+    sc_x = getattr(s, 'threshold_tiling_x', 1.0)
+    sc_y = getattr(s, 'threshold_tiling_y', 1.0)
+    rot  = getattr(s, 'threshold_rotation', 0.0)
+    uv_layer = mesh.uv_layers.get("UVMap") or mesh.uv_layers.new(name="UVMap")
+    if rot != 0.0:
+        _cos = _math_uv.cos(_math_uv.radians(rot))
+        _sin = _math_uv.sin(_math_uv.radians(rot))
+    for poly in mesh.polygons:
+        n = poly.normal
+        ax, ay, az = abs(n.x), abs(n.y), abs(n.z)
+        for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
+            co = mesh.vertices[mesh.loops[li].vertex_index].co
+            if az >= ax and az >= ay:
+                u, v = co.x * sc_x, co.y * sc_y
+            elif ax >= ay:
+                u, v = co.y * sc_x, co.z * sc_y
+            else:
+                u, v = co.x * sc_x, co.z * sc_y
+            if rot != 0.0:
+                u, v = _cos * u - _sin * v, _sin * u + _cos * v
+            uv_layer.data[li].uv = (u, v)
 
     thr_obj = bpy.data.objects.get(thr_name)
     if thr_obj is None:
@@ -2219,51 +2933,12 @@ def _remove_threshold(door):
         bpy.data.meshes.remove(mesh)
 
 
-def _sync_all_thresholds(s):
-    """Sync threshold strips across ALL rooms — exactly one strip per door opening.
-    For paired (shared-wall) doors the room with the lower list index owns the
-    object; the other room stores a reference to the same object name."""
+def _sync_thresholds(reg, collection=None, s=None):
+    """Create/update/remove threshold strips for all doors in a room."""
     if s is None:
         return
-    rooms = ROOM_OT_draw._room_list
-    t_default = getattr(s, 'wall_thickness', 0.125)
-    # Auto-enable threshold when any two connected rooms share a door pair
-    if not getattr(s, 'add_threshold', False):
-        for ri_c, reg_c in enumerate(rooms):
-            t_c = reg_c.get("t", t_default)
-            for di_c in range(len(reg_c.get("doors", []))):
-                if _find_partner_door(rooms, ri_c, di_c, t_c) is not None:
-                    s['add_threshold'] = True   # bypass update cb, avoid recursion
-                    break
-            if getattr(s, 'add_threshold', False):
-                break
-    for ri, reg in enumerate(rooms):
-        obj = bpy.data.objects.get(reg.get("obj_name", ""))
-        col = next(iter(obj.users_collection), None) if obj else None
-        t   = reg.get("t", t_default)
-        for di, door in enumerate(reg.get("doors", [])):
-            if not getattr(s, 'add_threshold', False):
-                _remove_threshold(door)
-                continue
-            partner = _find_partner_door(rooms, ri, di, t)
-            if partner is not None:
-                p_ri, p_di = partner
-                if p_ri < ri or (p_ri == ri and p_di < di):
-                    # Partner already processed and owns the strip.
-                    # Only remove a *separate* object this door may have created
-                    # previously; never remove the shared object owned by the partner.
-                    p_doors = rooms[p_ri].get("doors", [])
-                    owner_name = (p_doors[p_di].get("threshold_obj_name")
-                                  if p_di < len(p_doors) else None)
-                    self_name = door.get("threshold_obj_name")
-                    if self_name and self_name != owner_name:
-                        _remove_threshold(door)
-                    else:
-                        door.pop("threshold_obj_name", None)
-                    if owner_name:
-                        door["threshold_obj_name"] = owner_name
-                    continue
-            _place_threshold(door, di, reg, col, s)
+    for di, door in enumerate(reg.get("doors", [])):
+        _place_threshold(door, di, reg, collection, s)
 
 
 def _remove_opening_mesh(opening):
@@ -2278,14 +2953,43 @@ def _remove_opening_mesh(opening):
             bpy.data.objects.remove(inst)
 
 
+def _purge_deleted_openings(rooms=None):
+    """Remove openings from locked rooms whose mesh instance was deleted by the user.
+
+    When mesh_locked is True, a missing mesh_obj_name object means the user
+    intentionally deleted that frame from the viewport.  Purging it from the
+    registry clears the occupied zone so new openings can be placed there.
+    """
+    if rooms is None:
+        rooms = ROOM_OT_draw._room_list
+    for reg in rooms:
+        if not reg.get("mesh_locked", False):
+            continue
+        for key in ("doors", "windows"):
+            survivors = []
+            for opening in reg.get(key, []):
+                obj_name = opening.get("mesh_obj_name", "")
+                if obj_name and bpy.data.objects.get(obj_name) is None:
+                    # Object was deleted by the user — drop from registry
+                    continue
+                survivors.append(opening)
+            reg[key] = survivors
+
+
 def _sync_opening_meshes(reg, collection=None, s=None):
     """Reposition / recreate all door and window mesh instances for a room.
     Called after _rebuild_room_mesh so instances stay in sync with geometry."""
-    wall_h = getattr(s, 'wall_height', None) if s is not None else None
+    wall_h  = getattr(s, 'wall_height', None) if s is not None else None
+    locked  = reg.get("mesh_locked", False)
     for opening in reg.get("doors", []) + reg.get("windows", []):
         src_name = opening.get("mesh_source")
         if not src_name:
             continue
+        # When the mesh is locked and the instance was previously placed but
+        # its object no longer exists, the user deleted it intentionally — skip.
+        if locked and "mesh_obj_name" in opening:
+            if bpy.data.objects.get(opening["mesh_obj_name"]) is None:
+                continue
         w = opening.get("w", opening.get("window_width", 1.0))
         h = opening.get("h", opening.get("window_height", 1.0))
         # Clamp window sill height so the mesh instance never floats above the room.
@@ -2297,8 +3001,8 @@ def _sync_opening_meshes(reg, collection=None, s=None):
             if opening["v_offset"] > max_voff:
                 opening["v_offset"] = max_voff
         _place_opening_mesh(opening, src_name, w, h, reg, collection)
-    # Sync threshold strips globally so paired doors share one strip
-    _sync_all_thresholds(s)
+    # Sync threshold strips for this room
+    _sync_thresholds(reg, collection, s)
 
 
 def _apply_room_pivot(obj, x1, y1, x2, y2, z, mode):
@@ -2327,40 +3031,48 @@ def _apply_room_pivot(obj, x1, y1, x2, y2, z, mode):
     obj.location = pivot
 
 
+def _room_mat_list(s):
+    """Return the fixed 9-slot material list for a room (index == _CAT_* constant).
+    Never deduplicated — slot index is permanently tied to the category so that
+    face material_index values never go stale when materials are changed."""
+    mat_w    = getattr(s, 'mat_walls',          None)
+    mat_f    = getattr(s, 'mat_floor',          None)
+    mat_c    = getattr(s, 'mat_ceiling',        None)
+    mat_d    = getattr(s, 'mat_door_frame',     None) or mat_w
+    mat_wf   = getattr(s, 'mat_window_frame',   None) or mat_w
+    mat_pb   = getattr(s, 'mat_plinth_bottom',  None) or mat_w
+    mat_pt   = getattr(s, 'mat_plinth_top',     None) or mat_w
+    mat_arch = getattr(s, 'mat_architrave',     None) or mat_w
+    # Slot index == _CAT_* constant — this ordering must never change
+    return [mat_w, mat_f, mat_c, mat_d, mat_wf, mat_pb, mat_pt, mat_w, mat_arch]
+
+
 def _setup_room_materials(me, s, bm):
-    """Clear mesh material slots and re-populate from settings; assign face material_index.
-    Door frames and window frames fall back to the wall material when not explicitly set."""
-    while me.materials:
-        me.materials.pop(index=0)
-    mat_w  = getattr(s, 'mat_walls',        None)
-    mat_f  = getattr(s, 'mat_floor',        None)
-    mat_c  = getattr(s, 'mat_ceiling',      None)
-    mat_d  = getattr(s, 'mat_door_frame',   None) or mat_w
-    mat_wf = getattr(s, 'mat_window_frame', None) or mat_w
-    mat_pb   = getattr(s, 'mat_plinth_bottom', None) or mat_w
-    mat_pt   = getattr(s, 'mat_plinth_top',    None) or mat_w
-    mat_arch = getattr(s, 'mat_architrave',    None) or mat_w
-    # Build deduplicated slot list so shared materials use one slot
-    mat_list  = []
-    slot_map  = {}
-    # Index must match the _CAT_* constants (0=wall … 6=plinth_top, 7=stair, 8=architrave)
-    for cat, mat in enumerate((mat_w, mat_f, mat_c, mat_d, mat_wf, mat_pb, mat_pt, mat_w, mat_arch)):
-        if mat is None:
-            slot_map[cat] = None
-        elif mat in mat_list:
-            slot_map[cat] = mat_list.index(mat)
-        else:
-            slot_map[cat] = len(mat_list)
-            mat_list.append(mat)
-    for mat in mat_list:
-        me.materials.append(mat)
-    if any(v is not None for v in slot_map.values()):
-        cat_layer = bm.faces.layers.int.get("room_cat")
-        if cat_layer:
-            for face in bm.faces:
-                si = slot_map.get(face[cat_layer])
-                if si is not None:
-                    face.material_index = si
+    """Ensure 9 material slots and assign face material_index from the room_cat layer.
+    Uses fixed 9 slots (slot index == _CAT_* constant) so indices never shift.
+
+    Existing slot contents are PRESERVED so that geometry rebuilds triggered by
+    stair creation or trim/plinth settings do not overwrite per-room material
+    assignments.  Empty (None) slots are filled from room_settings; slots that
+    already hold a material are left untouched.  Use _apply_materials_one_room /
+    _apply_materials_all_rooms to explicitly update slot contents."""
+    mats = _room_mat_list(s)
+    n = len(mats)
+    # Ensure exactly n slots — add empty if too few, trim from the end if too many
+    while len(me.materials) < n:
+        me.materials.append(None)
+    while len(me.materials) > n:
+        me.materials.pop(index=len(me.materials) - 1)
+    # Populate only empty slots so existing per-room materials are not overwritten
+    for i, mat in enumerate(mats):
+        if me.materials[i] is None and mat is not None:
+            me.materials[i] = mat
+    cat_layer = bm.faces.layers.int.get("room_cat")
+    if cat_layer:
+        for face in bm.faces:
+            cat = face[cat_layer]
+            if 0 <= cat <= 8:
+                face.material_index = cat
 
 
 def _setup_room_vertex_groups(obj, cat_vert_sets):
@@ -3856,11 +4568,26 @@ class ROOM_OT_draw(bpy.types.Operator):
             is_blocked  = (anchor is None)
             draw_anchor = _clamp_anchor(raw_anchor, r, wall_char, dw, s.door_margin, zones=_zones_dc)
             ghost_door  = {"wc": wall_char, "anchor": draw_anchor, "w": dw, "h": dh}
+            # ── Mesh ghost (semi-transparent solid) ──────────────────────────
+            _mesh_src_dr = None
+            if 0 <= active < len(presets) and presets[active].mesh_object:
+                _mesh_src_dr = presets[active].mesh_object
+            if _mesh_src_dr is not None:
+                try:
+                    _gtris_dr = _mesh_ghost_tris(_mesh_src_dr, ghost_door, r)
+                    if _gtris_dr:
+                        _gb_dr = batch_for_shader(shader, 'TRIS', {"pos": _gtris_dr})
+                        shader.uniform_float("color",
+                            (0.55, 0.82, 1.0, 0.40) if not is_blocked
+                            else (1.0, 0.40, 0.30, 0.35))
+                        _gb_dr.draw(shader)
+                except Exception:
+                    pass
+            # ── Rectangle outline ─────────────────────────────────────────────
             d_verts = _door_frame_verts(r, ghost_door, r.get("z", s.z_foundation), dw, dh)
-            # Door ghost — green = valid, red = blocked
             b3 = batch_for_shader(shader, 'TRIS', {"pos": d_verts}, indices=idx_fill)
             shader.uniform_float("color",
-                (1.0, 0.08, 0.05, 0.35) if is_blocked else (0.05, 0.85, 0.2, 0.32))
+                (1.0, 0.08, 0.05, 0.28) if is_blocked else (0.05, 0.85, 0.2, 0.22))
             b3.draw(shader)
             gpu.state.line_width_set(2.0)
             b4 = batch_for_shader(shader, 'LINES', {"pos": d_verts}, indices=idx_line)
@@ -4008,44 +4735,19 @@ class ROOM_OT_draw(bpy.types.Operator):
             if event.type not in {'ESC', 'RIGHTMOUSE'}:
                 return {'PASS_THROUGH'}
 
-        # Tab / Shift+Tab — cycle door presets during DS phase
+        # Tab / Shift+Tab — cycle door presets
         if event.type == 'TAB' and event.value == 'PRESS':
-            if self._phase == 'DS':
-                presets = context.scene.room_door_presets
-                active  = context.scene.room_active_door_preset
-                if len(presets) > 1:
-                    delta      = -1 if event.shift else 1
-                    new_active = (active + delta) % len(presets)
-                    context.scene.room_active_door_preset = new_active
-                    dp   = presets[new_active]
-                    ex_reg = ROOM_OT_draw._room_list[self._ds_room_idx]
-                    di     = self._ds_door_idx
-                    if di is not None and di < len(ex_reg.get("doors", [])):
-                        new_src = dp.mesh_object.name if dp.mesh_object else None
-                        ex_reg["doors"][di]["w"]           = dp.door_width
-                        ex_reg["doors"][di]["h"]           = dp.door_height
-                        ex_reg["doors"][di]["mesh_source"] = new_src
-                        _rebuild_room_mesh(ex_reg, s)
-                        partner = _find_partner_wall(
-                            ROOM_OT_draw._room_list, self._ds_room_idx,
-                            self._ds_wall_char, s.wall_thickness)
-                        if partner is not None:
-                            p_idx, p_wc = partner
-                            p_reg = ROOM_OT_draw._room_list[p_idx]
-                            # Find the partner door by anchor
-                            cur_anchor = ex_reg["doors"][di]["anchor"]
-                            for pd in p_reg.get("doors", []):
-                                if pd["wc"] == p_wc and abs(pd["anchor"] - cur_anchor) < 0.001:
-                                    pd["w"]           = dp.door_width
-                                    pd["h"]           = dp.door_height
-                                    pd["mesh_source"] = new_src
-                                    break
-                            _rebuild_room_mesh(p_reg, s)
-                        _sync_to_scene(context)
-                        context.area.header_text_set(
-                            f"Preset: {dp.name} ({dp.door_width:.2f}×{dp.door_height:.2f}m)  |  "
-                            "Tab/Shift+Tab to cycle · Click to confirm  |  RMB – cancel")
-                        context.area.tag_redraw()
+            presets = context.scene.room_door_presets
+            active  = context.scene.room_active_door_preset
+            if len(presets) > 1:
+                delta      = -1 if event.shift else 1
+                new_active = (active + delta) % len(presets)
+                context.scene.room_active_door_preset = new_active
+                dp = presets[new_active]
+                context.area.header_text_set(
+                    f"Preset: {dp.name} ({dp.door_width:.2f}×{dp.door_height:.2f}m)  |  "
+                    "Tab/Shift+Tab to cycle")
+                context.area.tag_redraw()
             return {'RUNNING_MODAL'}
 
         # Scroll — navigation only (presets via Tab/Shift+Tab)
@@ -4074,6 +4776,7 @@ class ROOM_OT_draw(bpy.types.Operator):
                     _rebuild_room_mesh(ex_reg, s)
                 self._hovered = None
                 _sync_to_scene(context)
+                bpy.ops.ed.undo_push(message="Undo Room")
                 context.area.tag_redraw()
                 self._msg(context,
                     f"Undid last room  ({len(self._session_rooms)} this session)  |  "
@@ -4114,8 +4817,7 @@ class ROOM_OT_draw(bpy.types.Operator):
         # ── exit / cancel ──────────────────────────────────────────────────
         if event.type in {"RIGHTMOUSE", "ESC"} and event.value == 'PRESS':
             if self._phase != 0:
-                self._reset_placement(context)
-                return {'RUNNING_MODAL'}
+                self._reset_placement(context)   # clean up in-progress room
             self._delete_preview()
             self._remove_draw_handle()
             self._msg(context, None)
@@ -4123,8 +4825,7 @@ class ROOM_OT_draw(bpy.types.Operator):
 
         if event.type in {"RET", "NUMPAD_ENTER"} and event.value == 'PRESS':
             if self._phase != 0:
-                self._reset_placement(context)
-                return {'RUNNING_MODAL'}
+                self._reset_placement(context)   # clean up in-progress room
             self._delete_preview()
             self._remove_draw_handle()
             self._msg(context, None)
@@ -4194,6 +4895,13 @@ class ROOM_OT_draw(bpy.types.Operator):
                                           zones=_zones_ds, wall_span=_span_ds)
                     if anchor is not None:
                         doors[di]["anchor"] = anchor
+                        # Keep the green GPU preview in sync with the door
+                        if self._hovered is not None:
+                            sp_h = self._hovered[0]
+                            if wc in ('E', 'W'):
+                                sp_h.y = anchor
+                            else:
+                                sp_h.x = anchor
                         if wc in ('E', 'W'):
                             self._start.y = anchor
                         else:
@@ -4329,7 +5037,7 @@ class ROOM_OT_draw(bpy.types.Operator):
                         else:
                             new_door = {"wc": wc, "anchor": anchor,
                                         "w": ds_dw, "h": ds_dh}
-                            # Attach mesh from active preset (same as door edit mode)
+                            # Attach mesh from active preset
                             _dp2 = context.scene.room_door_presets
                             _da2 = context.scene.room_active_door_preset
                             if 0 <= _da2 < len(_dp2) and _dp2[_da2].mesh_object:
@@ -4339,11 +5047,14 @@ class ROOM_OT_draw(bpy.types.Operator):
                             ex_reg.setdefault("doors", []).append(new_door)
                             self._ds_door_idx = len(ex_reg["doors"]) - 1
                             _rebuild_room_mesh(ex_reg, s)
-                            self._end  = self._start.copy()
-                            self._phase = 'DS'
+                            # Go straight to phase 1 — no second slide needed
+                            self._end   = self._start.copy()
+                            self._phase = 1
+                            self._create_preview(context)
                             context.area.tag_redraw()
                             self._msg(context,
-                                "Slide door along wall · Tab/Shift+Tab=preset  |  Click to confirm  |  RMB – cancel")
+                                "Move to set first side  ·  Alt+S – snap to wall edge"
+                                "  |  Click to confirm  |  RMB – cancel")
                     else:
                         # No door: skip DS, go straight to drawing the room shape
                         self._ds_room_idx = self._ds_wall_char = self._ds_door_idx = None
@@ -4362,16 +5073,6 @@ class ROOM_OT_draw(bpy.types.Operator):
                     self._create_preview(context)
                     self._msg(context,
                         "Move to set east/west width  |  Click to confirm  |  RMB – cancel")
-                return {'RUNNING_MODAL'}
-
-            # ── Click DS: confirm door position → phase 1 ─────────────
-            if self._phase == 'DS':
-                self._end   = self._start.copy()
-                self._phase = 1
-                self._create_preview(context)
-                self._msg(context,
-                    "Move to set first side  ·  Alt+S – snap to wall edge"
-                    "  |  Click to confirm  |  RMB – cancel")
                 return {'RUNNING_MODAL'}
 
             # ── Click 2: lock first side ───────────────────────────────
@@ -4458,8 +5159,10 @@ class ROOM_OT_draw(bpy.types.Operator):
                         "mesh_locked":           False,
                     }
                     ROOM_OT_draw._room_list.append(reg)
+                    _sync_arch_obj(reg, s)   # generate arch for new room if enabled
                     self._session_rooms.append((obj, reg, ex_reg, prev_ds_door_idx))
                     _sync_to_scene(context)
+                    bpy.ops.ed.undo_push(message="Place Room")
                     for o in list(context.selected_objects):
                         o.select_set(False)
                     obj.select_set(True)
@@ -4537,38 +5240,178 @@ def _snap_no_walls(snap_info):
     return ()
 
 
-_hint_cb_state = {"prev_mode": None, "prev_obj": None}   # module-level state
+def _opening_centre_3d(reg, wc, anchor, ow, oh, voff, z):
+    """Return 3D world-space centre of a door/window opening."""
+    from mathutils import Vector
+    x1, x2 = reg.get("x1", 0.0), reg.get("x2", 0.0)
+    y1, y2 = reg.get("y1", 0.0), reg.get("y2", 0.0)
+    zc = z + voff + oh * 0.5
+    if wc == 'S': return Vector((anchor, y1, zc))
+    if wc == 'N': return Vector((anchor, y2, zc))
+    if wc == 'W': return Vector((x1, anchor, zc))
+    return Vector((x2, anchor, zc))
+
+
+def _draw_dimensions_cb():
+    """Persistent POST_PIXEL draw handler — viewport dimension annotations."""
+    try:
+        ctx = bpy.context
+        if ctx is None or ctx.area is None or ctx.region is None:
+            return
+        if ctx.area.type != 'VIEW_3D':
+            return
+        s = getattr(ctx.scene, 'room_settings', None)
+        if s is None or not getattr(s, 'show_dimensions', False):
+            return
+        rooms = ROOM_OT_draw._room_list
+        if not rooms:
+            return
+
+        from bpy_extras.view3d_utils import location_3d_to_region_2d
+        from mathutils import Vector
+
+        region = ctx.region
+        rv3d   = ctx.space_data.region_3d
+        dim_rooms    = getattr(s, 'dim_rooms',    True)
+        dim_openings = getattr(s, 'dim_openings', True)
+
+        def to2d(p3):
+            r = location_3d_to_region_2d(region, rv3d, Vector(p3))
+            return r  # mathutils.Vector2D or None
+
+        # ── collect all line segments (in 2-D screen space) ──────────────────
+        line_verts   = []   # flat list of (x,y) tuples
+        label_queue  = []   # (pos_2d, text, rgba)
+
+        def add_seg(a2, b2):
+            if a2 is not None and b2 is not None:
+                line_verts.append((a2.x, a2.y))
+                line_verts.append((b2.x, b2.y))
+
+        DIM_COL  = (0.95, 0.85, 0.10, 0.90)   # golden yellow  — room dims
+        DOOR_COL = (0.55, 1.00, 0.45, 0.95)   # green          — doors
+        WIN_COL  = (0.45, 0.80, 1.00, 0.95)   # blue           — windows
+
+        TICK_PX  = 6.0    # half-length of end ticks in screen pixels
+        EXTN_PX  = 8.0    # extra screen pixels beyond the dim line for ext lines
+
+        def draw_dim(p1w, p2w, off3, label, col):
+            """Dimension annotation: extension lines + dim line + ticks + label."""
+            off = Vector(off3)
+            d1  = to2d(Vector(p1w) + off)
+            d2  = to2d(Vector(p2w) + off)
+            e1  = to2d(p1w)
+            e2  = to2d(p2w)
+            if None in (d1, d2, e1, e2):
+                return
+            # Extension lines (slightly beyond the dim line for visual clarity)
+            dv = d1 - e1
+            ext = dv.normalized() * EXTN_PX if dv.length > 1e-3 else dv
+            add_seg(e1, d1 + ext)
+            dv2 = d2 - e2
+            ext2 = dv2.normalized() * EXTN_PX if dv2.length > 1e-3 else dv2
+            add_seg(e2, d2 + ext2)
+            # Dimension line
+            add_seg(d1, d2)
+            # End ticks (perpendicular to dim line)
+            span = d2 - d1
+            if span.length > 4.0:
+                n = Vector((-span.normalized().y, span.normalized().x)) * TICK_PX
+                add_seg(d1 - n, d1 + n)
+                add_seg(d2 - n, d2 + n)
+            # Label at midpoint of dim line
+            mid = (d1 + d2) * 0.5
+            label_queue.append((mid, label, col))
+
+        # Convert Blender internal units → metres for display
+        unit_scale = ctx.scene.unit_settings.scale_length  # e.g. 0.01 if scene is cm
+
+        def to_m(v):
+            """Blender units → metres, formatted as e.g. '3.05 m'."""
+            return f"{v * unit_scale:.2f} m"
+
+        def to_m2(a, b):
+            """Two Blender-unit values → 'A×B m' label."""
+            return f"{a * unit_scale:.2f}×{b * unit_scale:.2f} m"
+
+        for reg in rooms:
+            x1  = reg.get("x1", 0.0); x2 = reg.get("x2", 0.0)
+            y1  = reg.get("y1", 0.0); y2 = reg.get("y2", 0.0)
+            z   = reg.get("z",  0.0)
+            t   = reg.get("t",  getattr(s, 'wall_thickness', 0.125))
+            wh  = getattr(s, 'wall_height', 2.4)
+            off = max(t * 2.0, 0.25)
+
+            if dim_rooms:
+                rw = x2 - x1
+                rd = y2 - y1
+                if rw > 0.01:
+                    draw_dim((x1, y1, z), (x2, y1, z),
+                             (0, -off, 0), to_m(rw), DIM_COL)
+                if rd > 0.01:
+                    draw_dim((x1, y1, z), (x1, y2, z),
+                             (-off, 0, 0), to_m(rd), DIM_COL)
+                if wh > 0.01:
+                    draw_dim((x2, y1, z), (x2, y1, z + wh),
+                             (off, 0, 0), to_m(wh), DIM_COL)
+
+            if dim_openings:
+                for door in reg.get("doors", []):
+                    wc   = door.get("wc", 'S')
+                    anch = door.get("anchor", 0.0)
+                    dw   = door.get("w",  door.get("door_width",  0.9))
+                    dh   = door.get("h",  door.get("door_height", 2.0))
+                    voff = door.get("v_offset", 0.0)
+                    ctr  = _opening_centre_3d(reg, wc, anch, dw, dh, voff, z)
+                    p2d  = to2d(ctr)
+                    if p2d:
+                        label_queue.append((p2d, to_m2(dw, dh), DOOR_COL))
+
+                for win in reg.get("windows", []):
+                    wc   = win.get("wc", 'S')
+                    anch = win.get("anchor", 0.0)
+                    ww   = win.get("w",  win.get("window_width",  1.0))
+                    wh_w = win.get("h",  win.get("window_height", 1.2))
+                    voff = win.get("v_offset", 0.9)
+                    ctr  = _opening_centre_3d(reg, wc, anch, ww, wh_w, voff, z)
+                    p2d  = to2d(ctr)
+                    if p2d:
+                        label_queue.append((p2d, to_m2(ww, wh_w), WIN_COL))
+
+        # ── draw all lines in one batch ───────────────────────────────────────
+        if line_verts:
+            n_lines = len(line_verts) // 2
+            indices = [(i * 2, i * 2 + 1) for i in range(n_lines)]
+            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+            gpu.state.blend_set('ALPHA')
+            gpu.state.line_width_set(1.5)
+            batch = batch_for_shader(shader, 'LINES', {"pos": line_verts}, indices=indices)
+            shader.bind()
+            shader.uniform_float("color", DIM_COL)
+            batch.draw(shader)
+            gpu.state.blend_set('NONE')
+            gpu.state.line_width_set(1.0)
+
+        # ── draw all labels ───────────────────────────────────────────────────
+        for (p2d, text, col) in label_queue:
+            blf.size(0, 11)
+            blf.color(0, *col)
+            tw, th = blf.dimensions(0, text)
+            blf.position(0, p2d.x - tw * 0.5, p2d.y + 3, 0)
+            blf.draw(0, text)
+
+    except Exception:
+        pass   # never crash in a draw handler
 
 
 def _draw_room_hint_cb():
     """Persistent POST_PIXEL handler: draws hint text at the bottom of the 3D
-    viewport when the user is in Edit Mode on a room mesh.  Also detects
-    edit-mode exit and auto-recalculates plinth if the room has plinth enabled."""
+    viewport when the user is in Edit Mode on a room mesh."""
     try:
         ctx = bpy.context
         if ctx.area is None or ctx.region is None:
             return
         active = ctx.active_object
-        # ── Detect edit-mode exit and auto-recalculate plinth ─────────────
-        cur_mode = ctx.mode
-        prev_mode = _hint_cb_state["prev_mode"]
-        prev_obj  = _hint_cb_state["prev_obj"]
-        _hint_cb_state["prev_mode"] = cur_mode
-        _hint_cb_state["prev_obj"]  = active.name if active else None
-        if (prev_mode == 'EDIT_MESH' and cur_mode != 'EDIT_MESH' and
-                prev_obj is not None):
-            exited_reg = next((r for r in ROOM_OT_draw._room_list
-                               if r.get('obj_name') == prev_obj), None)
-            if exited_reg is not None:
-                ex_obj = bpy.data.objects.get(prev_obj)
-                s_ec   = getattr(ctx.scene, 'room_settings', None)
-                if ex_obj and s_ec and (
-                        exited_reg.get('plinth_bottom_enabled', False) or
-                        exited_reg.get('plinth_top_enabled', False)):
-                    try:
-                        _recalculate_plinth_for_obj(exited_reg, ex_obj, s_ec)
-                    except Exception:
-                        pass
         if active is None:
             return
         reg = next((r for r in ROOM_OT_draw._room_list
@@ -4593,11 +5436,38 @@ def _draw_room_hint_cb():
         pass
 
 
+def _delete_room_parts(reg):
+    """Delete all objects associated with a room registry entry (architrave,
+    door/window mesh instances, threshold strips).  The room mesh itself is
+    assumed to already be gone (or is being deleted by the user)."""
+    def _rm(name):
+        if not name:
+            return
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    _rm(reg.get("arch_obj_name"))
+    for door in reg.get("doors", []):
+        _rm(door.get("mesh_obj_name"))
+        _rm(door.get("threshold_obj_name"))
+    for win in reg.get("windows", []):
+        _rm(win.get("mesh_obj_name"))
+
+
 @bpy.app.handlers.persistent
 def _room_registry_cleanup(scene, depsgraph):
     """Remove rooms whose objects no longer exist (deleted or not yet restored by undo).
+    Also deletes all parts that belong to the deleted room (architrave, door/window
+    mesh instances, thresholds).
     Also detect deleted stair objects, strip their holes from rooms, and schedule a
     deferred mesh rebuild (timer avoids infinite depsgraph recursion)."""
+    deleted_rooms = [
+        r for r in ROOM_OT_draw._room_list
+        if r.get("obj_name", "") not in bpy.data.objects
+    ]
+    for reg in deleted_rooms:
+        _delete_room_parts(reg)
     ROOM_OT_draw._room_list[:] = [
         r for r in ROOM_OT_draw._room_list
         if r.get("obj_name", "") in bpy.data.objects
@@ -4742,6 +5612,66 @@ def _room_undo_post(*args):
                     reg["mesh_locked"] = getattr(e, "mesh_locked", False)
                 except Exception:
                     pass
+    except Exception:
+        pass
+
+
+# ── Auto UV recalculate on Edit Mode exit ─────────────────────────────────────
+_room_edit_mode_objects: set = set()   # obj_names that were in edit mode last frame
+
+@bpy.app.handlers.persistent
+def _room_edit_mode_exit(*args):
+    """Detect when a room object exits Edit Mode and auto-recalculate its UVs.
+    UV recalculation is deferred to a timer to avoid modifying mesh data inside
+    a depsgraph_update_post handler (which can cause infinite recursion)."""
+    try:
+        context = bpy.context
+        if context is None:
+            return
+        s = getattr(context.scene, 'room_settings', None)
+        if s is None:
+            return
+        room_names = {r.get("obj_name", "") for r in ROOM_OT_draw._room_list}
+        # Find objects currently in edit mode
+        current_edit = {obj.name for obj in bpy.data.objects
+                        if obj.mode == 'EDIT' and obj.name in room_names}
+        # Objects that were in edit mode last frame but are no longer
+        just_exited = _room_edit_mode_objects - current_edit
+        if just_exited:
+            exited_names = list(just_exited)
+
+            def _deferred_uv():
+                try:
+                    sc = bpy.context.scene
+                    sc_s = getattr(sc, 'room_settings', None)
+                    if sc_s is None:
+                        return None
+                    for obj_name in exited_names:
+                        reg = next((r for r in ROOM_OT_draw._room_list
+                                    if r.get("obj_name") == obj_name), None)
+                        if reg is None:
+                            continue
+                        _apply_uvs_one_room(reg, sc_s)
+                        # Recalculate plinth for unlocked rooms with plinth enabled.
+                        # Done here (deferred timer) rather than in the draw callback
+                        # to avoid modifying mesh data mid-render, which can corrupt
+                        # the mesh and cause rooms to disappear.
+                        if (not reg.get('mesh_locked', False) and
+                                (reg.get('plinth_bottom_enabled', False) or
+                                 reg.get('plinth_top_enabled', False))):
+                            obj = bpy.data.objects.get(obj_name)
+                            if obj is not None:
+                                try:
+                                    _recalculate_plinth_for_obj(reg, obj, sc_s)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+                return None  # don't repeat
+
+            bpy.app.timers.register(_deferred_uv, first_interval=0.0)
+        _room_edit_mode_objects.clear()
+        _room_edit_mode_objects.update(current_edit)
     except Exception:
         pass
 
@@ -5058,6 +5988,7 @@ class ROOM_OT_door_edit(bpy.types.Operator):
             self.report({"WARNING"}, "Must be used inside the 3D Viewport")
             return {"CANCELLED"}
         _sync_from_scene(context)
+        _purge_deleted_openings()
         self._phase           = 'HOVER'
         self._hovered_door    = None
         self._hover_snap      = None
@@ -5522,7 +6453,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
         idx_line = [(0, 1), (1, 2), (2, 3), (3, 0)]
 
         # ── Active window(s) (being placed or slid) — always drawn live ────────
-        if (self._phase in ('SLIDING', 'H_POSITION', 'V_POSITION') and
+        if (self._phase in ('SLIDING', 'V_POSITION') and
                 self._active_idx is not None and self._active_win_idx is not None):
             ri = self._active_idx
             if ri < len(rooms):
@@ -5751,6 +6682,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
         center   = proto["anchor"] + (old_count - 1) * (ww + gap) / 2
         for k in reversed(range(old_count)):
             if wi + k < len(wins):
+                _remove_opening_mesh(wins[wi + k])
                 wins.pop(wi + k)
         p_ri = p_wi = None
         if self._active_partner is not None:
@@ -5758,20 +6690,31 @@ class ROOM_OT_window_edit(bpy.types.Operator):
             p_wins = rooms[p_ri].get("windows", [])
             for k in reversed(range(old_count)):
                 if p_wi + k < len(p_wins):
+                    _remove_opening_mesh(p_wins[p_wi + k])
                     p_wins.pop(p_wi + k)
-        anchors = _array_anchors(center, new_count, ww, gap, reg, wc, s.door_margin)
+        anchors  = _array_anchors(center, new_count, ww, gap, reg, wc, s.door_margin)
+        mesh_src = proto.get("mesh_source")
+        ew_data  = proto.get("ew")
         for k, anch in enumerate(anchors):
-            wins.insert(wi + k, {"wc": wc, "anchor": anch,
-                                 "v_offset": voff, "w": ww, "h": wh,
-                                 "array_n": new_count, "array_idx": k})
+            wd = {"wc": wc, "anchor": anch, "v_offset": voff, "w": ww, "h": wh,
+                  "array_n": new_count, "array_idx": k}
+            if mesh_src:
+                wd["mesh_source"] = mesh_src
+            if ew_data:
+                wd["ew"] = ew_data
+            wins.insert(wi + k, wd)
         _rebuild_room_mesh(reg, s)
         if p_ri is not None and p_wi is not None:
             p_wc   = _OPPOSITE[wc]
             p_wins = rooms[p_ri].get("windows", [])
             for k, anch in enumerate(anchors):
-                p_wins.insert(p_wi + k, {"wc": p_wc, "anchor": anch,
-                                         "v_offset": voff, "w": ww, "h": wh,
-                                         "array_n": new_count, "array_idx": k})
+                pd = {"wc": p_wc, "anchor": anch, "v_offset": voff, "w": ww, "h": wh,
+                      "array_n": new_count, "array_idx": k}
+                if mesh_src:
+                    pd["mesh_source"] = mesh_src
+                if ew_data:
+                    pd["ew"] = ew_data
+                p_wins.insert(p_wi + k, pd)
             _rebuild_room_mesh(rooms[p_ri], s)
         self._array_count    = new_count
         s.window_array_count = new_count
@@ -5825,6 +6768,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
             self.report({"WARNING"}, "Must be used inside the 3D Viewport")
             return {"CANCELLED"}
         _sync_from_scene(context)
+        _purge_deleted_openings()
         # Repair any windows whose stored v_offset is out of bounds (e.g. from
         # sampling a mesh placed high in the scene).  Only repositions instances.
         s_inv = context.scene.room_settings
@@ -5880,6 +6824,13 @@ class ROOM_OT_window_edit(bpy.types.Operator):
             if self._undo_stack:
                 for ri_u, wins_u in self._undo_stack.pop():
                     if ri_u < len(rooms):
+                        # Remove mesh instances that won't survive the restore
+                        kept_names = {w.get("mesh_obj_name")
+                                      for w in wins_u if w.get("mesh_obj_name")}
+                        for w in rooms[ri_u].get("windows", []):
+                            name = w.get("mesh_obj_name")
+                            if name and name not in kept_names:
+                                _remove_opening_mesh(w)
                         rooms[ri_u]["windows"] = wins_u
                         _rebuild_room_mesh(rooms[ri_u], s)
                 _sync_to_scene(context)
@@ -5899,24 +6850,36 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                 # If there is an active window being placed/moved, update its dims
                 if (self._phase in ('LMB_DOWN', 'SLIDING', 'H_POSITION', 'V_POSITION') and
                         self._active_idx is not None and self._active_win_idx is not None):
-                    reg   = rooms[self._active_idx]
-                    wi    = self._active_win_idx
-                    wins  = reg.get("windows", [])
-                    count = self._array_count
+                    reg      = rooms[self._active_idx]
+                    wi       = self._active_win_idx
+                    wins     = reg.get("windows", [])
+                    count    = self._array_count
+                    new_src  = wp.mesh_object.name if wp.mesh_object else None
                     for k in range(count):
                         if wi + k < len(wins):
-                            wins[wi + k]["w"]        = wp.window_width
-                            wins[wi + k]["h"]        = wp.window_height
-                            wins[wi + k]["v_offset"] = wp.v_offset
+                            wd = wins[wi + k]
+                            # Remove old mesh instance so it's recreated with new source
+                            if new_src != wd.get("mesh_source"):
+                                _remove_opening_mesh(wd)
+                            wd["w"]        = wp.window_width
+                            wd["h"]        = wp.window_height
+                            wd["v_offset"] = wp.v_offset
+                            if new_src:
+                                wd["mesh_source"] = new_src
                     _rebuild_room_mesh(reg, s)
                     if self._active_partner is not None:
                         p_ri, p_wi = self._active_partner
                         p_wins = rooms[p_ri].get("windows", [])
                         for k in range(count):
                             if p_wi + k < len(p_wins):
-                                p_wins[p_wi + k]["w"]        = wp.window_width
-                                p_wins[p_wi + k]["h"]        = wp.window_height
-                                p_wins[p_wi + k]["v_offset"] = wp.v_offset
+                                pd = p_wins[p_wi + k]
+                                if new_src != pd.get("mesh_source"):
+                                    _remove_opening_mesh(pd)
+                                pd["w"]        = wp.window_width
+                                pd["h"]        = wp.window_height
+                                pd["v_offset"] = wp.v_offset
+                                if new_src:
+                                    pd["mesh_source"] = new_src
                         _rebuild_room_mesh(rooms[p_ri], s)
                     _sync_to_scene(context)
                     context.area.header_text_set(
@@ -5928,34 +6891,14 @@ class ROOM_OT_window_edit(bpy.types.Operator):
         # ── Scroll ────────────────────────────────────────────────────────────
         if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} and event.value == 'PRESS':
 
-            # H_POSITION: change array count
-            if (self._phase == 'H_POSITION' and
-                    self._active_idx is not None and self._active_win_idx is not None):
-                delta     = 1 if event.type == 'WHEELUPMOUSE' else -1
-                new_count = max(1, self._array_count + delta)
-                reg       = rooms[self._active_idx]
-                proto     = reg.get("windows", [])[self._active_win_idx]
-                max_c     = _max_array_count(reg, proto["wc"], proto["w"],
-                                             s.window_array_gap, s.door_margin)
-                new_count = min(new_count, max(1, max_c))
-                if new_count != self._array_count:
-                    # Pre-validate candidate anchors against doors before resizing.
-                    # (window-window overlap is not checked here because _resize_array
-                    # removes the current array first; only door positions are fixed.)
-                    ww_   = proto["w"]
-                    wc_   = proto["wc"]
-                    ctr   = proto["anchor"] + (self._array_count - 1) * (ww_ + s.window_array_gap) / 2
-                    cands = _array_anchors(ctr, new_count, ww_, s.window_array_gap,
-                                          reg, wc_, s.door_margin)
-                    if any(d["wc"] == wc_ and
-                           abs(a - d["anchor"]) - (ww_ + d["w"]) * 0.5 < s.door_margin
-                           for a in cands for d in reg.get("doors", [])):
-                        return {'RUNNING_MODAL'}   # would overlap a door — reject
-                    self._resize_array(context, rooms, s, new_count)
-                    hdr = (f"Move left/right  |  Scroll=count ({new_count})  "
-                           f"|  Tab/Shift+Tab=preset  |  Click confirms H  |  RMB – cancel")
-                    context.area.header_text_set(hdr)
-                    context.area.tag_redraw()
+            # HOVER: change count before placing
+            if self._phase == 'HOVER':
+                delta = 1 if event.type == 'WHEELUPMOUSE' else -1
+                s.window_array_count = max(1, s.window_array_count + delta)
+                context.area.header_text_set(
+                    f"Count: {s.window_array_count}  |  "
+                    "Tab/Shift+Tab=preset  ·  LMB=place  ·  RMB=exit")
+                context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
 
             # All other phases: navigation
@@ -5969,7 +6912,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
             return {"FINISHED"}
 
         if event.type in {"RIGHTMOUSE", "ESC"} and event.value == 'PRESS':
-            if self._phase in ('H_POSITION', 'V_POSITION'):
+            if self._phase == 'V_POSITION':
                 # Cancel: remove unconfirmed window + partner
                 self._remove_active_win(context, rooms, s)
                 self._go_hover(context)
@@ -6092,43 +7035,6 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                                 _rebuild_room_mesh(rooms[p_ri], s)
                         context.area.tag_redraw()
 
-            elif (self._phase == 'H_POSITION' and pt is not None and
-                    self._active_idx is not None and self._active_win_idx is not None):
-                reg  = rooms[self._active_idx]
-                wins = reg.get("windows", [])
-                wi   = self._active_win_idx
-                if wi < len(wins):
-                    ww      = wins[wi]["w"]
-                    gap     = s.window_array_gap
-                    count   = self._array_count
-                    raw     = pt.y if self._active_wc in ('E', 'W') else pt.x
-                    anchors = _array_anchors(raw, count, ww, gap, reg,
-                                            self._active_wc, s.door_margin)
-                    # Stop the array at door boundaries — same guard as scroll resize
-                    door_overlap = any(
-                        d["wc"] == self._active_wc and
-                        abs(a - d["anchor"]) - (ww + d["w"]) * 0.5 < s.door_margin
-                        for a in anchors for d in reg.get("doors", []))
-                    _t_hp = reg.get("t", s.wall_thickness)
-                    _zones_hp = _wall_adj_zones(reg, self._active_wc, rooms, _t_hp)
-                    zone_overlap = bool(_zones_hp) and any(
-                        a - ww * 0.5 - s.door_margin < z_hi and
-                        a + ww * 0.5 + s.door_margin > z_lo
-                        for a in anchors for z_lo, z_hi in _zones_hp)
-                    if not door_overlap and not zone_overlap:
-                        for k, anch in enumerate(anchors):
-                            if wi + k < len(wins):
-                                wins[wi + k]["anchor"] = anch
-                        _rebuild_room_mesh(reg, s)
-                        if self._active_partner is not None:
-                            p_ri, p_wi = self._active_partner
-                            p_wins = rooms[p_ri].get("windows", [])
-                            for k, anch in enumerate(anchors):
-                                if p_wi + k < len(p_wins):
-                                    p_wins[p_wi + k]["anchor"] = anch
-                            _rebuild_room_mesh(rooms[p_ri], s)
-                    context.area.tag_redraw()
-
             elif (self._phase == 'V_POSITION' and
                     self._active_idx is not None and self._active_win_idx is not None):
                 reg  = rooms[self._active_idx]
@@ -6168,23 +7074,7 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                 if not in_region:
                     return {'PASS_THROUGH'}
 
-                # ── H_POSITION: first click confirms horizontal, enter V ──
-                if self._phase == 'H_POSITION':
-                    active  = context.scene.room_active_window_preset
-                    presets = context.scene.room_window_presets
-                    if 0 <= active < len(presets):
-                        # Preset owns the sill height — skip V_POSITION, done
-                        _sync_to_scene(context)
-                        bpy.ops.ed.undo_push(message="Place Window")
-                        self._go_hover(context)
-                    else:
-                        # No preset — let user drag to set sill height
-                        self._phase = 'V_POSITION'
-                        context.area.header_text_set(
-                            "Move up/down to set sill height  |  Click to confirm  |  RMB – cancel")
-                    return {'RUNNING_MODAL'}
-
-                # ── V_POSITION: second click confirms vertical placement ────
+                # ── V_POSITION: click confirms sill height ────────────────
                 if self._phase == 'V_POSITION':
                     # Silently remember sill height for the next freehand placement
                     if (self._active_idx is not None and
@@ -6325,12 +7215,19 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                         self._orig_anchor    = anchors[0]
                         self._added_in_press = True
                         self._array_count    = count
-                        self._phase          = 'H_POSITION'
                         _sync_to_scene(context)
                         context.area.tag_redraw()
-                        context.area.header_text_set(
-                            f"Move left/right  |  Scroll=count ({count})  "
-                            f"|  Tab/Shift+Tab=preset  |  Click confirms H  |  RMB – cancel")
+                        # Skip H_POSITION — the HOVER ghost already previewed position.
+                        # Go straight to V_POSITION (custom sill) or confirm immediately.
+                        if getattr(s, 'window_v_mode', 'PRESET') == 'CUSTOM':
+                            self._phase = 'V_POSITION'
+                            _vt = ("Move up/down for sill height  |  "
+                                   "Click to confirm  |  RMB – cancel")
+                            context.area.header_text_set(_vt)
+                            self._hint_text = _vt
+                        else:
+                            bpy.ops.ed.undo_push(message="Place Window")
+                            self._go_hover(context)
                 else:
                     self._last_press_win = None
                     return {'PASS_THROUGH'}
@@ -7160,7 +8057,7 @@ class ROOM_OT_sample_dims_apply(bpy.types.Operator):
             wp.name        = name
             wp.window_width  = self.sampled_width
             wp.window_height = self.sampled_height
-            wp.v_offset      = s.window_v_offset   # inherit current sill height
+            wp.v_offset      = 0.8  # classic residential sill height
             if src is not None:
                 wp.mesh_object = src
             context.scene.room_active_window_preset = len(presets) - 1
@@ -7241,6 +8138,78 @@ class ROOM_OT_sample_dims(bpy.types.Operator):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+class ROOM_OT_sample_material(bpy.types.Operator):
+    """Click any face in the viewport to sample its material."""
+    bl_idname      = "room.sample_material"
+    bl_label       = "Sample Material"
+    bl_description = "Click any face to sample its material"
+
+    target : bpy.props.StringProperty(
+        name="Target Property",
+        description="Name of the material property to assign to (e.g. 'mat_walls')")
+
+    def invoke(self, context, event):
+        context.window_manager.modal_handler_add(self)
+        context.window.cursor_modal_set('EYEDROPPER')
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'MIDDLEMOUSE',
+                'NUMPAD_0', 'NUMPAD_1', 'NUMPAD_2', 'NUMPAD_3',
+                'NUMPAD_4', 'NUMPAD_5', 'NUMPAD_6', 'NUMPAD_7',
+                'NUMPAD_8', 'NUMPAD_9', 'NUMPAD_DECIMAL', 'NUMPAD_PERIOD',
+                'F', 'TILDE'}:
+            return {'PASS_THROUGH'}
+
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            context.window.cursor_modal_restore()
+            mx, my = event.mouse_x, event.mouse_y
+            region = None
+            rv3d   = None
+            for area in context.screen.areas:
+                if area.type != 'VIEW_3D':
+                    continue
+                if not (area.x <= mx < area.x + area.width and
+                        area.y <= my < area.y + area.height):
+                    continue
+                for r in area.regions:
+                    if (r.type == 'WINDOW' and
+                            r.x <= mx < r.x + r.width and
+                            r.y <= my < r.y + r.height):
+                        region = r
+                        rv3d   = area.spaces.active.region_3d
+                        break
+                break
+            if region is None or rv3d is None:
+                self.report({'WARNING'}, "Click inside the 3D viewport")
+                return {'CANCELLED'}
+            coord     = (mx - region.x, my - region.y)
+            origin    = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+            direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+            hit, _loc, _nor, face_index, obj, _mat = context.scene.ray_cast(
+                context.view_layer.depsgraph, origin, direction)
+            if not hit or obj is None or obj.type != 'MESH':
+                self.report({'WARNING'}, "No mesh face hit")
+                return {'CANCELLED'}
+            me = obj.data
+            if face_index < len(me.polygons):
+                mat_idx = me.polygons[face_index].material_index
+                if mat_idx < len(obj.material_slots) and obj.material_slots[mat_idx].material:
+                    mat = obj.material_slots[mat_idx].material
+                    setattr(context.scene.room_settings, self.target, mat)
+                    self.report({'INFO'}, f"Sampled '{mat.name}'")
+                    return {'FINISHED'}
+            self.report({'WARNING'}, "Hit face has no material")
+            return {'CANCELLED'}
+
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            context.window.cursor_modal_restore()
+            return {'CANCELLED'}
+
+        return {'RUNNING_MODAL'}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 class ROOM_OT_toggle_room_plinth(bpy.types.Operator):
     """Toggle bottom or top plinth on the selected room only."""
     bl_idname  = "room.toggle_room_plinth"
@@ -7302,9 +8271,28 @@ class ROOM_OT_toggle_mesh_lock(bpy.types.Operator):
             return {'CANCELLED'}
         if self.rebuild:
             reg['mesh_locked'] = False
+            # Clear hole_cut_locked flags so holes are regenerated cleanly from scratch
+            for opening in reg.get("doors", []) + reg.get("windows", []):
+                opening.pop("hole_cut_locked", None)
             _rebuild_room_mesh(reg, s)
         else:
             reg['mesh_locked'] = self.lock   # explicit set, not a toggle
+            if self.lock:
+                # Mark all currently-placed openings so they aren't re-cut on the next rebuild
+                for opening in reg.get("doors", []) + reg.get("windows", []):
+                    opening["hole_cut_locked"] = True
+                # Update stored bounds from the actual (possibly edited) mesh so
+                # window/door placement uses the real wall positions
+                me = obj.data
+                if me.vertices:
+                    mw = obj.matrix_world
+                    wxs = [mw @ v.co for v in me.vertices]
+                    xs = [v.x for v in wxs]
+                    ys = [v.y for v in wxs]
+                    zs = [v.z for v in wxs]
+                    reg["x1"] = min(xs);  reg["x2"] = max(xs)
+                    reg["y1"] = min(ys);  reg["y2"] = max(ys)
+                    reg["z"]  = min(zs)
         _sync_to_scene(context)
         return {'FINISHED'}
 
@@ -7536,7 +8524,11 @@ def _recalculate_plinth_for_obj(reg, obj, s):
         return segments
 
     # ── Emit plinth quads ─────────────────────────────────────────────────────
+    # Get (or create) the room_cat int layer so new faces are properly tagged.
+    cat_layer = bm.faces.layers.int.get("room_cat") or bm.faces.layers.int.new("room_cat")
+
     def add_plinth_quad(va, vb, fn, height, thickness, z_base, top=False):
+        cat = _CAT_PLINTH_TOP if top else _CAT_PLINTH_BOTTOM
         inward = fn.copy(); inward.z = 0; inward.normalize()
         z0_w = z_base + (wall_h - height if top else 0.0)
         z1_w = z0_w + height
@@ -7550,10 +8542,15 @@ def _recalculate_plinth_for_obj(reg, obj, s):
         p7_w = p4_w + inward * thickness; p7_w.z = z1_w
         pts_l = [mw_inv @ p for p in [p0_w, p1_w, p2_w, p3_w, p4_w, p5_w, p6_w, p7_w]]
         v = [bm.verts.new(co) for co in pts_l]
-        bm.faces.new([v[4], v[5], v[6], v[7]])
-        bm.faces.new([v[0], v[3], v[7], v[4]])
-        bm.faces.new([v[1], v[5], v[6], v[2]])
-        bm.faces.new([v[2], v[6], v[7], v[3]])
+        new_faces = [
+            bm.faces.new([v[4], v[5], v[6], v[7]]),
+            bm.faces.new([v[0], v[3], v[7], v[4]]),
+            bm.faces.new([v[1], v[5], v[6], v[2]]),
+            bm.faces.new([v[2], v[6], v[7], v[3]]),
+        ]
+        for f in new_faces:
+            f.material_index = cat
+            f[cat_layer] = cat
         return v
 
     # Z level where the top plinth strip begins — doors shorter than this don't
@@ -7598,6 +8595,13 @@ def _recalculate_plinth_for_obj(reg, obj, s):
         assign_vg('plinth_bottom', bottom_indices)
     if top_indices:
         assign_vg('plinth_top', top_indices)
+
+    # Fix material_index on the newly tagged plinth faces without touching slot
+    # contents (preserves per-room material assignments).
+    s_ctx = getattr(bpy.context.scene, 'room_settings', None)
+    if s_ctx is not None:
+        _sync_material_indices(me, _room_mat_list(s_ctx))
+        me.update()
 
     _apply_cube_uv_to_mesh(me, s, obj=obj)
     return len(unique_edges)
@@ -7669,6 +8673,350 @@ class ROOM_OT_recalculate_uv(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class ROOM_UL_mat_presets(bpy.types.UIList):
+    """UIList that shows material preset names with inline rename."""
+    bl_idname = "ROOM_UL_mat_presets"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        layout.prop(item, "name", text="", emboss=False, icon="MATERIAL")
+
+
+class ROOM_OT_save_mat_preset(bpy.types.Operator):
+    """Save the current material assignments and tiling values as a named preset."""
+    bl_idname  = "room.save_mat_preset"
+    bl_label   = "Save Material Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    preset_name : bpy.props.StringProperty(name="Preset Name", default="New Preset")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=260)
+
+    def draw(self, context):
+        self.layout.prop(self, "preset_name", text="Name")
+
+    def execute(self, context):
+        s       = context.scene.room_settings
+        presets = context.scene.room_mat_presets
+        # If a preset with this name exists, overwrite it
+        existing = next((p for p in presets if p.name == self.preset_name), None)
+        preset   = existing if existing else presets.add()
+        preset.name = self.preset_name
+        for mat_attr, tx, ty in _PRESET_SURFACES:
+            setattr(preset, mat_attr, getattr(s, mat_attr, None))
+            setattr(preset, tx, getattr(s, tx, 1.0))
+            setattr(preset, ty, getattr(s, ty, 1.0))
+        if not existing:
+            context.scene.room_mat_preset_active = len(presets) - 1
+        self.report({'INFO'}, f"Preset '{self.preset_name}' saved")
+        return {'FINISHED'}
+
+
+class ROOM_OT_apply_mat_preset(bpy.types.Operator):
+    """Apply the selected material preset to the room mesh(es).
+    Only material assignments are applied — tiling/rotation UV settings are
+    left unchanged so your UV work is never overwritten by a preset switch.
+    Respects the Apply To (All Rooms / Selected Room) setting."""
+    bl_idname  = "room.apply_mat_preset"
+    bl_label   = "Apply Material Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        presets = context.scene.room_mat_presets
+        idx     = context.scene.room_mat_preset_active
+        return 0 <= idx < len(presets)
+
+    def execute(self, context):
+        presets = context.scene.room_mat_presets
+        idx     = context.scene.room_mat_preset_active
+        preset  = presets[idx]
+        _apply_mat_preset_by_idx(context, idx)
+        _prev_mat_preset_idx[0] = idx
+        self.report({'INFO'}, f"Preset '{preset.name}' applied")
+        return {'FINISHED'}
+
+
+class ROOM_OT_delete_mat_preset(bpy.types.Operator):
+    """Delete the selected material preset."""
+    bl_idname  = "room.delete_mat_preset"
+    bl_label   = "Delete Material Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        presets = context.scene.room_mat_presets
+        idx     = context.scene.room_mat_preset_active
+        return 0 <= idx < len(presets)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        presets = context.scene.room_mat_presets
+        idx     = context.scene.room_mat_preset_active
+        name    = presets[idx].name
+        presets.remove(idx)
+        context.scene.room_mat_preset_active = max(0, idx - 1)
+        self.report({'INFO'}, f"Preset '{name}' deleted")
+        return {'FINISHED'}
+
+
+class ROOM_OT_duplicate_mat_preset(bpy.types.Operator):
+    """Duplicate the selected material preset."""
+    bl_idname  = "room.duplicate_mat_preset"
+    bl_label   = "Duplicate Material Preset"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        presets = context.scene.room_mat_presets
+        idx     = context.scene.room_mat_preset_active
+        return 0 <= idx < len(presets)
+
+    def execute(self, context):
+        presets = context.scene.room_mat_presets
+        idx     = context.scene.room_mat_preset_active
+        src     = presets[idx]
+        new_p   = presets.add()
+        new_p.name = src.name + " Copy"
+        for mat_attr, tx, ty in _PRESET_SURFACES:
+            setattr(new_p, mat_attr, getattr(src, mat_attr, None))
+            setattr(new_p, tx, getattr(src, tx, 1.0))
+            setattr(new_p, ty, getattr(src, ty, 1.0))
+        context.scene.room_mat_preset_active = len(presets) - 1
+        self.report({'INFO'}, f"Duplicated as '{new_p.name}'")
+        return {'FINISHED'}
+
+
+class ROOM_OT_scale_surface_uv(bpy.types.Operator):
+    """Scale UV coordinates for a specific surface category (walls, floor, etc.)
+    across all room objects, without re-projecting from scratch.
+    Updates in real time as you drag the Scale slider."""
+    bl_idname  = "room.scale_surface_uv"
+    bl_label   = "Scale Surface UVs"
+    bl_options = {"REGISTER", "UNDO"}
+
+    surface_cat : bpy.props.IntProperty(name="Surface Category", default=0)
+    factor      : bpy.props.FloatProperty(name="Scale", default=1.0, min=0.001, max=100.0)
+
+    _CAT_LABELS = {
+        0: "Walls", 1: "Floor", 2: "Ceiling",
+        3: "Door Frames", 4: "Window Frames",
+        5: "Bottom Plinth", 6: "Top Plinth",
+        7: "Stairs", 8: "Architrave",
+        10: "Threshold",
+    }
+
+    def invoke(self, context, event):
+        self.factor = 1.0
+        s = context.scene.room_settings
+        props = _CAT_TILING_PROPS.get(self.surface_cat)
+        if props:
+            self._orig_x = getattr(s, props[0], 1.0)
+            self._orig_y = getattr(s, props[1], 1.0)
+        else:
+            self._orig_x = 1.0
+            self._orig_y = 1.0
+        return context.window_manager.invoke_props_dialog(self, width=220)
+
+    def draw(self, context):
+        label = self._CAT_LABELS.get(self.surface_cat, f"Cat {self.surface_cat}")
+        self.layout.label(text=f"Scale UVs — {label}")
+        self.layout.prop(self, "factor")
+
+    def check(self, context):
+        """Called whenever the slider moves — update tiling props live."""
+        self._apply_scale(context)
+        return True
+
+    def _apply_scale(self, context):
+        s = context.scene.room_settings
+        props = _CAT_TILING_PROPS.get(self.surface_cat)
+        if not props:
+            return
+        f = self.factor
+        # Updating the tiling properties triggers _cb_tiling → full UV rebuild,
+        # so scale is baked into the tiling values and survives any later change.
+        setattr(s, props[0], max(0.001, self._orig_x * f))
+        setattr(s, props[1], max(0.001, self._orig_y * f))
+
+    def execute(self, context):
+        self._apply_scale(context)
+        label = self._CAT_LABELS.get(self.surface_cat, str(self.surface_cat))
+        self.report({'INFO'}, f"Scaled {label} tiling ×{self.factor:.3f}")
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        """Restore original tiling values if the user cancels."""
+        s = context.scene.room_settings
+        props = _CAT_TILING_PROPS.get(self.surface_cat)
+        if props:
+            setattr(s, props[0], self._orig_x)
+            setattr(s, props[1], self._orig_y)
+
+
+_CAT_TILING_PROPS = {
+    0:  ('mat_walls_tiling_x',         'mat_walls_tiling_y'),
+    1:  ('mat_floor_tiling_x',         'mat_floor_tiling_y'),
+    2:  ('mat_ceiling_tiling_x',       'mat_ceiling_tiling_y'),
+    3:  ('mat_door_frame_tiling_x',    'mat_door_frame_tiling_y'),
+    4:  ('mat_window_frame_tiling_x',  'mat_window_frame_tiling_y'),
+    5:  ('mat_plinth_bottom_tiling_x', 'mat_plinth_bottom_tiling_y'),
+    6:  ('mat_plinth_top_tiling_x',    'mat_plinth_top_tiling_y'),
+    7:  ('mat_stair_tiling_x',         'mat_stair_tiling_y'),
+    8:  ('mat_architrave_tiling_x',    'mat_architrave_tiling_y'),
+    9:  ('mat_stair_step_tiling_x',    'mat_stair_step_tiling_y'),
+    10: ('threshold_tiling_x',         'threshold_tiling_y'),
+}
+
+_CAT_ROTATION_PROP = {
+    0:  'mat_walls_rotation',
+    1:  'mat_floor_rotation',
+    2:  'mat_ceiling_rotation',
+    3:  'mat_door_frame_rotation',
+    4:  'mat_window_frame_rotation',
+    5:  'mat_plinth_bottom_rotation',
+    6:  'mat_plinth_top_rotation',
+    7:  'mat_stair_rotation',
+    8:  'mat_architrave_rotation',
+    9:  'mat_stair_step_rotation',
+    10: 'threshold_rotation',
+}
+
+
+class ROOM_OT_rotate_surface_uv(bpy.types.Operator):
+    """Rotate the UV projection for one surface category by 45 degrees."""
+    bl_idname  = "room.rotate_surface_uv"
+    bl_label   = "Rotate Surface UV"
+    bl_options = {"REGISTER", "UNDO"}
+
+    surface_cat : bpy.props.IntProperty(default=0)
+    angle       : bpy.props.FloatProperty(default=45.0)
+
+    def execute(self, context):
+        s    = context.scene.room_settings
+        prop = _CAT_ROTATION_PROP.get(self.surface_cat)
+        if prop:
+            cur     = getattr(s, prop, 0.0)
+            new_val = (cur + self.angle) % 360.0
+            setattr(s, prop, new_val)   # triggers _cb_tiling → UV recalc
+        return {'FINISHED'}
+
+
+class ROOM_OT_unify_uv(bpy.types.Operator):
+    """Match the UV scale of all selected room objects to the active room,
+    so textures tile consistently across all surfaces."""
+    bl_idname  = "room.unify_uv"
+    bl_label   = "Unify UV Scale"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.active_object is not None and
+                context.active_object.type == 'MESH' and
+                len(context.selected_objects) > 1)
+
+    def execute(self, context):
+        ref = context.active_object
+        ref_density = _uv_world_density(ref)
+        if ref_density is None or ref_density < 1e-9:
+            self.report({'WARNING'}, "Active object has no UV map — cannot use as reference")
+            return {'CANCELLED'}
+        count = 0
+        for obj in context.selected_objects:
+            if obj is ref or obj.type != 'MESH':
+                continue
+            d = _uv_world_density(obj)
+            if d is None or d < 1e-9:
+                continue
+            factor = ref_density / d
+            me = obj.data
+            if me.uv_layers.active:
+                for uv_loop in me.uv_layers.active.data:
+                    uv_loop.uv *= factor
+                me.update()
+                count += 1
+        self.report({'INFO'}, f"Unified UV scale on {count} object(s) to match '{ref.name}'")
+        return {'FINISHED'}
+
+
+class ROOM_OT_scale_uv(bpy.types.Operator):
+    """Uniformly scale the UVs of all selected room objects."""
+    bl_idname  = "room.scale_uv"
+    bl_label   = "Scale UVs"
+    bl_options = {"REGISTER", "UNDO"}
+
+    factor : bpy.props.FloatProperty(name="Scale Factor", default=1.0,
+                                     min=0.001, max=1000.0)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                continue
+            me = obj.data
+            if me.uv_layers.active:
+                for uv_loop in me.uv_layers.active.data:
+                    uv_loop.uv *= self.factor
+                me.update()
+                count += 1
+        self.report({'INFO'}, f"Scaled UVs ×{self.factor:.3f} on {count} object(s)")
+        return {'FINISHED'}
+
+
+def _uv_world_density(obj):
+    """Return sqrt(uv_area / world_area) for the object, or None if unavailable."""
+    me = obj.data
+    if not me.uv_layers.active:
+        return None
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    uv_lay = bm.loops.layers.uv.active
+    mw = obj.matrix_world
+    total_world = total_uv = 0.0
+    for face in bm.faces:
+        vw = [mw @ v.co for v in face.verts]
+        if len(vw) >= 3:
+            v0 = vw[0]
+            for i in range(1, len(vw) - 1):
+                total_world += ((vw[i] - v0).cross(vw[i + 1] - v0)).length * 0.5
+        uvs = [loop[uv_lay].uv for loop in face.loops]
+        a = 0.0
+        for i in range(len(uvs)):
+            j = (i + 1) % len(uvs)
+            a += uvs[i].x * uvs[j].y - uvs[j].x * uvs[i].y
+        total_uv += abs(a) * 0.5
+    bm.free()
+    if total_world < 1e-12 or total_uv < 1e-12:
+        return None
+    return (total_uv / total_world) ** 0.5
+
+
+class ROOM_OT_sync_openings(bpy.types.Operator):
+    """Reposition and rescale all door and window mesh instances across every room.
+    Use this after changing the source mesh scale or moving the source object."""
+    bl_idname  = "room.sync_openings"
+    bl_label   = "Sync All Openings"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        s     = context.scene.room_settings
+        count = 0
+        for reg in ROOM_OT_draw._room_list:
+            obj = bpy.data.objects.get(reg.get("obj_name", ""))
+            if obj is None:
+                continue
+            col = next(iter(obj.users_collection), None)
+            _sync_opening_meshes(reg, col, s)
+            count += len(reg.get("doors", [])) + len(reg.get("windows", []))
+        self.report({'INFO'}, f"Synced {count} opening(s)")
+        return {'FINISHED'}
+
+
 class ROOM_OT_sync_thresholds(bpy.types.Operator):
     """Recreate threshold strips on all doors using the current settings.
     Run this after changing threshold settings or loading a file."""
@@ -7678,9 +9026,156 @@ class ROOM_OT_sync_thresholds(bpy.types.Operator):
 
     def execute(self, context):
         s = context.scene.room_settings
-        _sync_all_thresholds(s)
-        total = sum(len(r.get("doors", [])) for r in ROOM_OT_draw._room_list)
-        self.report({'INFO'}, f"Thresholds synced across {total} door(s)")
+        count = 0
+        for reg in ROOM_OT_draw._room_list:
+            obj = bpy.data.objects.get(reg.get("obj_name", ""))
+            if obj is None:
+                continue
+            col = next(iter(obj.users_collection), None)
+            _sync_thresholds(reg, col, s)
+            count += len(reg.get("doors", []))
+        self.report({'INFO'}, f"Thresholds synced across {count} door(s)")
+        return {'FINISHED'}
+
+
+# ── Selection helpers ─────────────────────────────────────────────────────────
+
+class ROOM_OT_select_type(bpy.types.Operator):
+    """Select all scene objects of a given room-tool type"""
+    bl_idname  = "room.select_type"
+    bl_label   = "Select by Type"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    obj_type: bpy.props.EnumProperty(
+        name="Type",
+        items=[
+            ('ROOMS',      "Rooms",      "Select all Room.*** mesh objects"),
+            ('DOORS',      "Doors",      "Select all door mesh instances"),
+            ('WINDOWS',    "Windows",    "Select all window mesh instances"),
+            ('THRESHOLDS', "Thresholds", "Select all Threshold_* strip objects"),
+        ],
+        default='ROOMS',
+    )
+    extend: bpy.props.BoolProperty(name="Extend Selection", default=False)
+
+    def execute(self, context):
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        if not self.extend:
+            bpy.ops.object.select_all(action='DESELECT')
+
+        count = 0
+        if self.obj_type == 'ROOMS':
+            for obj in context.view_layer.objects:
+                if obj.name.startswith("Room."):
+                    obj.select_set(True)
+                    count += 1
+        elif self.obj_type == 'THRESHOLDS':
+            for obj in context.view_layer.objects:
+                if obj.name.startswith("Threshold_"):
+                    obj.select_set(True)
+                    count += 1
+        elif self.obj_type in ('DOORS', 'WINDOWS'):
+            key = "doors" if self.obj_type == 'DOORS' else "windows"
+            names = set()
+            for reg in ROOM_OT_draw._room_list:
+                for opening in reg.get(key, []):
+                    n = opening.get("mesh_obj_name")
+                    if n:
+                        names.add(n)
+            for obj in context.view_layer.objects:
+                if obj.name in names:
+                    obj.select_set(True)
+                    count += 1
+
+        self.report({'INFO'}, f"Selected {count} {self.obj_type.lower()}")
+        return {'FINISHED'}
+
+
+class ROOM_OT_select_by_preset(bpy.types.Operator):
+    """Select all door/window opening instances that use a specific preset mesh"""
+    bl_idname  = "room.select_by_preset"
+    bl_label   = "Select by Preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    preset_index: bpy.props.IntProperty(default=0)
+    preset_type:  bpy.props.EnumProperty(
+        items=[('DOOR', "Door", ""), ('WINDOW', "Window", "")],
+        default='DOOR',
+    )
+    extend: bpy.props.BoolProperty(name="Extend Selection", default=False)
+
+    def execute(self, context):
+        if self.preset_type == 'DOOR':
+            presets = context.scene.room_door_presets
+        else:
+            presets = context.scene.room_window_presets
+        if self.preset_index >= len(presets):
+            return {'CANCELLED'}
+        dp = presets[self.preset_index]
+        src_name = dp.mesh_object.name if dp.mesh_object else None
+        if not src_name:
+            self.report({'WARNING'}, f"Preset '{dp.name}' has no mesh assigned")
+            return {'CANCELLED'}
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        if not self.extend:
+            bpy.ops.object.select_all(action='DESELECT')
+        target_base = f"Opening.{src_name}"
+        count = 0
+        for obj in context.view_layer.objects:
+            if obj.name == target_base or obj.name.startswith(target_base + "."):
+                obj.select_set(True)
+                count += 1
+        self.report({'INFO'}, f"Selected {count} instance(s) of '{dp.name}'")
+        return {'FINISHED'}
+
+
+class ROOM_OT_select_category(bpy.types.Operator):
+    """In Edit Mode, select all faces belonging to a room geometry category"""
+    bl_idname  = "room.select_category"
+    bl_label   = "Select Category"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    category: bpy.props.IntProperty(default=0)
+    extend:   bpy.props.BoolProperty(name="Extend Selection", default=False)
+
+    def execute(self, context):
+        if context.mode != 'EDIT_MESH':
+            self.report({'WARNING'}, "Enter Edit Mode on a room mesh first")
+            return {'CANCELLED'}
+        _CAT_LABELS = ('Walls', 'Floor', 'Ceiling', 'Door Frames', 'Window Frames',
+                       'Plinth Bottom', 'Plinth Top', 'Stair', 'Architrave', 'Stair Treads')
+        label = _CAT_LABELS[self.category] if self.category < len(_CAT_LABELS) else str(self.category)
+
+        total = 0
+        skipped = 0
+        # context.objects_in_mode covers all objects currently open in edit mode
+        # (works for single object and multi-object edit alike)
+        for obj in context.objects_in_mode:
+            if obj.type != 'MESH':
+                continue
+            bm = bmesh.from_edit_mesh(obj.data)
+            cat_layer = bm.faces.layers.int.get("room_cat")
+            if cat_layer is None:
+                skipped += 1
+                continue
+            if not self.extend:
+                for f in bm.faces:
+                    f.select = False
+            count = 0
+            for f in bm.faces:
+                if f[cat_layer] == self.category:
+                    f.select = True
+                    count += 1
+            bm.select_flush_mode()
+            bmesh.update_edit_mesh(obj.data, loop_triangles=False)
+            total += count
+
+        if skipped:
+            self.report({'INFO'}, f"Selected {total} {label} face(s) ({skipped} object(s) skipped — not room meshes)")
+        else:
+            self.report({'INFO'}, f"Selected {total} {label} face(s)")
         return {'FINISHED'}
 
 
@@ -7820,6 +9315,9 @@ class ROOM_PT_panel(bpy.types.Panel):
         row.label(text="Trims", icon="MOD_SOLIDIFY")
         if s.show_trims:
             col = box.column(align=True)
+            row = col.row(align=True)
+            row.prop(s, "trim_apply_mode", expand=True)
+            col.separator()
             col.label(text="Plinth:")
             row = col.row(align=True)
             row.prop(s, "add_plinth_bottom", toggle=True, icon="TRIA_UP_BAR")
@@ -7874,7 +9372,6 @@ class ROOM_PT_panel(bpy.types.Panel):
                 sub = col.column(align=True)
                 sub.prop(s, "threshold_height")
                 sub.prop(s, "threshold_depth")
-                sub.prop(s, "threshold_material", text="Material", icon="MATERIAL")
                 sub.operator("room.sync_thresholds", icon="FILE_REFRESH",
                              text="Apply to All Doors")
 
@@ -7891,50 +9388,104 @@ class ROOM_PT_panel(bpy.types.Panel):
             row.prop(s, "mat_apply_mode", expand=True)
             col.separator()
 
+            # ── Material Presets ──────────────────────────────────────────
+            col.label(text="Presets:", icon="ASSET_MANAGER")
+            presets = context.scene.room_mat_presets
+            if presets:
+                col.template_list(
+                    "ROOM_UL_mat_presets", "",
+                    context.scene, "room_mat_presets",
+                    context.scene, "room_mat_preset_active",
+                    rows=min(len(presets), 4), maxrows=6,
+                )
+            else:
+                col.label(text="No presets saved yet", icon="INFO")
+            ops_row = col.row(align=True)
+            ops_row.operator("room.save_mat_preset",      text="Save",      icon="ADD")
+            ops_row.operator("room.apply_mat_preset",     text="Apply",     icon="CHECKMARK")
+            ops_row.operator("room.duplicate_mat_preset", text="",          icon="DUPLICATE")
+            ops_row.operator("room.delete_mat_preset",    text="",          icon="TRASH")
+            col.separator()
+            # ─────────────────────────────────────────────────────────────
+
+            def _mat_row(col, mat_attr, tile_x, tile_y, rot_attr, label, cat_idx):
+                hdr = col.row(align=True)
+                hdr.prop(s, mat_attr, text=label)
+                op = hdr.operator("room.sample_material", text="", icon='EYEDROPPER')
+                op.target = mat_attr
+                sub = col.row(align=True)
+                sub.label(text="Tiling  X:")
+                sub.prop(s, tile_x, text="")
+                sub.label(text="Y:")
+                sub.prop(s, tile_y, text="")
+                op = sub.operator("room.scale_surface_uv", text="", icon="FULLSCREEN_ENTER",
+                                  emboss=True)
+                op.surface_cat = cat_idx
+                rot_row = col.row(align=True)
+                rot_row.label(text="Rot:")
+                op_ccw = rot_row.operator("room.rotate_surface_uv", text="", icon="LOOP_BACK")
+                op_ccw.surface_cat = cat_idx; op_ccw.angle = -45.0
+                rot_row.prop(s, rot_attr, text="")
+                op_cw = rot_row.operator("room.rotate_surface_uv", text="", icon="LOOP_FORWARDS")
+                op_cw.surface_cat = cat_idx; op_cw.angle = 45.0
+
             col.label(text="Surfaces:")
-            for mat_attr, tile_attr, label in (
-                ("mat_walls",   "mat_walls_tiling",   "Walls"),
-                ("mat_floor",   "mat_floor_tiling",   "Floor"),
-                ("mat_ceiling", "mat_ceiling_tiling", "Ceiling"),
+            for mat_attr, tx, ty, rot, label, cat in (
+                ("mat_walls",   "mat_walls_tiling_x",   "mat_walls_tiling_y",   "mat_walls_rotation",   "Walls",   0),
+                ("mat_floor",   "mat_floor_tiling_x",   "mat_floor_tiling_y",   "mat_floor_rotation",   "Floor",   1),
+                ("mat_ceiling", "mat_ceiling_tiling_x", "mat_ceiling_tiling_y", "mat_ceiling_rotation", "Ceiling", 2),
             ):
-                row = col.row(align=True)
-                split = row.split(factor=0.65, align=True)
-                split.prop(s, mat_attr, text=label)
-                split.prop(s, tile_attr, text="")
+                _mat_row(col, mat_attr, tx, ty, rot, label, cat)
+                col.separator(factor=0.5)
 
             col.separator()
-            col.label(text="Openings:")
-            for mat_attr, tile_attr, label in (
-                ("mat_door_frame",   "mat_door_frame_tiling",   "Door (∅=Walls)"),
-                ("mat_window_frame", "mat_window_frame_tiling", "Win (∅=Walls)"),
-            ):
-                row = col.row(align=True)
-                split = row.split(factor=0.65, align=True)
-                split.prop(s, mat_attr, text=label)
-                split.prop(s, tile_attr, text="")
+            hdr = col.row(align=True)
+            hdr.label(text="Openings:")
+            hdr.prop(s, "opening_single_mat", text="", icon='LINKED' if s.opening_single_mat else 'UNLINKED')
+            if s.opening_single_mat:
+                _mat_row(col, "mat_door_frame", "mat_door_frame_tiling_x", "mat_door_frame_tiling_y", "mat_door_frame_rotation", "All (∅=Walls)", 3)
+                col.separator(factor=0.5)
+            else:
+                for mat_attr, tx, ty, rot, label, cat in (
+                    ("mat_door_frame",   "mat_door_frame_tiling_x",   "mat_door_frame_tiling_y",   "mat_door_frame_rotation",   "Door (∅=Walls)", 3),
+                    ("mat_window_frame", "mat_window_frame_tiling_x", "mat_window_frame_tiling_y", "mat_window_frame_rotation", "Win (∅=Walls)",  4),
+                ):
+                    _mat_row(col, mat_attr, tx, ty, rot, label, cat)
+                    col.separator(factor=0.5)
 
             col.separator()
-            col.label(text="Trims:")
-            for mat_attr, tile_attr, label in (
-                ("mat_plinth_bottom", "mat_plinth_bottom_tiling", "Bot Plinth (∅=Walls)"),
-                ("mat_plinth_top",    "mat_plinth_top_tiling",    "Top Plinth (∅=Walls)"),
-                ("mat_architrave",    "mat_architrave_tiling",    "Architrave (∅=Walls)"),
-            ):
-                row = col.row(align=True)
-                split = row.split(factor=0.65, align=True)
-                split.prop(s, mat_attr, text=label)
-                split.prop(s, tile_attr, text="")
+            hdr = col.row(align=True)
+            hdr.label(text="Trims:")
+            hdr.prop(s, "trim_single_mat", text="", icon='LINKED' if s.trim_single_mat else 'UNLINKED')
+            if s.trim_single_mat:
+                _mat_row(col, "mat_plinth_bottom", "mat_plinth_bottom_tiling_x", "mat_plinth_bottom_tiling_y", "mat_plinth_bottom_rotation", "All (∅=Walls)", 5)
+                col.separator(factor=0.5)
+                _mat_row(col, "threshold_material", "threshold_tiling_x", "threshold_tiling_y", "threshold_rotation", "Threshold (∅=Floor)", 10)
+                col.separator(factor=0.5)
+            else:
+                for mat_attr, tx, ty, rot, label, cat in (
+                    ("mat_plinth_bottom",  "mat_plinth_bottom_tiling_x", "mat_plinth_bottom_tiling_y", "mat_plinth_bottom_rotation", "Bot Plinth (∅=Walls)",  5),
+                    ("mat_plinth_top",     "mat_plinth_top_tiling_x",    "mat_plinth_top_tiling_y",    "mat_plinth_top_rotation",    "Top Plinth (∅=Walls)",  6),
+                    ("mat_architrave",     "mat_architrave_tiling_x",    "mat_architrave_tiling_y",    "mat_architrave_rotation",    "Architrave (∅=Walls)",  8),
+                    ("threshold_material", "threshold_tiling_x",         "threshold_tiling_y",         "threshold_rotation",         "Threshold (∅=Floor)", 10),
+                ):
+                    _mat_row(col, mat_attr, tx, ty, rot, label, cat)
+                    col.separator(factor=0.5)
 
             col.separator()
             col.label(text="Stairs:")
-            for mat_attr, tile_attr, label in (
-                ("mat_stair",      "mat_stair_tiling",      "Sides"),
-                ("mat_stair_step", "mat_stair_step_tiling", "Treads"),
+            for mat_attr, tx, ty, rot, label, cat in (
+                ("mat_stair",      "mat_stair_tiling_x",      "mat_stair_tiling_y",      "mat_stair_rotation",      "Sides",  7),
+                ("mat_stair_step", "mat_stair_step_tiling_x", "mat_stair_step_tiling_y", "mat_stair_step_rotation", "Treads", 9),
             ):
-                row = col.row(align=True)
-                split = row.split(factor=0.65, align=True)
-                split.prop(s, mat_attr, text=label)
-                split.prop(s, tile_attr, text="")
+                _mat_row(col, mat_attr, tx, ty, rot, label, cat)
+                col.separator(factor=0.5)
+
+            col.separator()
+            col.operator("room.recalculate_uv", text="Recalculate UV", icon="UV")
+            row = col.row(align=True)
+            row.operator("room.unify_uv", text="Unify UV Scale",  icon="ZOOM_ALL")
+            row.operator("room.scale_uv", text="Scale All UVs",   icon="FULLSCREEN_ENTER")
 
         # ── Utilities ─────────────────────────────────────────────────────────
         box = L.box()
@@ -7947,6 +9498,77 @@ class ROOM_PT_panel(bpy.types.Panel):
             col = box.column(align=True)
             col.operator("room.clear_registry",  icon="X",              text="Reset Snap Registry")
             col.operator("room.clear_overlays",  icon="GHOST_DISABLED", text="Clear Phantom Overlays")
+
+        # ── Select ────────────────────────────────────────────────────────────
+        box = L.box()
+        row = box.row()
+        row.prop(s, "show_select",
+                 icon='TRIA_DOWN' if s.show_select else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.label(text="Select", icon="RESTRICT_SELECT_OFF")
+        if s.show_select:
+            mode = context.mode
+            if mode == 'OBJECT':
+                col = box.column(align=True)
+                col.label(text="By Object Type:")
+                row3 = col.row(align=True)
+                row3.operator("room.select_type", text="Rooms",      icon="CUBE").obj_type        = 'ROOMS'
+                row3.operator("room.select_type", text="Doors",      icon="OUTLINER_OB_EMPTY").obj_type = 'DOORS'
+                row3.operator("room.select_type", text="Windows",    icon="OUTLINER_OB_EMPTY").obj_type = 'WINDOWS'
+                col.operator("room.select_type",  text="Thresholds", icon="MESH_PLANE").obj_type  = 'THRESHOLDS'
+
+                door_presets   = context.scene.room_door_presets
+                window_presets = context.scene.room_window_presets
+                if door_presets:
+                    col.separator()
+                    col.label(text="By Door Preset:")
+                    for i, dp in enumerate(door_presets):
+                        icon = "OUTLINER_OB_EMPTY" if dp.mesh_object else "QUESTION"
+                        op = col.operator("room.select_by_preset", text=dp.name, icon=icon)
+                        op.preset_index = i
+                        op.preset_type  = 'DOOR'
+                if window_presets:
+                    col.separator()
+                    col.label(text="By Window Preset:")
+                    for i, wp in enumerate(window_presets):
+                        icon = "OUTLINER_OB_EMPTY" if wp.mesh_object else "QUESTION"
+                        op = col.operator("room.select_by_preset", text=wp.name, icon=icon)
+                        op.preset_index = i
+                        op.preset_type  = 'WINDOW'
+                col.separator()
+                col.label(text="Enter Edit Mode for face category selection", icon="INFO")
+            else:
+                # Edit Mode — face-category buttons
+                col = box.column(align=True)
+                col.label(text="Select Faces by Category:")
+                _cats = [
+                    (0, "Walls",          "SNAP_FACE"),
+                    (1, "Floor",          "MESH_PLANE"),
+                    (2, "Ceiling",        "MESH_PLANE"),
+                    (3, "Door Frames",    "OUTLINER_OB_EMPTY"),
+                    (4, "Window Frames",  "OUTLINER_OB_EMPTY"),
+                    (5, "Plinth Bottom",  "MESH_CUBE"),
+                    (6, "Plinth Top",     "MESH_CUBE"),
+                    (7, "Stair",          "MESH_CUBE"),
+                    (8, "Architrave",     "MESH_CUBE"),
+                    (9, "Stair Treads",   "MESH_CUBE"),
+                ]
+                for cat_idx, label, icon in _cats:
+                    op = col.operator("room.select_category", text=label, icon=icon)
+                    op.category = cat_idx
+
+        # ── Dimensions ────────────────────────────────────────────────────────
+        box = L.box()
+        row = box.row()
+        row.prop(s, "show_dimensions",
+                 icon='TRIA_DOWN' if s.show_dimensions else 'TRIA_RIGHT',
+                 icon_only=True, emboss=False)
+        row.prop(s, "show_dimensions", text="", icon="EMPTY_ARROWS", emboss=False)
+        row.label(text="Dimensions")
+        if s.show_dimensions:
+            col = box.column(align=True)
+            col.prop(s, "dim_rooms",    icon="VIEW_ORTHO")
+            col.prop(s, "dim_openings", icon="FULLSCREEN_ENTER")
 
 
 class ROOM_PT_door_panel(bpy.types.Panel):
@@ -7975,6 +9597,7 @@ class ROOM_PT_door_panel(bpy.types.Panel):
         col.prop(s, "door_margin")
         col.operator("room.sample_dims", icon="EYEDROPPER", text="Sample from Object  (Ctrl+Shift+E)")
         col.operator("room.save_door_preset", icon="ADD", text="Save Door Preset")
+        col.operator("room.sync_openings", icon="FILE_REFRESH", text="Sync All Openings")
         col.separator()
         col.label(text="Batch Flip All Doors:")
         row = col.row(align=True)
@@ -8027,7 +9650,9 @@ class ROOM_PT_window_panel(bpy.types.Panel):
         col = L.column(align=True)
         col.prop(s, "window_width")
         col.prop(s, "window_height")
-        col.prop(s, "window_v_offset")
+        col.row(align=True).prop(s, "window_v_mode", expand=True)
+        if s.window_v_mode == 'PRESET':
+            col.prop(s, "window_v_offset")
         col.separator()
         row = col.row(align=True)
         row.prop(s, "window_array_count")
@@ -9001,6 +10626,12 @@ _classes = (
     ROOM_PG_door_preset,
     ROOM_PG_window_preset,
     ROOM_PG_arch_preset,
+    ROOM_PG_mat_preset,
+    ROOM_UL_mat_presets,
+    ROOM_OT_save_mat_preset,
+    ROOM_OT_apply_mat_preset,
+    ROOM_OT_delete_mat_preset,
+    ROOM_OT_duplicate_mat_preset,
     ROOM_PG_settings,
     ROOM_OT_draw,
     ROOM_OT_clear,
@@ -9028,11 +10659,19 @@ _classes = (
     ROOM_OT_remove_arch_preset,
     ROOM_OT_sample_dims_apply,
     ROOM_OT_sample_dims,
+    ROOM_OT_sample_material,
     ROOM_OT_toggle_room_plinth,
     ROOM_OT_toggle_mesh_lock,
     ROOM_OT_recalculate_plinth,
     ROOM_OT_recalculate_uv,
+    ROOM_OT_scale_surface_uv,
+    ROOM_OT_rotate_surface_uv,
+    ROOM_OT_unify_uv,
+    ROOM_OT_scale_uv,
     ROOM_OT_sync_thresholds,
+    ROOM_OT_select_type,
+    ROOM_OT_select_by_preset,
+    ROOM_OT_select_category,
     ROOM_PT_panel,
     ROOM_PT_door_panel,
     ROOM_PT_window_panel,
@@ -9052,6 +10691,8 @@ def register():
     bpy.types.Scene.room_active_window_preset = bpy.props.IntProperty(default=-1)
     bpy.types.Scene.room_arch_presets         = bpy.props.CollectionProperty(type=ROOM_PG_arch_preset)
     bpy.types.Scene.room_active_arch_preset   = bpy.props.IntProperty(default=-1)
+    bpy.types.Scene.room_mat_presets          = bpy.props.CollectionProperty(type=ROOM_PG_mat_preset)
+    bpy.types.Scene.room_mat_preset_active    = bpy.props.IntProperty(default=0, update=_cb_mat_preset_active)
     bpy.types.Scene.room_registry             = bpy.props.CollectionProperty(type=ROOM_PG_registry_entry)
     bpy.types.Scene.room_door_edit_active     = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.room_window_edit_active   = bpy.props.BoolProperty(default=False)
@@ -9090,12 +10731,19 @@ def register():
         _draw_room_hint_cb, (), 'WINDOW', 'POST_PIXEL')
     _DRAW_HANDLES.add(_h)
 
+    # Persistent dimension overlay
+    _hd = bpy.types.SpaceView3D.draw_handler_add(
+        _draw_dimensions_cb, (), 'WINDOW', 'POST_PIXEL')
+    _DRAW_HANDLES.add(_hd)
+
     if _room_registry_cleanup not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_room_registry_cleanup)
     if _room_on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_room_on_load)
     if _room_undo_post not in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.append(_room_undo_post)
+    if _room_edit_mode_exit not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_room_edit_mode_exit)
 
 
 def unregister():
@@ -9113,6 +10761,8 @@ def unregister():
         bpy.app.handlers.load_post.remove(_room_on_load)
     if _room_undo_post in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.remove(_room_undo_post)
+    if _room_edit_mode_exit in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_room_edit_mode_exit)
 
     for km, kmi in ROOM_OT_draw._addon_kmaps:
         try: km.keymap_items.remove(kmi)
