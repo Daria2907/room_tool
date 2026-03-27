@@ -8326,22 +8326,19 @@ def _recalculate_plinth_for_obj(reg, obj, s):
     mw_inv = mw.inverted()
 
     # ── Remove existing plinth faces ─────────────────────────────────────────
-    for grp_name in ('plinth_bottom', 'plinth_top'):
-        vg = obj.vertex_groups.get(grp_name)
-        if vg is None:
-            continue
-        idx = vg.index
-        bm.verts.ensure_lookup_table()
-        plinth_verts = set()
-        deform = bm.verts.layers.deform.active
-        for v in bm.verts:
-            try:
-                if deform and idx in v[deform]:
-                    plinth_verts.add(v)
-            except Exception:
-                pass
-        if plinth_verts:
-            bmesh.ops.delete(bm, geom=list(plinth_verts), context='VERTS')
+    # Use the room_cat face attribute — NOT vertex groups — to identify plinth
+    # faces.  _fill_room calls remove_doubles which merges plinth vertices that
+    # sit flush against wall surfaces into a single shared vertex; that shared
+    # vertex ends up in both the 'walls' and 'plinth_bottom' vertex groups, so
+    # deleting by vertex group would also delete the wall faces that share it.
+    # Deleting by face with context='FACES' only removes vertices that become
+    # fully isolated (no remaining faces), so shared wall vertices survive.
+    cat_layer_rm = bm.faces.layers.int.get("room_cat")
+    if cat_layer_rm is not None:
+        plinth_faces = [f for f in bm.faces
+                        if f[cat_layer_rm] in (_CAT_PLINTH_BOTTOM, _CAT_PLINTH_TOP)]
+        if plinth_faces:
+            bmesh.ops.delete(bm, geom=plinth_faces, context='FACES')
 
     # ── Find wall-base edges (floor level) and wall-top edges (ceiling level) ──
     bm.verts.ensure_lookup_table()
