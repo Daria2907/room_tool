@@ -1612,7 +1612,7 @@ def _apply_cube_uv_to_mesh(me, s, obj=None):
     extruded floor/ceiling quads automatically pick up floor/ceiling tiling
     instead of being incorrectly bucketed as walls.
     """
-    uv_layer = me.uv_layers.new(name="UVMap")
+    uv_layer = me.uv_layers.get("UVMap") or me.uv_layers.new(name="UVMap")
     if uv_layer is None:
         return  # mesh has no polygons — nothing to UV-map
     cat_attr = me.attributes.get("room_cat") if hasattr(me, 'attributes') else None
@@ -1722,9 +1722,6 @@ def _apply_uvs_all_rooms(s):
             continue
         obj = bpy.data.objects[obj_name]
         me  = obj.data
-        uv = me.uv_layers.get("UVMap")
-        if uv:
-            me.uv_layers.remove(uv)
         _apply_cube_uv_to_mesh(me, s, obj=obj)
 
 
@@ -1749,14 +1746,10 @@ def _apply_materials_one_room(reg, s):
 def _apply_uvs_one_room(reg, s):
     """Recompute the UVMap for a single room registry entry."""
     obj_name = reg.get("obj_name", "")
-    if obj_name not in bpy.data.objects:
+    obj = bpy.data.objects.get(obj_name)
+    if obj is None:
         return
-    obj = bpy.data.objects[obj_name]
-    me  = obj.data
-    uv = me.uv_layers.get("UVMap")
-    if uv:
-        me.uv_layers.remove(uv)
-    _apply_cube_uv_to_mesh(me, s, obj=obj)
+    _apply_cube_uv_to_mesh(obj.data, s, obj=obj)
 
 
 def _build_stair_mesh(sd, s):
