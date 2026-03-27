@@ -2564,6 +2564,8 @@ def _rebuild_room_mesh(reg, s):
     if obj_name not in bpy.data.objects:
         return
     obj = bpy.data.objects[obj_name]
+    if obj.mode == 'EDIT':
+        return  # modifying mesh data while in edit mode corrupts it
 
     if reg.get("mesh_locked", False):
         # Locked: skip geometry rebuild, only cut new holes and reposition instances.
