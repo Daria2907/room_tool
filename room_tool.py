@@ -5642,6 +5642,14 @@ def _room_edit_mode_exit(*args):
                     if sc_s is None:
                         return None
                     for obj_name in exited_names:
+                        obj = bpy.data.objects.get(obj_name)
+                        if obj is None:
+                            continue
+                        # Safety: only act once the object is fully in Object mode.
+                        # If the user re-entered Edit Mode in the same frame, skip
+                        # rather than write mesh data into a live edit BMesh.
+                        if obj.mode != 'OBJECT':
+                            continue
                         reg = next((r for r in ROOM_OT_draw._room_list
                                     if r.get("obj_name") == obj_name), None)
                         if reg is None:
@@ -5654,12 +5662,10 @@ def _room_edit_mode_exit(*args):
                         if (not reg.get('mesh_locked', False) and
                                 (reg.get('plinth_bottom_enabled', False) or
                                  reg.get('plinth_top_enabled', False))):
-                            obj = bpy.data.objects.get(obj_name)
-                            if obj is not None:
-                                try:
-                                    _recalculate_plinth_for_obj(reg, obj, sc_s)
-                                except Exception:
-                                    pass
+                            try:
+                                _recalculate_plinth_for_obj(reg, obj, sc_s)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
                 return None  # don't repeat
@@ -8298,6 +8304,9 @@ def _recalculate_plinth_for_obj(reg, obj, s):
     Works on locked rooms without touching the rest of the mesh.
     Returns the number of unique base edges processed (0 if no edges found).
     """
+    if obj.mode == 'EDIT':
+        return 0  # never modify mesh data while the object is in edit mode
+
     pb = reg.get('plinth_bottom_enabled', False)
     pt = reg.get('plinth_top_enabled',    False)
     if not pb and not pt:
