@@ -5655,17 +5655,9 @@ def _room_edit_mode_exit(*args):
                         if reg is None:
                             continue
                         _apply_uvs_one_room(reg, sc_s)
-                        # Recalculate plinth for unlocked rooms with plinth enabled.
-                        # Done here (deferred timer) rather than in the draw callback
-                        # to avoid modifying mesh data mid-render, which can corrupt
-                        # the mesh and cause rooms to disappear.
-                        if (not reg.get('mesh_locked', False) and
-                                (reg.get('plinth_bottom_enabled', False) or
-                                 reg.get('plinth_top_enabled', False))):
-                            try:
-                                _recalculate_plinth_for_obj(reg, obj, sc_s)
-                            except Exception:
-                                pass
+                        # Plinth is NOT recalculated automatically on edit-mode exit.
+                        # Despite 4 fix attempts the BMesh round-trip caused persistent
+                        # "rooms breaking" bugs. Use the Recalculate Plinth button.
                 except Exception:
                     pass
                 return None  # don't repeat
