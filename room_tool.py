@@ -2535,7 +2535,12 @@ def _sync_arch_obj(reg, s):
 def _sync_reg_bounds_from_mesh(reg, obj):
     """Update reg x1/y1/x2/y2/z from the actual mesh world-space bounding box.
     Called for locked rooms before cutting holes or placing instances so that
-    manually-moved walls are accounted for correctly."""
+    manually-moved walls are accounted for correctly.
+
+    The bounding box includes outer wall faces (offset by wall thickness t).
+    We add t back on each side to recover the inner-face positions that the
+    rest of the tool (cutter placement, instance positioning) expects.
+    """
     if obj is None or obj.type != 'MESH' or not obj.data.vertices:
         return
     mw = obj.matrix_world
@@ -2545,10 +2550,11 @@ def _sync_reg_bounds_from_mesh(reg, obj):
         xs.append(wco.x)
         ys.append(wco.y)
         zs.append(wco.z)
-    reg["x1"] = min(xs)
-    reg["x2"] = max(xs)
-    reg["y1"] = min(ys)
-    reg["y2"] = max(ys)
+    t = reg.get("t", 0.125)
+    reg["x1"] = min(xs) + t
+    reg["x2"] = max(xs) - t
+    reg["y1"] = min(ys) + t
+    reg["y2"] = max(ys) - t
     reg["z"]  = min(zs)
 
 
