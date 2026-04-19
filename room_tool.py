@@ -1,9 +1,14 @@
+# Room Tool — Blender Addon
+# Copyright (c) 2025 WildBloom. All rights reserved.
+# Distributed via Gumroad. Unauthorised redistribution prohibited.
+
 bl_info = {
     "name": "Room Tool",
-    "version": (1, 4),
+    "author": "WildBloom",
+    "version": (1, 5),
     "blender": (3, 0, 0),
     "location": "3D View ▸ N-Panel ▸ Room Tool  |  Shift+R",
-    "description": "Click to draw rooms. Connected rooms share aligned door openings.",
+    "description": "Draw rooms. Add windows and doors in one click. Create material presets. Add simple stairs to connect floors.",
     "category": "Mesh",
 }
 
@@ -95,6 +100,9 @@ class ROOM_PG_mat_preset(bpy.types.PropertyGroup):
     mat_stair_step         : bpy.props.PointerProperty(type=bpy.types.Material)
     mat_stair_step_tiling_x     : bpy.props.FloatProperty(default=1.0)
     mat_stair_step_tiling_y     : bpy.props.FloatProperty(default=1.0)
+    mat_stair_riser        : bpy.props.PointerProperty(type=bpy.types.Material)
+    mat_stair_riser_tiling_x    : bpy.props.FloatProperty(default=1.0)
+    mat_stair_riser_tiling_y    : bpy.props.FloatProperty(default=1.0)
 
 
 # Ordered list of (mat_attr, tiling_x_attr, tiling_y_attr) — used by preset save/apply
@@ -109,6 +117,7 @@ _PRESET_SURFACES = [
     ("mat_architrave",   "mat_architrave_tiling_x",   "mat_architrave_tiling_y"),
     ("mat_stair",        "mat_stair_tiling_x",        "mat_stair_tiling_y"),
     ("mat_stair_step",   "mat_stair_step_tiling_x",   "mat_stair_step_tiling_y"),
+    ("mat_stair_riser",  "mat_stair_riser_tiling_x",  "mat_stair_riser_tiling_y"),
 ]
 
 
@@ -135,6 +144,7 @@ class ROOM_PG_registry_entry(bpy.types.PropertyGroup):
     plinth_top_enabled    : bpy.props.BoolProperty(default=False)
     stairs_json           : bpy.props.StringProperty(default="[]")
     mesh_locked           : bpy.props.BoolProperty(default=False)
+    mat_preset_idx        : bpy.props.IntProperty(default=-1)
 
 
 def _update_arch_mat(reg, s):
@@ -198,16 +208,19 @@ def _apply_mat_preset_by_idx(context, idx):
     finally:
         _preset_loading = False
 
-    # Apply materials and UVs to rooms
+    # Apply materials and UVs to rooms; record the preset index per room
     if getattr(s, 'mat_apply_mode', 'ALL') == 'SELECTED' and context.active_object:
         reg = next((r for r in ROOM_OT_draw._room_list
                     if r.get('obj_name') == context.active_object.name), None)
         if reg is not None:
+            reg["mat_preset_idx"] = idx
             _apply_materials_one_room(reg, s)
             _update_arch_mat(reg, s)
             _apply_uvs_one_room(reg, s)
             _update_arch_uv(reg, s)
             return
+    for reg in ROOM_OT_draw._room_list:
+        reg["mat_preset_idx"] = idx
     _apply_materials_all_rooms(s)
     _apply_uvs_all_rooms(s)
     for reg in ROOM_OT_draw._room_list:
@@ -520,7 +533,7 @@ def _rebuild_stair_steps(context, use_depth):
         me.update()
         obj.data = me
         bpy.data.meshes.remove(old_me)
-        _setup_stair_materials(me, s)
+        _setup_stair_materials(me, s, sd=sd)
         _apply_stair_uv(me, s)
         obj["room_stair"] = json.dumps({k: v for k, v in sd.items() if k != "obj_name"})
     except Exception:
@@ -540,13 +553,10 @@ def _cb_stair_slab(self, context):
     """Update callback for stair_open_under / stair_slab_thick."""
     obj = context.active_object
     if obj is None or "room_stair" not in obj:
-        print("[room_tool] _cb_stair_slab: no stair object active")
         return
     sd = next((d for d in ROOM_OT_draw._stair_list
                if d.get("obj_name") == obj.name), None)
     if sd is None:
-        print(f"[room_tool] _cb_stair_slab: sd not found for '{obj.name}' "
-              f"(list has {len(ROOM_OT_draw._stair_list)} entries)")
         return
     # Sync sd from the object's custom property so any undo that restored the
     # mesh to a previous position is reflected before we rebuild.
@@ -558,11 +568,8 @@ def _cb_stair_slab(self, context):
     s = context.scene.room_settings
     sd["open_under"] = s.stair_open_under
     sd["slab_thick"] = s.stair_slab_thick
-    print(f"[room_tool] _cb_stair_slab: rebuilding '{obj.name}' "
-          f"open={sd['open_under']} thick={sd['slab_thick']:.3f}")
     try:
         verts, faces, cats = _build_stair_mesh(sd, s)
-        print(f"[room_tool] _cb_stair_slab: built {len(verts)} verts, {len(faces)} faces")
         if not verts:
             return
         # _build_stair_mesh returns world-space coords; convert to local (obj.location is pivot)
@@ -584,10 +591,9 @@ def _cb_stair_slab(self, context):
         bm.to_mesh(me)
         bm.free()
         me.update()
-        _setup_stair_materials(me, s)
+        _setup_stair_materials(me, s, sd=sd)
         _apply_stair_uv(me, s)
         obj["room_stair"] = json.dumps({k: v for k, v in sd.items() if k != "obj_name"})
-        print(f"[room_tool] _cb_stair_slab: done, mesh has {len(me.polygons)} polys")
     except Exception:
         import traceback
         traceback.print_exc()
@@ -785,6 +791,11 @@ class ROOM_PG_settings(bpy.types.PropertyGroup):
     mat_stair_step_tiling_x  : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
     mat_stair_step_tiling_y  : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
     mat_stair_step_rotation  : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_stair_tiling)
+    mat_stair_riser       : bpy.props.PointerProperty(type=bpy.types.Material, name="Stair Risers",
+        update=_cb_stair_mat)
+    mat_stair_riser_tiling_x : bpy.props.FloatProperty(name="X", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
+    mat_stair_riser_tiling_y : bpy.props.FloatProperty(name="Y", default=1.0, min=0.001, max=1000.0, update=_cb_stair_tiling)
+    mat_stair_riser_rotation : bpy.props.FloatProperty(name="°", default=0.0, soft_min=0, soft_max=315, step=4500, precision=0, update=_cb_stair_tiling)
     stair_apply_dir    : bpy.props.EnumProperty(
         name="Direction",
         items=[('LEFT','Left',''),('RIGHT','Right','')],
@@ -898,8 +909,9 @@ _CAT_PLINTH_TOP    = 6
 _CAT_STAIR         = 7
 _CAT_ARCHITRAVE    = 8
 _CAT_STAIR_STEP    = 9
-_CAT_THRESHOLD     = 10   # virtual — threshold is a separate mesh, not a room face category
-_CAT_NAMES = ('walls', 'floor', 'ceiling', 'door_frames', 'window_frames', 'plinth_bottom', 'plinth_top', 'stair', 'architrave', 'stair_step')
+_CAT_STAIR_RISER   = 10
+_CAT_THRESHOLD     = 11   # virtual — threshold is a separate mesh, not a room face category
+_CAT_NAMES = ('walls', 'floor', 'ceiling', 'door_frames', 'window_frames', 'plinth_bottom', 'plinth_top', 'stair', 'architrave', 'stair_step', 'stair_riser')
 
 def _face4(bm, v0, v1, v2, v3):
     bm.faces.new([bm.verts.new(co) for co in (v0, v1, v2, v3)])
@@ -1612,7 +1624,7 @@ def _apply_cube_uv_to_mesh(me, s, obj=None):
     extruded floor/ceiling quads automatically pick up floor/ceiling tiling
     instead of being incorrectly bucketed as walls.
     """
-    uv_layer = me.uv_layers.get("UVMap") or me.uv_layers.new(name="UVMap")
+    uv_layer = me.uv_layers.new(name="UVMap")
     if uv_layer is None:
         return  # mesh has no polygons — nothing to UV-map
     cat_attr = me.attributes.get("room_cat") if hasattr(me, 'attributes') else None
@@ -1722,6 +1734,9 @@ def _apply_uvs_all_rooms(s):
             continue
         obj = bpy.data.objects[obj_name]
         me  = obj.data
+        uv = me.uv_layers.get("UVMap")
+        if uv:
+            me.uv_layers.remove(uv)
         _apply_cube_uv_to_mesh(me, s, obj=obj)
 
 
@@ -1746,10 +1761,14 @@ def _apply_materials_one_room(reg, s):
 def _apply_uvs_one_room(reg, s):
     """Recompute the UVMap for a single room registry entry."""
     obj_name = reg.get("obj_name", "")
-    obj = bpy.data.objects.get(obj_name)
-    if obj is None:
+    if obj_name not in bpy.data.objects:
         return
-    _apply_cube_uv_to_mesh(obj.data, s, obj=obj)
+    obj = bpy.data.objects[obj_name]
+    me  = obj.data
+    uv = me.uv_layers.get("UVMap")
+    if uv:
+        me.uv_layers.remove(uv)
+    _apply_cube_uv_to_mesh(me, s, obj=obj)
 
 
 def _build_stair_mesh(sd, s):
@@ -1763,7 +1782,7 @@ def _build_stair_mesh(sd, s):
       - risers (front vertical face of each step)
       - flat soffit at z_bot (-Z normal)
       - back wall at the high end of the run
-      - left / right solid stringer walls (fan-triangulated staircase profile)
+      - left / right solid stringer walls (per-step column quads)
       - optional railing panels on each side
 
     sd keys: lx1,ly1,lx2,ly2 (lower hole footprint / rect width)
@@ -1823,7 +1842,6 @@ def _build_stair_mesh(sd, s):
         faces_out.append((base, base + 1, base + 2))
         cats_out.append(cat)
 
-
     # Helpers: interpolate perpendicular (width) bounds linearly from lower to upper rect.
     # frac=0 → lower rect perpendicular; frac=1 → upper rect perpendicular.
     _span = (t_end - t_start) if abs(t_end - t_start) > 1e-6 else 1.0
@@ -1848,10 +1866,10 @@ def _build_stair_mesh(sd, s):
             yab = _ya(xb); ybb = _yb(xb)
             if td > 0:
                 _quad((xf, yaf, zh), (xb, yab, zh), (xb, ybb, zh), (xf, ybf, zh), cat=_CAT_STAIR_STEP)  # tread
-                _quad((xf, ybf, zl), (xf, yaf, zl), (xf, yaf, zh), (xf, ybf, zh))  # riser
+                _quad((xf, ybf, zl), (xf, yaf, zl), (xf, yaf, zh), (xf, ybf, zh), cat=_CAT_STAIR_RISER)  # riser
             else:
                 _quad((xb, yab, zh), (xf, yaf, zh), (xf, ybf, zh), (xb, ybb, zh), cat=_CAT_STAIR_STEP)
-                _quad((xf, yaf, zl), (xf, ybf, zl), (xf, ybf, zh), (xf, yaf, zh))
+                _quad((xf, yaf, zl), (xf, ybf, zl), (xf, ybf, zh), (xf, yaf, zh), cat=_CAT_STAIR_RISER)
 
         z_slab_top = z_bot + dz   # height of the slab at t_end
 
@@ -1873,18 +1891,20 @@ def _build_stair_mesh(sd, s):
             D2 = (bt_start, _yb(bt_start), z_bot)
             B2 = (t_end, ya1, z_slab_top - slab_thick)
             C2 = (t_end, yb1, z_slab_top - slab_thick)
-            _quad(A, B, C, D)       # top inclined face
-            _quad(D2, C2, B2, A2)   # bottom inclined face (uniform thickness)
             if td > 0:
+                _quad(A, B, C, D)       # top inclined face
+                _quad(D2, C2, B2, A2)   # bottom inclined face
                 _quad(A, A2, B2, B)     # ya side
                 _quad(D, C, C2, D2)     # yb side
                 _quad(A, D, D2, A2)     # lower floor-level end cap
                 _quad(B, B2, C2, C)     # upper end cap
             else:
-                _quad(A, B, B2, A2)     # ya side (td<0)
-                _quad(D2, C2, C, D)     # yb side (td<0)
-                _quad(A2, D2, D, A)     # lower floor-level end cap (td<0)
-                _quad(B, C, C2, B2)     # upper end cap (td<0)
+                _quad(D, C, B, A)       # top inclined face (reversed for td<0)
+                _quad(A2, B2, C2, D2)   # bottom inclined face (reversed for td<0)
+                _quad(A, B, B2, A2)     # ya side
+                _quad(D2, C2, C, D)     # yb side
+                _quad(A2, D2, D, A)     # lower floor-level end cap
+                _quad(B, C, C2, B2)     # upper end cap
             # Close the triangular gap between each step riser and the slab.
             # For step i: V_top=(xf,y,zh), V_bot=(xf,y,zl), V_back=(xb,y,zh).
             # Slab top surface passes exactly through V_bot and V_back, so the
@@ -1912,9 +1932,13 @@ def _build_stair_mesh(sd, s):
                 cats_out.append(_CAT_STAIR)
         else:
             # ── Solid stringer (default) ──────────────────────────────────────
-            # Soffit — horizontal quad at z_bot
-            _quad((t_start, _yb(t_start), z_bot), (t_end, _yb(t_end), z_bot),
-                  (t_end,   _ya(t_end),   z_bot), (t_start, _ya(t_start), z_bot))
+            # Soffit — horizontal quad at z_bot (-Z normal)
+            if td > 0:
+                _quad((t_start, _yb(t_start), z_bot), (t_end, _yb(t_end), z_bot),
+                      (t_end,   _ya(t_end),   z_bot), (t_start, _ya(t_start), z_bot))
+            else:
+                _quad((t_start, _ya(t_start), z_bot), (t_end, _ya(t_end), z_bot),
+                      (t_end,   _yb(t_end),   z_bot), (t_start, _yb(t_start), z_bot))
 
             # Back wall at the high end
             xw = t_end; ya_w = _ya(xw); yb_w = _yb(xw)
@@ -1923,23 +1947,23 @@ def _build_stair_mesh(sd, s):
             else:
                 _quad((xw, yb_w, z_bot), (xw, ya_w, z_bot), (xw, ya_w, z_top), (xw, yb_w, z_top))
 
-            # Solid stringer on each side: one quad per step
+            # Solid stringer on each side: one quad per step (column from z_bot to
+            # step tread height).  Per-step quads avoid the concave N-gon fan
+            # triangulation that produced diagonal artifacts and inverted normals.
             def _stringer_quads(side_fn, outward_neg_y):
-                """One quad per step: spans the step's X width from z_bot to step
-                height.  Avoids fan-triangulation artifacts on the concave polygon."""
                 for i in range(n):
-                    xf = t_start + td * i * step_d
-                    xb = t_start + td * (i + 1) * step_d
-                    zh = z_bot + (i + 1) * actual_rise
-                    x_lo, x_hi = (xf, xb) if xb > xf else (xb, xf)
-                    yl = side_fn(x_lo)
-                    yh = side_fn(x_hi)
-                    if outward_neg_y:   # −Y outward normal
-                        _quad((x_hi, yh, z_bot), (x_lo, yl, z_bot),
-                              (x_lo, yl, zh),    (x_hi, yh, zh))
-                    else:               # +Y outward normal
-                        _quad((x_lo, yl, z_bot), (x_hi, yh, z_bot),
-                              (x_hi, yh, zh),    (x_lo, yl, zh))
+                    x_lo = t_start + td * i * step_d
+                    x_hi = t_start + td * (i + 1) * step_d
+                    zh_i = z_bot + (i + 1) * actual_rise
+                    ya_lo = side_fn(x_lo)
+                    ya_hi = side_fn(x_hi)
+                    want_neg_y = outward_neg_y if td > 0 else not outward_neg_y
+                    if want_neg_y:
+                        _quad((x_lo, ya_lo, z_bot), (x_hi, ya_hi, z_bot),
+                              (x_hi, ya_hi, zh_i), (x_lo, ya_lo, zh_i))
+                    else:
+                        _quad((x_lo, ya_lo, zh_i), (x_hi, ya_hi, zh_i),
+                              (x_hi, ya_hi, z_bot), (x_lo, ya_lo, z_bot))
 
             _stringer_quads(_ya, outward_neg_y=True)
             _stringer_quads(_yb, outward_neg_y=False)
@@ -1958,10 +1982,10 @@ def _build_stair_mesh(sd, s):
             xab = _xa(yb_); xbb = _xb(yb_)
             if td > 0:
                 _quad((xaf, yf, zh), (xbf, yf, zh), (xbb, yb_, zh), (xab, yb_, zh), cat=_CAT_STAIR_STEP)  # tread
-                _quad((xaf, yf, zl), (xbf, yf, zl), (xbf, yf, zh), (xaf, yf, zh))    # riser (−Y normal)
+                _quad((xaf, yf, zl), (xbf, yf, zl), (xbf, yf, zh), (xaf, yf, zh), cat=_CAT_STAIR_RISER)  # riser
             else:
                 _quad((xab, yb_, zh), (xbb, yb_, zh), (xbf, yf, zh), (xaf, yf, zh), cat=_CAT_STAIR_STEP)
-                _quad((xbf, yf, zl), (xaf, yf, zl), (xaf, yf, zh), (xbf, yf, zh))    # riser (+Y normal)
+                _quad((xbf, yf, zl), (xaf, yf, zl), (xaf, yf, zh), (xbf, yf, zh), cat=_CAT_STAIR_RISER)
 
         z_slab_top = z_bot + dz
 
@@ -1979,44 +2003,51 @@ def _build_stair_mesh(sd, s):
             D2 = (_xb(bt_start), bt_start, z_bot)
             B2 = (xa1, t_end, z_slab_top - slab_thick)
             C2 = (xb1, t_end, z_slab_top - slab_thick)
-            _quad(A, B, C, D)       # top inclined face
-            _quad(D2, C2, B2, A2)   # bottom inclined face (uniform thickness)
             if td > 0:
+                _quad(D, C, B, A)       # top inclined face (reversed for td>0 y_travel)
+                _quad(A2, B2, C2, D2)   # bottom inclined face (reversed for td>0 y_travel)
                 _quad(A, A2, B2, B)     # xa side
                 _quad(D, C, C2, D2)     # xb side
                 _quad(A, D, D2, A2)     # lower floor-level end cap
                 _quad(B, B2, C2, C)     # upper end cap
             else:
-                _quad(A, B, B2, A2)     # xa side (td<0)
-                _quad(D2, C2, C, D)     # xb side (td<0)
-                _quad(A2, D2, D, A)     # lower floor-level end cap (td<0)
-                _quad(B, C, C2, B2)     # upper end cap (td<0)
+                _quad(A, B, C, D)       # top inclined face
+                _quad(D2, C2, B2, A2)   # bottom inclined face
+                _quad(A, B, B2, A2)     # xa side
+                _quad(D2, C2, C, D)     # xb side
+                _quad(A2, D2, D, A)     # lower floor-level end cap
+                _quad(B, C, C2, B2)     # upper end cap
             # Close triangular gap under each step (y_travel version)
             for i in range(n):
                 yf = t_start + td * i * step_d
                 yb_ = t_start + td * (i + 1) * step_d
                 zl  = z_bot + i * actual_rise
                 zh  = zl + actual_rise
-                # xa side triangle (normal −X for td>0)
+                # xa side triangle (normal −X)
                 base = len(verts_out)
                 verts_out += [(_xa(yf), yf, zh), (_xa(yf), yf, zl), (_xa(yb_), yb_, zh)]
                 if td > 0:
-                    faces_out.append((base, base+1, base+2))
-                else:
                     faces_out.append((base, base+2, base+1))
+                else:
+                    faces_out.append((base, base+1, base+2))
                 cats_out.append(_CAT_STAIR)
                 # xb side triangle (normal +X — reversed winding)
                 base = len(verts_out)
                 verts_out += [(_xb(yf), yf, zh), (_xb(yf), yf, zl), (_xb(yb_), yb_, zh)]
                 if td > 0:
-                    faces_out.append((base, base+2, base+1))
-                else:
                     faces_out.append((base, base+1, base+2))
+                else:
+                    faces_out.append((base, base+2, base+1))
                 cats_out.append(_CAT_STAIR)
         else:
             # ── Solid stringer (default, y_travel) ───────────────────────────
-            _quad((_xb(t_start), t_start, z_bot), (_xb(t_end), t_end, z_bot),
-                  (_xa(t_end),   t_end,   z_bot), (_xa(t_start), t_start, z_bot))
+            # Soffit — horizontal quad at z_bot (-Z normal)
+            if td > 0:
+                _quad((_xa(t_start), t_start, z_bot), (_xa(t_end), t_end, z_bot),
+                      (_xb(t_end),   t_end,   z_bot), (_xb(t_start), t_start, z_bot))
+            else:
+                _quad((_xb(t_start), t_start, z_bot), (_xb(t_end), t_end, z_bot),
+                      (_xa(t_end),   t_end,   z_bot), (_xa(t_start), t_start, z_bot))
 
             yw = t_end; xa_w = _xa(yw); xb_w = _xb(yw)
             if td > 0:
@@ -2024,23 +2055,21 @@ def _build_stair_mesh(sd, s):
             else:
                 _quad((xa_w, yw, z_bot), (xb_w, yw, z_bot), (xb_w, yw, z_top), (xa_w, yw, z_top))
 
-            # Solid stringer on each side: one quad per step
+            # Solid stringer on each side: one quad per step (column approach).
             def _stringer_y_quads(side_fn, outward_neg_x):
-                """One quad per step: spans the step's Y width from z_bot to step
-                height.  Avoids fan-triangulation artifacts on the concave polygon."""
                 for i in range(n):
-                    yf  = t_start + td * i * step_d
-                    yb_ = t_start + td * (i + 1) * step_d
-                    zh  = z_bot + (i + 1) * actual_rise
-                    y_lo, y_hi = (yf, yb_) if yb_ > yf else (yb_, yf)
-                    xl = side_fn(y_lo)
-                    xh = side_fn(y_hi)
-                    if outward_neg_x:   # −X outward normal
-                        _quad((xh, y_hi, z_bot), (xl, y_lo, z_bot),
-                              (xl, y_lo, zh),    (xh, y_hi, zh))
-                    else:               # +X outward normal
-                        _quad((xl, y_lo, z_bot), (xh, y_hi, z_bot),
-                              (xh, y_hi, zh),    (xl, y_lo, zh))
+                    y_lo = t_start + td * i * step_d
+                    y_hi = t_start + td * (i + 1) * step_d
+                    zh_i = z_bot + (i + 1) * actual_rise
+                    xa_lo = side_fn(y_lo)
+                    xa_hi = side_fn(y_hi)
+                    want_neg_x = outward_neg_x if td > 0 else not outward_neg_x
+                    if want_neg_x:
+                        _quad((xa_lo, y_lo, z_bot), (xa_lo, y_lo, zh_i),
+                              (xa_hi, y_hi, zh_i), (xa_hi, y_hi, z_bot))
+                    else:
+                        _quad((xa_hi, y_hi, z_bot), (xa_hi, y_hi, zh_i),
+                              (xa_lo, y_lo, zh_i), (xa_lo, y_lo, z_bot))
 
             _stringer_y_quads(_xa, outward_neg_x=True)
             _stringer_y_quads(_xb, outward_neg_x=False)
@@ -2099,7 +2128,7 @@ def _make_stair_obj(name, sd, s, collection=None):
     me.update()
     obj = bpy.data.objects.new(name, me)
     (collection or bpy.context.collection).objects.link(obj)
-    _setup_stair_materials(me, s)
+    _setup_stair_materials(me, s, sd=sd)
     _apply_stair_uv(me, s)   # UV computed while verts are still in world space
     # Set object origin to centroid of all vertices
     pivot = Vector((
@@ -2116,15 +2145,54 @@ def _make_stair_obj(name, sd, s, collection=None):
     return obj
 
 
-def _setup_stair_materials(me, s):
-    """Assign stair/railing materials to a stair mesh."""
+def _get_stair_preset_mats(sd):
+    """Return (mat_stair, mat_stair_step, mat_stair_riser) from the lower room's
+    assigned preset. Falls back to (None, None, None) when no preset is found."""
+    rooms = ROOM_OT_draw._room_list
+    lx1 = min(sd.get("lx1", 0), sd.get("lx2", 0))
+    lx2 = max(sd.get("lx1", 0), sd.get("lx2", 0))
+    ly1 = min(sd.get("ly1", 0), sd.get("ly2", 0))
+    ly2 = max(sd.get("ly1", 0), sd.get("ly2", 0))
+    li = _rect_fits_in_room(lx1, ly1, lx2, ly2, sd.get("z_bot", 0), rooms)
+    if li is None:
+        return None, None, None
+    pidx = rooms[li].get("mat_preset_idx", -1)
+    if pidx < 0:
+        return None, None, None
+    scene = next((sc for sc in bpy.data.scenes
+                  if hasattr(sc, 'room_mat_presets')), None)
+    if scene is None:
+        return None, None, None
+    presets = scene.room_mat_presets
+    if not (0 <= pidx < len(presets)):
+        return None, None, None
+    p = presets[pidx]
+    return p.mat_stair, p.mat_stair_step, p.mat_stair_riser
+
+
+def _setup_stair_materials(me, s, sd=None):
+    """Assign stair/railing materials to a stair mesh.
+
+    If sd is provided, stair materials are sourced from the lower room's assigned
+    material preset so the stair inherits the material set of the floor it sits on."""
     while me.materials:
         me.materials.pop(index=0)
-    mat_s    = getattr(s, 'mat_stair',      None)
-    mat_step = getattr(s, 'mat_stair_step', None)
-    # _CAT_STAIR_STEP falls back to mat_s when no separate material assigned
+    if sd is not None:
+        mat_s, mat_step, mat_riser = _get_stair_preset_mats(sd)
+        if mat_s is None:
+            mat_s = getattr(s, 'mat_stair', None)
+        if mat_step is None:
+            mat_step = getattr(s, 'mat_stair_step', None)
+        if mat_riser is None:
+            mat_riser = getattr(s, 'mat_stair_riser', None)
+    else:
+        mat_s     = getattr(s, 'mat_stair',       None)
+        mat_step  = getattr(s, 'mat_stair_step',  None)
+        mat_riser = getattr(s, 'mat_stair_riser', None)
+    # Risers and treads fall back to mat_s when no separate material assigned
     mat_list, slot_map = [], {}
-    for cat, mat in ((_CAT_STAIR, mat_s), (_CAT_STAIR_STEP, mat_step or mat_s)):
+    for cat, mat in ((_CAT_STAIR, mat_s), (_CAT_STAIR_STEP, mat_step or mat_s),
+                     (_CAT_STAIR_RISER, mat_riser or mat_s)):
         if mat is None:
             slot_map[cat] = None
         elif mat in mat_list:
@@ -2151,7 +2219,7 @@ def _apply_stair_materials_all(s):
             continue
         obj = bpy.data.objects.get(obj_name)
         if obj and obj.data:
-            _setup_stair_materials(obj.data, s)
+            _setup_stair_materials(obj.data, s, sd=sd)
 
 
 def _apply_stair_uvs_all(s):
@@ -2173,20 +2241,26 @@ def _apply_stair_uv(me, s):
     """Cube-project UV for stair mesh, with separate X/Y tiling for treads vs sides."""
     import math as _math
     uv_layer = me.uv_layers.new(name="UVMap")
-    side_x   = getattr(s, 'mat_stair_tiling_x',       1.0)
-    side_y   = getattr(s, 'mat_stair_tiling_y',       1.0)
-    side_rot = getattr(s, 'mat_stair_rotation',        0.0)
-    step_x   = getattr(s, 'mat_stair_step_tiling_x',  1.0)
-    step_y   = getattr(s, 'mat_stair_step_tiling_y',  1.0)
-    step_rot = getattr(s, 'mat_stair_step_rotation',  0.0)
+    side_x    = getattr(s, 'mat_stair_tiling_x',        1.0)
+    side_y    = getattr(s, 'mat_stair_tiling_y',        1.0)
+    side_rot  = getattr(s, 'mat_stair_rotation',         0.0)
+    step_x    = getattr(s, 'mat_stair_step_tiling_x',   1.0)
+    step_y    = getattr(s, 'mat_stair_step_tiling_y',   1.0)
+    step_rot  = getattr(s, 'mat_stair_step_rotation',   0.0)
+    riser_x   = getattr(s, 'mat_stair_riser_tiling_x',  1.0)
+    riser_y   = getattr(s, 'mat_stair_riser_tiling_y',  1.0)
+    riser_rot = getattr(s, 'mat_stair_riser_rotation',   0.0)
     cat_attr = me.attributes.get("stair_cat") if hasattr(me, 'attributes') else None
     verts = me.vertices
     loops = me.loops
     for poly in me.polygons:
         cat = cat_attr.data[poly.index].value if cat_attr else _CAT_STAIR
-        is_step = (cat == _CAT_STAIR_STEP)
-        sc_x, sc_y = (step_x, step_y) if is_step else (side_x, side_y)
-        rot_deg    = step_rot if is_step else side_rot
+        if cat == _CAT_STAIR_STEP:
+            sc_x, sc_y, rot_deg = step_x, step_y, step_rot
+        elif cat == _CAT_STAIR_RISER:
+            sc_x, sc_y, rot_deg = riser_x, riser_y, riser_rot
+        else:
+            sc_x, sc_y, rot_deg = side_x, side_y, side_rot
         n = poly.normal
         ax, ay, az = abs(n.x), abs(n.y), abs(n.z)
         if rot_deg != 0.0:
@@ -2253,32 +2327,38 @@ def _cut_hole_in_locked_mesh(reg, opening, s):
     t      = reg.get("t", getattr(s, 'wall_thickness', 0.125))
     x1, y1, x2, y2 = reg["x1"], reg["y1"], reg["x2"], reg["y2"]
 
+    # Centre the cutter at the wall mid-plane so it covers the full wall depth.
     depth  = t + 0.06   # slightly deeper than wall for a clean cut
     half_w = w * 0.5
     z_bot  = z + v_off
     z_top  = z + v_off + h
     hd     = depth * 0.5
+    ht     = t * 0.5   # half wall thickness — offset to wall mid-plane
 
     if wc == 'S':
-        cx, cy = anchor, y1
+        # S inner face = y1, outer face = y1-t, mid-plane = y1-ht
+        cx, cy = anchor, y1 - ht
         verts = [(cx - half_w, cy - hd, z_bot), (cx + half_w, cy - hd, z_bot),
                  (cx + half_w, cy + hd, z_bot), (cx - half_w, cy + hd, z_bot),
                  (cx - half_w, cy - hd, z_top), (cx + half_w, cy - hd, z_top),
                  (cx + half_w, cy + hd, z_top), (cx - half_w, cy + hd, z_top)]
     elif wc == 'N':
-        cx, cy = anchor, y2
+        # N inner face = y2, outer face = y2+t, mid-plane = y2+ht
+        cx, cy = anchor, y2 + ht
         verts = [(cx - half_w, cy - hd, z_bot), (cx + half_w, cy - hd, z_bot),
                  (cx + half_w, cy + hd, z_bot), (cx - half_w, cy + hd, z_bot),
                  (cx - half_w, cy - hd, z_top), (cx + half_w, cy - hd, z_top),
                  (cx + half_w, cy + hd, z_top), (cx - half_w, cy + hd, z_top)]
     elif wc == 'W':
-        cx, cy = x1, anchor
+        # W inner face = x1, outer face = x1-t, mid-plane = x1-ht
+        cx, cy = x1 - ht, anchor
         verts = [(cx - hd, cy - half_w, z_bot), (cx + hd, cy - half_w, z_bot),
                  (cx + hd, cy + half_w, z_bot), (cx - hd, cy + half_w, z_bot),
                  (cx - hd, cy - half_w, z_top), (cx + hd, cy - half_w, z_top),
                  (cx + hd, cy + half_w, z_top), (cx - hd, cy + half_w, z_top)]
     elif wc == 'E':
-        cx, cy = x2, anchor
+        # E inner face = x2, outer face = x2+t, mid-plane = x2+ht
+        cx, cy = x2 + ht, anchor
         verts = [(cx - hd, cy - half_w, z_bot), (cx + hd, cy - half_w, z_bot),
                  (cx + hd, cy + half_w, z_bot), (cx - hd, cy + half_w, z_bot),
                  (cx - hd, cy - half_w, z_top), (cx + hd, cy - half_w, z_top),
@@ -2295,43 +2375,83 @@ def _cut_hole_in_locked_mesh(reg, opening, s):
     col = next(iter(obj.users_collection), bpy.context.scene.collection)
     col.objects.link(cutter_obj)
 
-    mod = obj.modifiers.new("__rt_bool__", 'BOOLEAN')
-    mod.operation = 'DIFFERENCE'
-    mod.solver    = 'EXACT'
-    mod.object    = cutter_obj
+    orig_poly_count = len(obj.data.polygons)
 
-    success = False
-    try:
-        # Use depsgraph evaluation — does not need operator context
-        bpy.context.view_layer.update()
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-        eval_obj  = obj.evaluated_get(depsgraph)
-        new_me    = bpy.data.meshes.new_from_object(
-                        eval_obj, preserve_all_data_layers=True,
-                        depsgraph=depsgraph)
-        # Copy material slots from the original mesh
-        old_me = obj.data
-        new_me.name = old_me.name + "__bool__"
-        for mat in old_me.materials:
-            new_me.materials.append(mat)
-        # Swap mesh data and remove the now-unused original
-        obj.data = new_me
-        obj.modifiers.remove(mod)
-        new_me.update()
-        new_me.name = old_me.name
-        if old_me.users == 0:
-            bpy.data.meshes.remove(old_me)
-        success = True
-    except Exception as e:
-        print(f"[RoomTool] Boolean hole cut failed: {e}")
+    def _run_bool(solver):
+        """Apply one Boolean DIFFERENCE pass with *solver*.  Returns True only
+        if the result is non-empty AND has a different polygon count (i.e. a
+        real hole was cut).  On failure the modifier is cleaned up and the
+        original mesh data is left untouched."""
+        mod2 = obj.modifiers.new("__rt_bool__", 'BOOLEAN')
+        mod2.operation = 'DIFFERENCE'
+        mod2.solver    = solver
+        mod2.object    = cutter_obj
         try:
-            obj.modifiers.remove(mod)
-        except Exception:
-            pass
+            bpy.context.view_layer.update()
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            eval_obj  = obj.evaluated_get(depsgraph)
+            new_me    = bpy.data.meshes.new_from_object(
+                            eval_obj, preserve_all_data_layers=True,
+                            depsgraph=depsgraph)
+            # Guard 1: empty mesh — solver silently failed (non-manifold etc.)
+            if len(new_me.polygons) == 0:
+                bpy.data.meshes.remove(new_me)
+                raise RuntimeError(f"{solver}: empty result")
+            # Guard 2: unchanged count — cutter missed the wall entirely
+            if len(new_me.polygons) == orig_poly_count:
+                bpy.data.meshes.remove(new_me)
+                raise RuntimeError(f"{solver}: cutter missed (count unchanged)")
+            old_me = obj.data
+            new_me.name = old_me.name + "__bool__"
+            for mat in old_me.materials:
+                new_me.materials.append(mat)
+            obj.data = new_me
+            obj.modifiers.remove(mod2)
+            new_me.update()
+            new_me.name = old_me.name
+            if old_me.users == 0:
+                bpy.data.meshes.remove(old_me)
+            return True
+        except Exception as e:
+            print(f"[RoomTool] Boolean ({solver}) failed: {e}")
+            try:
+                obj.modifiers.remove(mod2)
+            except Exception:
+                pass
+            return False
+
+    # Try EXACT first (most accurate).  Interior-only room meshes are non-manifold,
+    # so EXACT may reject them — fall back to FAST which tolerates open boundaries.
+    # Both passes are guarded against empty / no-change results so the original
+    # mesh is never silently replaced with a destroyed or miss-cut version.
+    success = _run_bool('EXACT') or _run_bool('FAST')
 
     bpy.data.objects.remove(cutter_obj, do_unlink=True)
     if cutter_me.users == 0:
         bpy.data.meshes.remove(cutter_me)
+
+    # Safety: if the Boolean somehow left the mesh empty despite the guard above
+    # (e.g. the mesh was already empty before we ran), schedule a deferred rebuild
+    # from the registry so the room is never left permanently invisible.
+    if not success and obj is not None and len(obj.data.polygons) == 0:
+        def _recover_empty(r=reg):
+            try:
+                s = bpy.context.scene.room_settings
+                if (r.get("x2", 0) > r.get("x1", 0) and
+                        r.get("y2", 0) > r.get("y1", 0)):
+                    r["mesh_locked"] = False
+                    for d in r.get("doors", []):
+                        d.pop("hole_cut_locked", None)
+                    for w in r.get("windows", []):
+                        w.pop("hole_cut_locked", None)
+                    _rebuild_room_mesh(r, s)
+                    _sync_to_scene(bpy.context)
+                    print(f"[RoomTool] Auto-recovered empty room: {r.get('obj_name')}")
+            except Exception as ex:
+                print(f"[RoomTool] Auto-recover failed: {ex}")
+            return None
+        bpy.app.timers.register(_recover_empty, first_interval=0.0)
+
     return success
 
 
@@ -2533,28 +2653,39 @@ def _sync_arch_obj(reg, s):
 
 
 def _sync_reg_bounds_from_mesh(reg, obj):
-    """Update reg x1/y1/x2/y2/z from the actual mesh world-space bounding box.
-    Called for locked rooms before cutting holes or placing instances so that
-    manually-moved walls are accounted for correctly.
+    """Update reg x1/y1/x2/y2/z from the actual mesh world-space geometry.
 
-    The bounding box includes outer wall faces (offset by wall thickness t).
-    We add t back on each side to recover the inner-face positions that the
-    rest of the tool (cutter placement, instance positioning) expects.
-    """
+    x1/y1/x2/y2 are *inner* room coordinates (inner face of each wall).
+    Primary method: use floor (room_cat==1) polygon vertices, which lie
+    exactly on the inner boundary.  Fallback: full bounding box (the mesh
+    is interior-only so the bbox is already approximately at the inner faces)."""
     if obj is None or obj.type != 'MESH' or not obj.data.vertices:
         return
+    me = obj.data
     mw = obj.matrix_world
+
+    # ── Primary: floor polygon extent ────────────────────────────────────────
+    cat_attr = me.attributes.get("room_cat") if hasattr(me, 'attributes') else None
+    fxs, fys, fzs = [], [], []
+    if cat_attr is not None:
+        for poly in me.polygons:
+            if cat_attr.data[poly.index].value == 1:   # _CAT_FLOOR
+                for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
+                    co = mw @ me.vertices[me.loops[li].vertex_index].co
+                    fxs.append(co.x); fys.append(co.y); fzs.append(co.z)
+    if fxs:
+        reg["x1"] = min(fxs);  reg["x2"] = max(fxs)
+        reg["y1"] = min(fys);  reg["y2"] = max(fys)
+        reg["z"]  = min(fzs)
+        return
+
+    # ── Fallback: full bounding box (interior mesh ≈ inner coords) ───────────
     xs, ys, zs = [], [], []
-    for v in obj.data.vertices:
+    for v in me.vertices:
         wco = mw @ v.co
-        xs.append(wco.x)
-        ys.append(wco.y)
-        zs.append(wco.z)
-    t = reg.get("t", 0.125)
-    reg["x1"] = min(xs) + t
-    reg["x2"] = max(xs) - t
-    reg["y1"] = min(ys) + t
-    reg["y2"] = max(ys) - t
+        xs.append(wco.x); ys.append(wco.y); zs.append(wco.z)
+    reg["x1"] = min(xs);  reg["x2"] = max(xs)
+    reg["y1"] = min(ys);  reg["y2"] = max(ys)
     reg["z"]  = min(zs)
 
 
@@ -2570,8 +2701,6 @@ def _rebuild_room_mesh(reg, s):
     if obj_name not in bpy.data.objects:
         return
     obj = bpy.data.objects[obj_name]
-    if obj.mode == 'EDIT':
-        return  # modifying mesh data while in edit mode corrupts it
 
     if reg.get("mesh_locked", False):
         # Locked: skip geometry rebuild, only cut new holes and reposition instances.
@@ -3566,9 +3695,6 @@ def _snap_wall_from_ray(context, event, rooms, t_fallback, current_z=None):
             sv = pt.x if ax == 'x' else pt.y
             if not (lo - t <= sv <= hi + t):
                 continue
-            # Reject if this wall segment is shared (open) with an adjacent room
-            if _snap_wall_is_shared(reg, wc, sv, rooms, t):
-                continue
             # Reject if this wall plane is now interior (the room was extruded outward)
             if _snap_original_wall_superseded(reg, wc, sv, t):
                 continue
@@ -4297,6 +4423,7 @@ def _reg_to_entry(reg, entry):
     entry.plinth_bottom_enabled = reg.get('plinth_bottom_enabled', False)
     entry.plinth_top_enabled    = reg.get('plinth_top_enabled',    False)
     entry.mesh_locked           = reg.get('mesh_locked',           False)
+    entry.mat_preset_idx        = reg.get('mat_preset_idx',        -1)
     # Legacy fields — kept so old .blend files don't error on load
     entry.door_walls   = ""
     entry.door_anchors = "{}"
@@ -4347,6 +4474,7 @@ def _entry_to_reg(entry):
         "plinth_bottom_enabled": getattr(entry, 'plinth_bottom_enabled', False),
         "plinth_top_enabled":    getattr(entry, 'plinth_top_enabled',    False),
         "mesh_locked":           getattr(entry, 'mesh_locked',           False),
+        "mat_preset_idx":        getattr(entry, 'mat_preset_idx',        -1),
     }
 
 
@@ -5158,6 +5286,7 @@ class ROOM_OT_draw(bpy.types.Operator):
                         "plinth_bottom_enabled": s.add_plinth_bottom,
                         "plinth_top_enabled":    s.add_plinth_top,
                         "mesh_locked":           False,
+                        "mat_preset_idx":        getattr(context.scene, 'room_mat_preset_active', -1),
                     }
                     ROOM_OT_draw._room_list.append(reg)
                     _sync_arch_obj(reg, s)   # generate arch for new room if enabled
@@ -5648,22 +5777,28 @@ def _room_edit_mode_exit(*args):
                     if sc_s is None:
                         return None
                     for obj_name in exited_names:
-                        obj = bpy.data.objects.get(obj_name)
-                        if obj is None:
-                            continue
-                        # Safety: only act once the object is fully in Object mode.
-                        # If the user re-entered Edit Mode in the same frame, skip
-                        # rather than write mesh data into a live edit BMesh.
-                        if obj.mode != 'OBJECT':
-                            continue
                         reg = next((r for r in ROOM_OT_draw._room_list
                                     if r.get("obj_name") == obj_name), None)
                         if reg is None:
                             continue
                         _apply_uvs_one_room(reg, sc_s)
-                        # Plinth is NOT recalculated automatically on edit-mode exit.
-                        # Despite 4 fix attempts the BMesh round-trip caused persistent
-                        # "rooms breaking" bugs. Use the Recalculate Plinth button.
+                        # Auto-lock the mesh so subsequent door/window placement
+                        # uses Boolean cuts and does not rebuild from registry,
+                        # which would erase any manual edits made in Edit Mode.
+                        if not reg.get("mesh_locked", False):
+                            reg["mesh_locked"] = True
+                            for opening in (reg.get("doors", []) +
+                                            reg.get("windows", [])):
+                                opening["hole_cut_locked"] = True
+                            obj_al = bpy.data.objects.get(obj_name)
+                            if obj_al is not None:
+                                _sync_reg_bounds_from_mesh(reg, obj_al)
+                            entries = getattr(sc, "room_registry", None)
+                            if entries is not None:
+                                for entry in entries:
+                                    if entry.obj_name == obj_name:
+                                        _reg_to_entry(reg, entry)
+                                        break
                 except Exception:
                     pass
                 return None  # don't repeat
@@ -6297,8 +6432,8 @@ class ROOM_OT_door_edit(bpy.types.Operator):
                             p_ri, p_wc = partner
                             p_reg = rooms[p_ri]
                             p_door = {"wc": p_wc, "anchor": anchor, "w": dw, "h": dh}
-                            if new_door.get("mesh_source"):
-                                p_door["mesh_source"] = new_door["mesh_source"]
+                            # Do NOT copy mesh_source to partner — the primary
+                            # room owns the single shared mesh instance.
                             p_reg.setdefault("doors", []).append(p_door)
                             partner_door_idx = len(p_reg["doors"]) - 1
                             _rebuild_room_mesh(p_reg, s)
@@ -6772,6 +6907,10 @@ class ROOM_OT_window_edit(bpy.types.Operator):
         # sampling a mesh placed high in the scene).  Only repositions instances.
         s_inv = context.scene.room_settings
         for _reg in ROOM_OT_draw._room_list:
+            if _reg.get("mesh_locked", False):
+                _obj_inv = bpy.data.objects.get(_reg.get("obj_name", ""))
+                if _obj_inv is not None:
+                    _sync_reg_bounds_from_mesh(_reg, _obj_inv)
             _sync_opening_meshes(_reg, s=s_inv)
         self._phase           = 'HOVER'
         self._hovered_win     = None
@@ -7201,8 +7340,8 @@ class ROOM_OT_window_edit(bpy.types.Operator):
                                 pd = {"wc": p_wc, "anchor": anch,
                                       "v_offset": voff, "w": ww, "h": wh,
                                       "array_n": count, "array_idx": k}
-                                if _win_src:
-                                    pd["mesh_source"] = _win_src
+                                # Do NOT copy mesh_source to partner — the
+                                # primary room owns the single shared mesh instance.
                                 p_wins.append(pd)
                             _rebuild_room_mesh(p_reg, s)
                         self._active_idx     = ri
@@ -7355,7 +7494,8 @@ class ROOM_OT_stair_edit(bpy.types.Operator):
             # ── Phase UPPER_SLIDE: upper rect slides along travel axis ───────
             if self._phase == 'UPPER_SLIDE' and self._upper_rect is not None:
                 ux1, uy1, ux2, uy2 = self._upper_rect
-                fits = (_rect_fits_in_room(ux1, uy1, ux2, uy2,
+                fits = (_rect_fits_in_room(lx1, ly1, lx2, ly2, self._z_lower, rooms) is not None and
+                        _rect_fits_in_room(ux1, uy1, ux2, uy2,
                                            self._z_upper, rooms) is not None and
                         not _rect_overlaps_stair_hole(ux1, uy1, ux2, uy2,
                                                       self._z_upper, rooms))
@@ -8282,16 +8422,7 @@ class ROOM_OT_toggle_mesh_lock(bpy.types.Operator):
                     opening["hole_cut_locked"] = True
                 # Update stored bounds from the actual (possibly edited) mesh so
                 # window/door placement uses the real wall positions
-                me = obj.data
-                if me.vertices:
-                    mw = obj.matrix_world
-                    wxs = [mw @ v.co for v in me.vertices]
-                    xs = [v.x for v in wxs]
-                    ys = [v.y for v in wxs]
-                    zs = [v.z for v in wxs]
-                    reg["x1"] = min(xs);  reg["x2"] = max(xs)
-                    reg["y1"] = min(ys);  reg["y2"] = max(ys)
-                    reg["z"]  = min(zs)
+                _sync_reg_bounds_from_mesh(reg, obj)
         _sync_to_scene(context)
         return {'FINISHED'}
 
@@ -8302,9 +8433,6 @@ def _recalculate_plinth_for_obj(reg, obj, s):
     Works on locked rooms without touching the rest of the mesh.
     Returns the number of unique base edges processed (0 if no edges found).
     """
-    if obj.mode == 'EDIT':
-        return 0  # never modify mesh data while the object is in edit mode
-
     pb = reg.get('plinth_bottom_enabled', False)
     pt = reg.get('plinth_top_enabled',    False)
     if not pb and not pt:
@@ -8324,19 +8452,22 @@ def _recalculate_plinth_for_obj(reg, obj, s):
     mw_inv = mw.inverted()
 
     # ── Remove existing plinth faces ─────────────────────────────────────────
-    # Use the room_cat face attribute — NOT vertex groups — to identify plinth
-    # faces.  _fill_room calls remove_doubles which merges plinth vertices that
-    # sit flush against wall surfaces into a single shared vertex; that shared
-    # vertex ends up in both the 'walls' and 'plinth_bottom' vertex groups, so
-    # deleting by vertex group would also delete the wall faces that share it.
-    # Deleting by face with context='FACES' only removes vertices that become
-    # fully isolated (no remaining faces), so shared wall vertices survive.
-    cat_layer_rm = bm.faces.layers.int.get("room_cat")
-    if cat_layer_rm is not None:
-        plinth_faces = [f for f in bm.faces
-                        if f[cat_layer_rm] in (_CAT_PLINTH_BOTTOM, _CAT_PLINTH_TOP)]
-        if plinth_faces:
-            bmesh.ops.delete(bm, geom=plinth_faces, context='FACES')
+    for grp_name in ('plinth_bottom', 'plinth_top'):
+        vg = obj.vertex_groups.get(grp_name)
+        if vg is None:
+            continue
+        idx = vg.index
+        bm.verts.ensure_lookup_table()
+        plinth_verts = set()
+        deform = bm.verts.layers.deform.active
+        for v in bm.verts:
+            try:
+                if deform and idx in v[deform]:
+                    plinth_verts.add(v)
+            except Exception:
+                pass
+        if plinth_verts:
+            bmesh.ops.delete(bm, geom=list(plinth_verts), context='VERTS')
 
     # ── Find wall-base edges (floor level) and wall-top edges (ceiling level) ──
     bm.verts.ensure_lookup_table()
@@ -8866,7 +8997,8 @@ _CAT_TILING_PROPS = {
     7:  ('mat_stair_tiling_x',         'mat_stair_tiling_y'),
     8:  ('mat_architrave_tiling_x',    'mat_architrave_tiling_y'),
     9:  ('mat_stair_step_tiling_x',    'mat_stair_step_tiling_y'),
-    10: ('threshold_tiling_x',         'threshold_tiling_y'),
+    10: ('mat_stair_riser_tiling_x',   'mat_stair_riser_tiling_y'),
+    11: ('threshold_tiling_x',         'threshold_tiling_y'),
 }
 
 _CAT_ROTATION_PROP = {
@@ -8880,7 +9012,8 @@ _CAT_ROTATION_PROP = {
     7:  'mat_stair_rotation',
     8:  'mat_architrave_rotation',
     9:  'mat_stair_step_rotation',
-    10: 'threshold_rotation',
+    10: 'mat_stair_riser_rotation',
+    11: 'threshold_rotation',
 }
 
 
@@ -9474,8 +9607,9 @@ class ROOM_PT_panel(bpy.types.Panel):
             col.separator()
             col.label(text="Stairs:")
             for mat_attr, tx, ty, rot, label, cat in (
-                ("mat_stair",      "mat_stair_tiling_x",      "mat_stair_tiling_y",      "mat_stair_rotation",      "Sides",  7),
-                ("mat_stair_step", "mat_stair_step_tiling_x", "mat_stair_step_tiling_y", "mat_stair_step_rotation", "Treads", 9),
+                ("mat_stair",       "mat_stair_tiling_x",       "mat_stair_tiling_y",       "mat_stair_rotation",       "Sides",  7),
+                ("mat_stair_step",  "mat_stair_step_tiling_x",  "mat_stair_step_tiling_y",  "mat_stair_step_rotation",  "Treads", 9),
+                ("mat_stair_riser", "mat_stair_riser_tiling_x", "mat_stair_riser_tiling_y", "mat_stair_riser_rotation", "Risers", 10),
             ):
                 _mat_row(col, mat_attr, tx, ty, rot, label, cat)
                 col.separator(factor=0.5)
@@ -9495,6 +9629,8 @@ class ROOM_PT_panel(bpy.types.Panel):
         row.label(text="Utilities", icon="TOOL_SETTINGS")
         if s.show_utilities:
             col = box.column(align=True)
+            col.operator("room.rebuild_all",     icon="FILE_REFRESH",   text="Rebuild All Geometry")
+            col.separator()
             col.operator("room.clear_registry",  icon="X",              text="Reset Snap Registry")
             col.operator("room.clear_overlays",  icon="GHOST_DISABLED", text="Clear Phantom Overlays")
 
@@ -9852,7 +9988,7 @@ class ROOM_OT_stair_rebuild(bpy.types.Operator):
         me.update()
         obj.data = me
         bpy.data.meshes.remove(old_me)
-        _setup_stair_materials(me, s)
+        _setup_stair_materials(me, s, sd=sd)
         _apply_stair_uv(me, s)
         # Update the stored JSON marker
         obj["room_stair"] = json.dumps({k: v for k, v in sd.items() if k != "obj_name"})
@@ -9860,6 +9996,72 @@ class ROOM_OT_stair_rebuild(bpy.types.Operator):
         step_d = total_travel / n
         self.report({"INFO"},
                     f"{obj.name}: {n} steps, rise={sd['step_rise']:.3f} m, depth={step_d:.3f} m")
+        return {"FINISHED"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Rebuild all stairs operator
+# ═════════════════════════════════════════════════════════════════════════════
+class ROOM_OT_rebuild_all(bpy.types.Operator):
+    """Rebuild geometry for every room and stair in the scene from scratch.
+    Use this after updating the addon to pick up newly added geometry features
+    (face categories, trim changes, etc.) on objects placed with an older version."""
+    bl_idname  = "room.rebuild_all"
+    bl_label   = "Rebuild All Geometry"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        s = context.scene.room_settings
+        rooms_done = 0
+        stairs_done = 0
+
+        # ── Rooms ──────────────────────────────────────────────────────────────
+        for reg in ROOM_OT_draw._room_list:
+            try:
+                _rebuild_room_mesh(reg, s)
+                rooms_done += 1
+            except Exception:
+                import traceback; traceback.print_exc()
+
+        # ── Stairs ─────────────────────────────────────────────────────────────
+        for sd in ROOM_OT_draw._stair_list:
+            obj_name = sd.get("obj_name")
+            if not obj_name:
+                continue
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None:
+                continue
+            try:
+                verts, faces, cats = _build_stair_mesh(sd, s)
+                if not verts:
+                    continue
+                old_me = obj.data
+                me  = bpy.data.meshes.new(obj_name)
+                bm2 = bmesh.new()
+                cl  = bm2.faces.layers.int.new("stair_cat")
+                for v in verts:
+                    bm2.verts.new(v)
+                bm2.verts.ensure_lookup_table()
+                for fi, fidx in enumerate(faces):
+                    try:
+                        face = bm2.faces.new([bm2.verts[i] for i in fidx])
+                        face[cl] = cats[fi]
+                    except Exception:
+                        pass
+                bm2.to_mesh(me); bm2.free(); me.update()
+                loc = obj.location
+                for v in me.vertices:
+                    v.co.x -= loc.x; v.co.y -= loc.y; v.co.z -= loc.z
+                obj.data = me
+                bpy.data.meshes.remove(old_me)
+                _setup_stair_materials(me, s, sd=sd)
+                _apply_stair_uv(me, s)
+                me.update()
+                stairs_done += 1
+            except Exception:
+                import traceback; traceback.print_exc()
+
+        self.report({"INFO"}, f"Rebuilt {rooms_done} room(s) and {stairs_done} stair(s)")
         return {"FINISHED"}
 
 
@@ -10022,19 +10224,22 @@ class ROOM_OT_stair_move(bpy.types.Operator):
             raw_dx = 0.0
 
         # ── Gather inner bounds for both rooms ────────────────────────────────
+        # r["x1"]/r["x2"]/r["y1"]/r["y2"] are already the inner wall faces;
+        # walls extend *outward* from these coordinates.  Do NOT add wall
+        # thickness here — that would prevent stairs from snapping flush to walls.
         rooms = self._rooms
         INF = 1e9
         if 0 <= self._li < len(rooms):
-            rl = rooms[self._li]; tl = rl.get("t", 0.125)
-            l_x1, l_x2 = rl["x1"] + tl, rl["x2"] - tl
-            l_y1, l_y2 = rl["y1"] + tl, rl["y2"] - tl
+            rl = rooms[self._li]
+            l_x1, l_x2 = rl["x1"], rl["x2"]
+            l_y1, l_y2 = rl["y1"], rl["y2"]
         else:
             l_x1, l_x2, l_y1, l_y2 = -INF, INF, -INF, INF
 
         if 0 <= self._ui < len(rooms):
-            ru = rooms[self._ui]; tu = ru.get("t", 0.125)
-            u_x1, u_x2 = ru["x1"] + tu, ru["x2"] - tu
-            u_y1, u_y2 = ru["y1"] + tu, ru["y2"] - tu
+            ru = rooms[self._ui]
+            u_x1, u_x2 = ru["x1"], ru["x2"]
+            u_y1, u_y2 = ru["y1"], ru["y2"]
         else:
             u_x1, u_x2, u_y1, u_y2 = -INF, INF, -INF, INF
 
@@ -10096,9 +10301,10 @@ class ROOM_OT_stair_move(bpy.types.Operator):
             ux2=b["ux2"]+dx, uy2=b["uy2"]+dy,
             x_travel=b["x_travel"])
         p = self._preview
+        li_chk = _rect_fits_in_room(p["lx1"],p["ly1"],p["lx2"],p["ly2"],
+                                    self._sd["z_bot"], self._rooms)
         self._valid = (
-            _rect_fits_in_room(p["lx1"],p["ly1"],p["lx2"],p["ly2"],
-                               self._sd["z_bot"], self._rooms) is not None and
+            li_chk is not None and
             _rect_fits_in_room(p["ux1"],p["uy1"],p["ux2"],p["uy2"],
                                self._sd["z_top"], self._rooms) is not None)
 
@@ -10142,13 +10348,14 @@ class ROOM_OT_stair_move(bpy.types.Operator):
         self._preview     = dict(nb)
         self._base_pivot  = self._pivot_point(nb)  # keep snap anchor on new pivot
         self._mouse_start = cur_xy   # reset delta to zero
+        li_chk = _rect_fits_in_room(nb["lx1"],nb["ly1"],nb["lx2"],nb["ly2"],
+                                    self._sd["z_bot"], self._rooms)
         self._valid = (
-            _rect_fits_in_room(nb["lx1"],nb["ly1"],nb["lx2"],nb["ly2"],
-                               self._sd["z_bot"], self._rooms) is not None and
+            li_chk is not None and
             _rect_fits_in_room(nb["ux1"],nb["uy1"],nb["ux2"],nb["uy2"],
                                self._sd["z_top"], self._rooms) is not None)
 
-    def _apply(self):
+    def _apply(self, context):
         sd   = self._sd
         p    = self._preview
         name = self._obj_name
@@ -10166,37 +10373,9 @@ class ROOM_OT_stair_move(bpy.types.Operator):
             r["stair_holes"] = [h for h in r.get("stair_holes", [])
                                 if h.get("stair_obj") != name]
 
-        # Recompute hole bounds (same logic as _finalise)
-        lx1 = min(sd["lx1"],sd["lx2"]); lx2 = max(sd["lx1"],sd["lx2"])
-        ly1 = min(sd["ly1"],sd["ly2"]); ly2 = max(sd["ly1"],sd["ly2"])
-        ux1 = min(sd["ux1"],sd["ux2"]); ux2 = max(sd["ux1"],sd["ux2"])
-        uy1 = min(sd["uy1"],sd["uy2"]); uy2 = max(sd["uy1"],sd["uy2"])
-        x_t = sd["x_travel"]
-        if x_t:
-            if (ux1+ux2)/2 >= (lx1+lx2)/2:
-                hx1, hx2 = lx2, ux2
-            else:
-                hx1, hx2 = ux1, lx1
-            hy1, hy2 = min(ly1,uy1), max(ly2,uy2)
-        else:
-            if (uy1+uy2)/2 >= (ly1+ly2)/2:
-                hy1, hy2 = ly2, uy2
-            else:
-                hy1, hy2 = uy1, ly1
-            hx1, hx2 = min(lx1,ux1), max(lx2,ux2)
-
-        z_upper  = rooms[ui].get("z", s.z_foundation)
-        zt_lower = rooms[li].get("z", s.z_foundation) + s.wall_height
-        lower_hole = {"x1":hx1,"y1":hy1,"x2":hx2,"y2":hy2,
-                      "cut":"ceiling","stair_obj":name,"slab_z":z_upper}
-        upper_hole = {"x1":hx1,"y1":hy1,"x2":hx2,"y2":hy2,
-                      "cut":"floor","stair_obj":name,"slab_z":zt_lower}
-
-        rooms[li].setdefault("stair_holes", []).append(lower_hole)
-        _rebuild_room_mesh(rooms[li], s)
-        if ui != li:
-            rooms[ui].setdefault("stair_holes", []).append(upper_hole)
-            _rebuild_room_mesh(rooms[ui], s)
+        # Recompute and add holes using the shared helper (same as _finalise),
+        # which also handles hole_resize metadata and calls _rebuild_room_mesh.
+        _stair_cut_holes(sd, li, ui, rooms, s)
 
         # Rebuild stair mesh in-place
         obj = bpy.data.objects.get(name)
@@ -10217,7 +10396,7 @@ class ROOM_OT_stair_move(bpy.types.Operator):
                 bm2.to_mesh(me); bm2.free(); me.update()
                 obj.data = me
                 bpy.data.meshes.remove(old_me)
-                _setup_stair_materials(me, s)
+                _setup_stair_materials(me, s, sd=sd)
                 _apply_stair_uv(me, s)   # UV while verts still in world space
                 # Re-apply pivot origin
                 px, py = _stair_pivot_xy(sd)
@@ -10229,6 +10408,8 @@ class ROOM_OT_stair_move(bpy.types.Operator):
                 me.update()
                 obj["room_stair"] = json.dumps(
                     {k: v for k, v in sd.items() if k != "obj_name"})
+
+        _sync_to_scene(context)
 
     # ── GPU draw callback ─────────────────────────────────────────────────────
     def _draw_cb(self, context):
@@ -10272,9 +10453,7 @@ class ROOM_OT_stair_move(bpy.types.Operator):
         for ri, z in ((self._li, z_lo), (self._ui, z_hi)):
             if 0 <= ri < len(rooms):
                 r  = rooms[ri]
-                t_ = r.get("t", s.wall_thickness)
-                draw_rect(r["x1"]+t_, r["y1"]+t_,
-                          r["x2"]-t_, r["y2"]-t_,
+                draw_rect(r["x1"], r["y1"], r["x2"], r["y2"],
                           z, (0,0,0,0), self._COL_ROOM_LINE)
 
         # ── Gizmo at pivot point ──────────────────────────────────────────
@@ -10403,7 +10582,7 @@ class ROOM_OT_stair_move(bpy.types.Operator):
                 # Short click (no drag) → confirm placement if valid
                 self._lmb_down = False
                 if self._valid:
-                    self._apply()
+                    self._apply(context)
                     self._remove_draw_handle()
                     context.window.cursor_set('DEFAULT')
                     return {'FINISHED'}
@@ -10641,6 +10820,7 @@ _classes = (
     ROOM_OT_window_edit,
     ROOM_OT_stair_edit,
     ROOM_OT_stair_rebuild,
+    ROOM_OT_rebuild_all,
     ROOM_OT_stair_delete,
     ROOM_OT_stair_move,
     ROOM_OT_stair_apply_floors,
